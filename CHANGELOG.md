@@ -56,6 +56,25 @@ sort *before* `1.0.9`.
   invokes directly, and `rc.godwit`'s start/status/stop lifecycle against a
   stub daemon.
 
+### Fixed (found by code-diff-reviewer + advisor before this version shipped)
+
+- `godwitd` now backs off (1s doubling to 60s) when both the unix-socket and
+  tcp-fallback rcd start attempts fail, instead of retrying every second
+  forever.
+- `godwitd`'s `chmod` on `rclone.conf` is best-effort — `/boot/config` is a
+  vfat mount where `chmod` is a no-op, and the unsuppressed call logged a
+  spurious warning on every daemon start.
+- `godwit_rc_call()` degrades to `null` instead of a fatal error if the
+  `curl` extension is absent (PLAN.md's confirmed host extension list is
+  sqlite3/pcntl/posix — curl was assumed, not confirmed).
+- `install-on-host.sh`'s Waseh/`/usr/sbin/rclone` snapshot used a
+  `*rclone*` name glob that also matched godwit's own bundled binary,
+  guaranteeing a spurious before/after mismatch; switched to fixed paths.
+  The `rclone.conf` permission check no longer asserts an exact mode on a
+  vfat mount (mode is mount-determined, not code-determined). The (e)
+  status check now falls back to a CLI PHP invocation if the HTTP path is
+  blocked by nginx's `auth_request`.
+
 ### Decisions made during this unattended session (not in PLAN.md)
 
 - No `godwit.cfg` yet — Phase 1 has no user-configurable settings, so there
