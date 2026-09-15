@@ -70,12 +70,51 @@ already up), but would have on the next reboot.
   second godwitd/rcd alongside the still-alive orphan. Moved the `rm -f`
   after both liveness checks.
 
+### Verified on the live host (2026-09-15, upgrade → uninstall → reinstall → by-hand event hooks)
+
+- Upgrade 0.1.0 → 0.1.1 installed and restarted cleanly (`rc.godwit stop`
+  from the old install, then the new package's install step started it).
+- `event/started` and `event/stopping_svcs` present and **executable**
+  under `/usr/local/emhttp/plugins/godwit/event/`.
+- Invoked `event/stopping_svcs` by hand: godwitd (pid) and the bundled rcd
+  both went from 1 running process to 0, and `/var/run/godwit/rcd.sock`
+  went from present to absent — no escalation needed (a clean SIGTERM
+  stop). Then invoked `event/started` by hand: both came back to 1, socket
+  present again.
+- `array-ready.sh` read the live `var.ini`/mountpoint state as ready
+  (exit 0) during both the upgrade and the reinstall, with `mdState="STARTED"`
+  confirmed directly from `var.ini`.
+- Uninstall (10/10 checks) and reinstall (all checks) both clean, same as
+  0.1.0's checklist.
+- `/usr/sbin/rclone` (md5 unchanged) and the Waseh plugin's files
+  unchanged across the full upgrade/uninstall/reinstall cycle.
+- The heartbeat db under `/mnt/cache/appdata/godwit/godwit.db` persisted
+  (144 rows) across the whole cycle, as designed.
+- `mountpoint` confirmed on `emhttpd`'s own PATH
+  (`/bin:/sbin:/usr/bin:/usr/sbin`), so the cache-mount guard in godwitd
+  actually works when invoked from the `started` event hook's environment,
+  not just from an interactive shell.
+- **Not verified — cannot be from this repo's allowed actions:** whether a
+  `godwit` directory exists on the RAM rootfs underneath the live
+  `/mnt/cache` mount. You cannot see beneath an active mount without a
+  bind-mount, and mutating mounts is outside this phase's allowed host
+  actions. Covered instead by the mountpoint check itself: `mountpoint
+  /mnt/cache` reported "is a mountpoint" throughout this session, and both
+  `array-ready.sh` and godwitd's own guard require exactly that condition
+  before ever writing to the state dir — so nothing was written to the
+  rootfs during any of the test cycles above, by construction, not by
+  inspection of what's under the mount.
+
 ### Outstanding
 
-A real reboot / array-stop test is still outstanding — this only exercises
-the event hooks by hand and the install-time gate against the *current*
-array state, not an actual boot cycle. Kieren needs to schedule a real
-reboot to close this out fully.
+**A real reboot or array-stop/start cycle is still outstanding.** Everything
+above exercises the event hooks by hand and the install-time gate against
+whatever the array's state happens to be *right now* (already started) —
+none of it proves the fix survives an actual boot, where the ~14s gap
+between plugin install and cache mount is the failure window this release
+exists to close. Kieren needs to schedule a real reboot to close this out
+fully; rebooting the host is not one of this phase's allowed automatic
+actions.
 
 ## [0.1.0] - 2026-09-15 (verified on host 2026-09-15)
 

@@ -7,10 +7,12 @@ stands — if the two conflict, re-derive this file from the current repo
 state, not from memory of an earlier plan.
 
 **Phase 1 (scaffold + release pipeline) is built and verified on the host**
-(v0.1.0, verified 2026-09-15: install, uninstall, reinstall, all via
-`scripts/install-on-host.sh` / `scripts/uninstall-on-host.sh` against the
-live host over ssh — see CHANGELOG.md for the full checklist). See PLAN.md
-§5 for the remaining phases.
+(v0.1.1, verified 2026-09-15: install, uninstall, reinstall, plus the
+`event/started`/`event/stopping_svcs` hooks fired by hand, all via
+`scripts/install-on-host.sh` / `scripts/uninstall-on-host.sh` and direct
+ssh — see CHANGELOG.md for the full checklist). A real reboot/array-stop
+test is still outstanding — see "Deploy and verify" below. See PLAN.md §5
+for the remaining phases.
 
 ## Test command
 
