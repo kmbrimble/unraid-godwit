@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.1.1">
+<!ENTITY version   "0.1.2">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,14 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.1.2
+- Fixes a boot-time install failure: the install block runs under `set -e`,
+  and array-ready.sh's expected non-zero exit at boot (array not started,
+  cache not mounted — the exact scenario the 0.1.1 deferral branch exists
+  for) was left as a bare statement, so `set -e` aborted the whole install
+  block before it ever reached the deferral branch, reporting the plugin
+  install as failed. The result is now captured via an `if`/`else` instead
+  of a bare command.
 ###0.1.1
 - Fixes a boot-order bug: plugins install ~14s before the cache pool is
   mounted, so 0.1.0's unconditional `rc.godwit start` in the install step
@@ -76,10 +84,19 @@ mkdir -p &plgPATH;
 # mid-session install/upgrade); a boot-time install defers to the
 # `started` event hook, which fires once the array and cache are actually
 # ready. See array-ready.sh.
+# The install block runs under `set -e`, so array-ready.sh's expected
+# non-zero exit (the whole point of this check, on the exact boot-time
+# scenario this release exists to handle) must be consumed by an `if`
+# condition, never left as a bare statement — a bare statement's failure
+# would abort the install script before it ever reaches the "defer to the
+# started hook" branch below.
 READY=1
 if [[ -f &emhttp;/scripts/array-ready.sh ]]; then
-  bash &emhttp;/scripts/array-ready.sh
-  READY=$?
+  if bash &emhttp;/scripts/array-ready.sh; then
+    READY=0
+  else
+    READY=1
+  fi
 fi
 if [[ -f &emhttp;/scripts/rc.godwit ]]; then
   if [[ "$READY" -eq 0 ]]; then

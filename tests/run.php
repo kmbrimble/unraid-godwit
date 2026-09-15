@@ -287,6 +287,79 @@ t('array-ready.sh: missing var.ini -> not ready', function () use ($repoRoot) {
     assert_true($code !== 0, 'must not be ready if var.ini cannot even be read');
 });
 
+// --- install block: must survive array-ready.sh's expected non-zero exit --
+//
+// Regression test for the boot-time install-abort bug: the install block
+// runs under `set -e`, and a bare `bash array-ready.sh` (with its exit
+// captured afterward via `$?`) trips `set -e` the moment array-ready.sh
+// exits 1 — which is exactly what it does at boot, by design, before the
+// cache is mounted. That abort happens before the "defer to the started
+// event hook" branch ever runs, so plugin install reports failure at the
+// one moment this whole mechanism exists to handle gracefully.
+
+function godwit_extract_install_block(string $plgRaw): string
+{
+    preg_match('/<FILE Run="\/bin\/bash">\s*<INLINE>(.*?)<\/INLINE>\s*<\/FILE>/s', $plgRaw, $m);
+    if (!isset($m[1])) {
+        throw new \RuntimeException('could not locate the install FILE/INLINE block in godwit.plg');
+    }
+    return $m[1];
+}
+
+function godwit_run_install_block(string $plgRaw, int $arrayReadyExit): array
+{
+    $tmp = sys_get_temp_dir() . '/godwit-install-block-' . bin2hex(random_bytes(4));
+    $emhttp = $tmp . '/emhttp';
+    $plgPath = $tmp . '/plgpath';
+    $bin = $tmp . '/bin';
+    $callsLog = $tmp . '/calls.log';
+    mkdir($emhttp . '/scripts', 0755, true);
+    mkdir($plgPath, 0755, true);
+    mkdir($bin, 0755, true);
+
+    file_put_contents($bin . '/upgradepkg', "#!/bin/bash\necho \"upgradepkg \$*\" >> " . escapeshellarg($callsLog) . "\n");
+    chmod($bin . '/upgradepkg', 0755);
+    file_put_contents($bin . '/removepkg', "#!/bin/bash\necho \"removepkg \$*\" >> " . escapeshellarg($callsLog) . "\n");
+    chmod($bin . '/removepkg', 0755);
+
+    file_put_contents($emhttp . '/scripts/array-ready.sh', "#!/bin/bash\nexit $arrayReadyExit\n");
+    chmod($emhttp . '/scripts/array-ready.sh', 0755);
+
+    file_put_contents($emhttp . '/scripts/rc.godwit', "#!/bin/bash\necho \"rc.godwit \$*\" >> " . escapeshellarg($callsLog) . "\n");
+    chmod($emhttp . '/scripts/rc.godwit', 0755);
+
+    preg_match('/<!ENTITY version\s+"([^"]+)">/', $plgRaw, $vm);
+    $block = godwit_extract_install_block($plgRaw);
+    $block = str_replace('&plgPATH;', $plgPath, $block);
+    $block = str_replace('&emhttp;', $emhttp, $block);
+    $block = str_replace('&version;', $vm[1], $block);
+    $block = str_replace('&name;', 'godwit', $block);
+
+    $scriptPath = $tmp . '/install.sh';
+    file_put_contents($scriptPath, $block);
+
+    $cmd = 'PATH=' . escapeshellarg($bin . ':' . getenv('PATH')) . ' bash ' . escapeshellarg($scriptPath) . ' 2>&1';
+    exec($cmd, $output, $exitCode);
+    $calls = file_exists($callsLog) ? file_get_contents($callsLog) : '';
+
+    exec('rm -rf ' . escapeshellarg($tmp));
+
+    return [$exitCode, implode("\n", $output), $calls];
+}
+
+t('install block: array not ready (boot-time case) still exits 0 and defers to the started hook', function () use ($plgRaw) {
+    [$exitCode, $out, $calls] = godwit_run_install_block($plgRaw, 1);
+    assert_eq(0, $exitCode, "install block must not abort under set -e when array-ready.sh exits 1 (boot-time case): $out");
+    assert_true(str_contains($out, "array not started yet — godwitd will start via the 'started' event hook"), "expected the deferral message, got: $out");
+    assert_true(!str_contains($calls, 'rc.godwit start'), "rc.godwit start must never be called when the array isn't ready, calls were: $calls");
+});
+
+t('install block: array ready starts godwitd immediately', function () use ($plgRaw) {
+    [$exitCode, $out, $calls] = godwit_run_install_block($plgRaw, 0);
+    assert_eq(0, $exitCode, "install block should exit 0 when array-ready.sh exits 0: $out");
+    assert_true(str_contains($calls, 'rc.godwit start'), "rc.godwit start must be called when the array is already ready, calls were: $calls");
+});
+
 // --- godwit_resolve_cache_mounted(): godwitd's own mount-guard override --
 
 t('godwit_resolve_cache_mounted: override "1" forces mounted regardless of the real check', function () {

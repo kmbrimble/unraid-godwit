@@ -10,6 +10,43 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-16
+
+### Fixed
+
+Found by Dormouse 0.2.3's review, which hit the identical bug; confirmed by
+reading `godwit.plg` at a565143. The install `<INLINE>` block runs under
+`set -e`. At boot, `array-ready.sh` exits 1 by design (array not started,
+cache not mounted yet) — that is the whole point of the check, and the exact
+case the 0.1.1 "defer to the `started` event hook" branch exists to handle.
+But the block called it as a bare statement (`bash .../array-ready.sh;
+READY=$?`), so `set -e` aborted the install script the moment that bare
+command returned non-zero, before the deferral branch it was meant to feed
+ever ran — a boot-time plugin install therefore reported failure instead of
+deferring cleanly.
+
+- `godwit.plg`'s install block now captures the result with `if bash
+  .../array-ready.sh; then READY=0; else READY=1; fi` instead of a bare
+  statement + `$?`. XML well-formedness (no bare `&` in the INLINE block)
+  confirmed still green by the existing `simplexml_load_file` test.
+- Added `tests/run.php` coverage that extracts the real install `<INLINE>`
+  block out of `godwit.plg`, substitutes its entities to a temp layout, and
+  runs it under bash against recording stubs for `upgradepkg`, `removepkg`
+  and `rc.godwit`, plus a stubbed `array-ready.sh`: asserts exit 0 and the
+  deferral message when array-ready.sh exits 1 (and that `rc.godwit start`
+  is never called), and the mirror case where array-ready.sh exits 0 and
+  `rc.godwit start` is called. Proven to fail against the pre-fix block
+  first (see handback).
+- Scanned the rest of `godwit.plg` and `scripts/` for other bare commands
+  under `set -e` with an expected non-zero exit — the remove block has no
+  `set -e` at all, and every other guarded call in `scripts/*.sh` already
+  wraps its fallible command in `if` or `|| true`. No other instances found.
+- Checked, not changed: godwitd's mount guard (`godwit_is_mountpoint()` in
+  `plugin/scripts/lib.php`) checks `/mnt/cache` itself via `mountpoint -q`,
+  not a walk-up to the nearest existing mountpoint — Dormouse's 0.2.3
+  walk-up regression (stopping at `/mnt`, a bind of rootfs on this host)
+  does not apply here.
+
 ## [0.1.1] - 2026-09-15
 
 ### Fixed
