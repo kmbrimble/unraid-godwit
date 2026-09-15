@@ -107,7 +107,12 @@ check "flash .plg reports version $VERSION" \
 check "registered in /var/log/plugins/godwit.plg" \
     "[[ -f /var/log/plugins/godwit.plg ]]"
 check "installed tree complete" \
-    "[[ -f /usr/local/emhttp/plugins/godwit/README.md && -f /usr/local/emhttp/plugins/godwit/Godwit.page && -f /usr/local/emhttp/plugins/godwit/scripts/rc.godwit && -f /usr/local/emhttp/plugins/godwit/scripts/godwitd && -f /usr/local/emhttp/plugins/godwit/scripts/lib.php && -f /usr/local/emhttp/plugins/godwit/scripts/godwit-api.php ]]"
+    "[[ -f /usr/local/emhttp/plugins/godwit/README.md && -f /usr/local/emhttp/plugins/godwit/Godwit.page && -f /usr/local/emhttp/plugins/godwit/scripts/rc.godwit && -f /usr/local/emhttp/plugins/godwit/scripts/godwitd && -f /usr/local/emhttp/plugins/godwit/scripts/lib.php && -f /usr/local/emhttp/plugins/godwit/scripts/godwit-api.php && -f /usr/local/emhttp/plugins/godwit/scripts/array-ready.sh ]]"
+# emhttp_event gates event/* on the executable bit (-x), not -f — this is
+# what it actually checks before invoking a plugin's hook, so that's what
+# must be verified here, not mere existence.
+check "event/started and event/stopping_svcs are present and executable" \
+    "[[ -x /usr/local/emhttp/plugins/godwit/event/started && -x /usr/local/emhttp/plugins/godwit/event/stopping_svcs ]]"
 check "packaged README has no heading" \
     "! grep -q '^#' /usr/local/emhttp/plugins/godwit/README.md"
 
@@ -144,6 +149,15 @@ check "rclone.conf exists under /boot/config" \
 # unset; note in the handback if this still doesn't render the row.
 check "Plugins tab renders the godwit row via ShowPlugins.php" \
     "cd /usr/local/emhttp && php plugins/dynamix.plugin.manager/include/ShowPlugins.php 2>/dev/null | grep -qi godwit"
+
+# array-ready.sh's decision against the REAL var.ini/mountpoint state right
+# now — the array is already up during any install-on-host.sh run, so this
+# should read ready (exit 0). This is a read of live host state, not a
+# simulation: it proves array-ready.sh's var.ini parsing against the real
+# file, not just the fixture files tests/run.php uses offline.
+check "array-ready.sh reads the real var.ini/mountpoint state as ready" \
+    "bash /usr/local/emhttp/plugins/godwit/scripts/array-ready.sh"
+"${SSH[@]}" "grep mdState /var/local/emhttp/var.ini" || true
 
 echo "waiting for the first heartbeat (daemon ticks every 15s)..."
 sleep 20

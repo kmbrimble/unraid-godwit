@@ -76,8 +76,13 @@ mkdir -p &plgPATH;
 # mid-session install/upgrade); a boot-time install defers to the
 # `started` event hook, which fires once the array and cache are actually
 # ready. See array-ready.sh.
+READY=1
+if [[ -f &emhttp;/scripts/array-ready.sh ]]; then
+  bash &emhttp;/scripts/array-ready.sh
+  READY=$?
+fi
 if [[ -f &emhttp;/scripts/rc.godwit ]]; then
-  if [[ -f &emhttp;/scripts/array-ready.sh ]] && bash &emhttp;/scripts/array-ready.sh; then
+  if [[ "$READY" -eq 0 ]]; then
     bash &emhttp;/scripts/rc.godwit start
   else
     echo "&name;: array not started yet — godwitd will start via the 'started' event hook"

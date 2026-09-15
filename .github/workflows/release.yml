@@ -48,7 +48,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
-          extensions: json, sqlite3, pcntl, posix, curl
+          extensions: json, sqlite3, pcntl, posix, curl, simplexml, dom
 
       - name: Require a CHANGES entry for this version
         run: grep -qx "###$VERSION" godwit.plg

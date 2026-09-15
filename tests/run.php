@@ -58,6 +58,15 @@ t('version_sorts_after: minor bump sorts after', function () {
 $plgPath = $repoRoot . '/godwit.plg';
 $plgRaw = file_get_contents($plgPath);
 
+t('godwit.plg: is well-formed XML (a bare & in an INLINE block breaks the plugin manager\'s parse)', function () use ($plgPath) {
+    $prevSetting = libxml_use_internal_errors(true);
+    $parsed = simplexml_load_file($plgPath);
+    $errors = libxml_get_errors();
+    libxml_clear_errors();
+    libxml_use_internal_errors($prevSetting);
+    assert_true($parsed !== false, 'godwit.plg failed to parse as XML: ' . implode('; ', array_map(fn ($e) => trim($e->message), $errors)));
+});
+
 t('godwit.plg: version entity and CHANGES entry match', function () use ($plgRaw) {
     preg_match('/<!ENTITY version\s+"([^"]+)">/', $plgRaw, $m);
     assert_true(isset($m[1]), 'version entity not found');

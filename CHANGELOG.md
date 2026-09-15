@@ -10,30 +10,72 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
-### Plan — 2026-09-15: fix boot-order bug (0.1.1)
+## [0.1.1] - 2026-09-15
 
-0.1.0's `.plg` install step calls `rc.godwit start` unconditionally, but
+### Fixed
+
+0.1.0's `.plg` install step called `rc.godwit start` unconditionally, but
 plugins install ~14s before `/mnt/cache` is mounted at boot (confirmed from
-`/boot/logs/syslog`) — godwitd then creates `appdata/godwit` and
+`/boot/logs/syslog`) — godwitd then created `appdata/godwit` and
 `godwit.db` on the RAM rootfs, which the later cache mount silently covers,
-losing all state at shutdown. Fix:
+losing all state at shutdown. The bug never actually fired on the live host
+(last boot 2026-09-12 11:18; 0.1.0 was installed 2026-09-15 with the array
+already up), but would have on the next reboot.
 
 - `plugin/event/started` + `plugin/event/stopping_svcs` (executable,
   packaged) hook the real emhttpd lifecycle (confirmed via
   `/usr/local/sbin/emhttp_event` and sibling plugins file.activity/
   unbalanced/tips.and.tweaks) instead of relying on boot-time install order.
+  `emhttp_event` gates `event/*` scripts on the **executable bit**
+  (`[ -x $Dir/event/$1 ]`), not `-f` — a documented exception to CLAUDE.md
+  non-negotiable 4, which is about our own `.plg`'s gating of scripts it
+  invokes directly, not about emhttpd's own dispatcher.
 - `plugin/scripts/array-ready.sh` (new): the install step starts the
   daemon only if the array is already `STARTED` (`var.ini`) *and*
   `/mnt/cache` is a real mountpoint; otherwise it defers to the `started`
   event hook.
 - `godwitd` refuses to create/open the state dir unless `/mnt/cache` is a
-  real mountpoint (defense in depth, overridable via env var for tests).
+  real mountpoint (defense in depth, overridable via `GODWIT_ASSUME_CACHE_MOUNTED`
+  for tests — confirmed `mountpoint` is on emhttpd's own PATH
+  `/bin:/sbin:/usr/bin:/usr/sbin` on the host, so the guard works from the
+  `started` event hook's environment, not just an interactive shell's).
 - `rc.godwit stop` escalates to SIGKILL (daemon + bundled rcd) if the
   graceful wait times out, and verifies nothing from the bundled rclone
   binary is left running.
-- Tests for the array-readiness decision, the mount-guard override, and the
-  escalation path. `godwit.plg`'s `launch`/page-menu pairing checked against
-  Dormouse's proven, installed shape — confirmed already correct, no change.
+- `godwit.plg`'s `launch`/page-menu pairing checked against Dormouse's
+  proven, installed shape — confirmed already correct, no change.
+
+### Fixed (found by code-diff-reviewer + advisor before this version shipped)
+
+- `godwit.plg` was no longer well-formed XML: the install step's
+  `&& bash ...` inside an `<INLINE>` block is a bare `&` outside an entity
+  reference, which the plugin manager's XML parser rejects — `plugin
+  install` would have failed on the host even though `release.yml`
+  (sed/grep only) would have shipped it. Rewritten as nested `if`s
+  (Dormouse has no `&&` anywhere in its INLINE blocks). Added an XML
+  well-formedness test (`simplexml_load_file`) so this class can't regress
+  silently again; added `simplexml, dom` to both workflows' PHP extensions.
+- `godwitd`: `getenv('GODWIT_ASSUME_CACHE_MOUNTED') ?: null` collapsed the
+  string `"0"` to `null` (PHP's `?:` treats `"0"` as falsy), silently
+  falling through to the real mountpoint check instead of forcing the
+  guard to fail — breaking the override for exactly the negative case it
+  exists to test. Compared against `getenv()`'s `false`-on-unset sentinel
+  explicitly instead. Test strengthened to point `GODWIT_CACHE_MOUNT_DIR`
+  at `/` (a real mountpoint) so the override is proven to force failure
+  despite the real check being true.
+- `rc.godwit stop()`: the pidfile was removed before confirming a
+  SIGKILL-escalated process (and its rcd child) were actually dead. Since
+  `is_running()` and `restart` (`stop; start`, unconditional) key purely
+  off pidfile presence, a failed kill would let a subsequent start spawn a
+  second godwitd/rcd alongside the still-alive orphan. Moved the `rm -f`
+  after both liveness checks.
+
+### Outstanding
+
+A real reboot / array-stop test is still outstanding — this only exercises
+the event hooks by hand and the install-time gate against the *current*
+array state, not an actual boot cycle. Kieren needs to schedule a real
+reboot to close this out fully.
 
 ## [0.1.0] - 2026-09-15 (verified on host 2026-09-15)
 

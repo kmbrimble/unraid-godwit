@@ -30,11 +30,23 @@ needs `curl`, `unzip` and `xz-utils`.)
    up to 5 minutes), then checks: flash `.plg` version, package registration,
    installed tree, stock README, bundled rclone reports v1.75.1, `rc.godwit`
    status, exactly one `godwitd` and one `rcd` process (from the bundled
-   binary), the rcd unix socket present, `rclone.conf` created 0600, the
-   Plugins-tab row rendering through the host's own `ShowPlugins.php`, the
-   settings-page status call reporting the rclone version, and that
-   `/usr/sbin/rclone` and the Waseh plugin's files are byte-for-byte
-   unchanged (md5 + mtime snapshot before and after).
+   binary), the rcd unix socket present, `rclone.conf` created 0600, that
+   `event/started` and `event/stopping_svcs` are present **and executable**
+   (`emhttp_event` gates on `-x`, not `-f` — see non-negotiable 4's
+   exception), that `array-ready.sh` reads the live `var.ini`/mountpoint
+   state as ready, the Plugins-tab row rendering through the host's own
+   `ShowPlugins.php`, the settings-page status call reporting the rclone
+   version, and that `/usr/sbin/rclone` and the Waseh plugin's files are
+   byte-for-byte unchanged (md5 + mtime snapshot before and after).
+   As of 0.1.1, also confirm by hand: invoking Godwit's own
+   `event/stopping_svcs` then `event/started` stops and restarts the
+   daemon and rcd cleanly (pgrep counts and socket presence before/after).
+   **Not covered by any of this:** a real reboot or array-stop/start
+   cycle — only the event hooks fired by hand and the install-time gate
+   against whatever the array's state happens to be *right now*. A real
+   reboot test is outstanding and needs to be scheduled deliberately
+   (rebooting the host is not one of this phase's allowed automatic
+   actions).
 2. `scripts/uninstall-on-host.sh` — removes and asserts a clean revert: no
    flash `.plg`, no flash plugin dir (including `rclone.conf` — nothing to
    preserve yet, see the decision recorded in `godwit.plg`'s remove block
@@ -77,6 +89,23 @@ project.
    `FILE` block invokes must have a shebang and be gated on `[[ -f script ]]`,
    never `[[ -x script ]]` — an executable-bit check silently skips a script
    that lost its bit in transit.
+   **Exception: `plugin/event/*` hooks.** `emhttpd`'s own dispatcher
+   (`/usr/local/sbin/emhttp_event` on the host) gates these on the
+   executable bit (`[ -x $Dir/event/$1 ]`), not `-f` — that is Unraid's own
+   code, not this repo's `.plg` gating convention, and cannot be changed.
+   `build-plugin.sh` must `chmod +x` every `event/*` script; a lost bit
+   there means the hook silently never fires (confirmed on 0.1.1's boot-
+   order fix).
+4a. **A bare `&` inside a `.plg` `<INLINE>` block breaks the XML parse.**
+   The plugin manager parses `.plg` as XML with entity substitution
+   (`&emhttp;`, `&name;`, etc.) — a literal `&&` (or any other bare `&`)
+   is a well-formedness error that `plugin install` rejects on the host,
+   even though `release.yml`'s sed/grep-only pipeline will still tag and
+   publish it. Use nested `if`s instead of `&&` (plain `||`, with no `&`
+   character, is fine — `bash ... stop || true` already relies on it
+   elsewhere). `tests/run.php` parses the `.plg` with `simplexml_load_file`
+   to catch this class before it ships (added after 0.1.1 nearly shipped
+   one, caught by review before it reached a release).
 5. **`upgradepkg` may leave both versions in `/var/log/packages/`.**
    Cosmetic (tmpfs, rebuilt at boot), not a bug.
 6. **`gh release list` is not evidence about what is on the host.** Read the
