@@ -121,6 +121,13 @@ function godwit_daemon_running(string $pidFile): bool
  */
 function godwit_rc_call(array $listener, string $rcPath): ?array
 {
+    // PLAN.md §2 lists sqlite3/pcntl/posix as confirmed on the host but not
+    // curl — if it turns out to be absent, this must degrade to "no
+    // heartbeat data" rather than fatal the whole daemon on an undefined
+    // function call.
+    if (!function_exists('curl_init')) {
+        return null;
+    }
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, '{}');

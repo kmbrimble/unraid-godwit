@@ -99,7 +99,11 @@ $configPath = $cfgDir . '/rclone.conf';
 if (!file_exists($configPath)) {
     touch($configPath);
 }
-chmod($configPath, 0600);
+// /boot/config is a vfat mount on the host — chmod() there is a no-op (mode
+// comes from the mount's fmask/dmask) and PHP logs an EPERM warning on every
+// daemon start if not suppressed. Best-effort only; the actual mode is
+// whatever the mount enforces, not necessarily 0600.
+@chmod($configPath, 0600);
 
 if (!is_dir($runDir)) {
     mkdir($runDir, 0700, true);
@@ -152,6 +156,14 @@ while ($running) {
     if ($rcd === null && $running) {
         $rcd = godwit_start_rcd($rcloneBin, $configPath, $runDir, $rcdLogFile, $logFile);
         $rcdStartedAt = time();
+        if ($rcd === null) {
+            // Both the unix-socket attempt and the tcp fallback failed to
+            // start (e.g. a broken binary) — back off the same as a crash,
+            // or this loop retries every second forever with no delay.
+            godwit_log($logFile, "rcd failed to start on both listeners — retrying in {$backoffSeconds}s");
+            sleep($backoffSeconds);
+            $backoffSeconds = min($backoffSeconds * 2, 60);
+        }
     }
 
     if ($db !== null && $rcd !== null && $now - $lastHeartbeat >= 15) {

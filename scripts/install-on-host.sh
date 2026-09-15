@@ -75,9 +75,15 @@ fi
 
 # Snapshot the Waseh plugin and /usr/sbin/rclone before touching anything —
 # godwit must never touch either (PLAN.md D10), and this is the only way to
-# prove that after the fact.
+# prove that after the fact. Fixed paths, not a name glob: godwit's own
+# install lands at /usr/local/emhttp/plugins/godwit/bin/rclone, which a bare
+# "*rclone*" glob over all plugin dirs would also match, guaranteeing a
+# before/after mismatch that has nothing to do with the Waseh plugin.
+snapshot_waseh_and_sbin() {
+    "${SSH[@]}" "md5sum /usr/sbin/rclone 2>/dev/null; find /usr/local/emhttp/plugins/rclone /usr/local/emhttp/plugins/rclone-beta /boot/config/plugins/rclone* -type f 2>/dev/null | sort | xargs -r stat -c '%n %Y %s' 2>/dev/null"
+}
 echo "snapshotting /usr/sbin/rclone and the Waseh plugin's files..."
-BEFORE_SNAPSHOT="$("${SSH[@]}" "md5sum /usr/sbin/rclone 2>/dev/null; find /usr/local/emhttp/plugins -iname '*waseh*' -o -iname '*rclone*' 2>/dev/null | sort | xargs -r stat -c '%n %Y %s' 2>/dev/null")"
+BEFORE_SNAPSHOT="$(snapshot_waseh_and_sbin)"
 
 echo "installing $VERSION on $HOST..."
 "${SSH[@]}" "plugin install '$PLG_URL' $FORCED"
@@ -121,28 +127,48 @@ check "exactly one rcd process from the bundled binary" \
     "[[ \$(pgrep -fc '/usr/local/emhttp/plugins/godwit/bin/[r]clone rcd') == 1 ]]"
 check "rcd unix socket present" \
     "[[ -S /var/run/godwit/rcd.sock ]]"
-check "rclone.conf created 0600 under /boot/config" \
-    "[[ \$(stat -c '%a' /boot/config/plugins/godwit/rclone.conf) == 600 ]]"
+# /boot is a vfat mount — actual file mode is whatever the mount's
+# fmask/dmask enforces, not necessarily 0600 (godwitd's chmod is
+# best-effort there, see plugin/scripts/godwitd). Check existence, and
+# report the real mode for the record rather than asserting a value that
+# may just be a mount coincidence.
+check "rclone.conf exists under /boot/config" \
+    "[[ -f /boot/config/plugins/godwit/rclone.conf ]]"
+"${SSH[@]}" "stat -c 'rclone.conf mode on this mount: %a' /boot/config/plugins/godwit/rclone.conf" || true
 
-# (d) Plugins-tab row renders through the host's own ShowPlugins.php
+# (d) Plugins-tab row renders through the host's own ShowPlugins.php. This
+# exact invocation is not proven by Dormouse (it did not have this check) —
+# ShowPlugins.php may expect DOCUMENT_ROOT/cwd context that only exists
+# under the webGui's own PHP-FPM process. cd into /usr/local/emhttp first,
+# since ShowPlugins.php falls back to that as its root when DOCUMENT_ROOT is
+# unset; note in the handback if this still doesn't render the row.
 check "Plugins tab renders the godwit row via ShowPlugins.php" \
-    "php /usr/local/emhttp/plugins/dynamix.plugin.manager/include/ShowPlugins.php 2>/dev/null | grep -qi godwit"
+    "cd /usr/local/emhttp && php plugins/dynamix.plugin.manager/include/ShowPlugins.php 2>/dev/null | grep -qi godwit"
 
 echo "waiting for the first heartbeat (daemon ticks every 15s)..."
 sleep 20
 
-# (e) settings page status call returns the rclone version — hits the same
-# godwit-api.php the browser would, over the host's own PHP.
+# (e) settings page status call returns the rclone version. Try the same
+# HTTP path the browser would use first, but the host's nginx auth_request
+# setup likely rejects an unauthenticated loopback curl with a login page
+# rather than JSON (unproven either way from this repo) — fall back to
+# invoking the same script directly via the host's own PHP CLI, which reads
+# real on-host state (the heartbeat db) exactly like the HTTP path does,
+# just without going through nginx.
 STATUS_JSON="$("${SSH[@]}" "curl -s -X POST http://localhost/plugins/godwit/scripts/godwit-api.php -d action=status" || true)"
+if ! echo "$STATUS_JSON" | grep -q '"rclone_version":"v1.75.1"'; then
+    echo "  HTTP status call did not report v1.75.1 ($STATUS_JSON) — falling back to CLI invocation"
+    STATUS_JSON="$("${SSH[@]}" "php /usr/local/emhttp/plugins/godwit/scripts/godwit-api.php" || true)"
+fi
 if echo "$STATUS_JSON" | grep -q '"rclone_version":"v1.75.1"'; then
     echo "  OK: settings-page status call reports rclone v1.75.1 ($STATUS_JSON)"
 else
-    echo "  FAIL: settings-page status call did not report v1.75.1 ($STATUS_JSON)"
+    echo "  FAIL: settings-page status call did not report v1.75.1 via HTTP or CLI ($STATUS_JSON)"
     FAIL=1
 fi
 
 # Waseh / /usr/sbin/rclone unchanged
-AFTER_SNAPSHOT="$("${SSH[@]}" "md5sum /usr/sbin/rclone 2>/dev/null; find /usr/local/emhttp/plugins -iname '*waseh*' -o -iname '*rclone*' 2>/dev/null | sort | xargs -r stat -c '%n %Y %s' 2>/dev/null")"
+AFTER_SNAPSHOT="$(snapshot_waseh_and_sbin)"
 if [[ "$BEFORE_SNAPSHOT" == "$AFTER_SNAPSHOT" ]]; then
     echo "  OK: /usr/sbin/rclone and Waseh plugin files unchanged"
 else

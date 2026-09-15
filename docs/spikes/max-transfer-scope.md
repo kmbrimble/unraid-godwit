@@ -57,12 +57,15 @@ core/stats (global, no group):  {"bytes":16777216,"transfers":8,...}
 du -sh dst_a dst_b: 8.0M each
 ```
 
-Both jobs independently transferred **~8 MiB each**, not a combined ~3 MiB.
-Job B's own stats group has no knowledge of job A's bytes — if the cap were
-enforced against a shared process total, job B would have started already
-over budget (job A alone exceeded 3 MiB) and transferred nothing. It didn't:
-it ran to its own independent cutoff. The global `core/stats` total (16 MiB)
-is simply the sum of the two per-job groups, not a shared enforcement point.
+The strongest evidence is the global total: `core/stats` with no group
+filter reports **16 MiB transferred**, more than five times either job's own
+3 MiB cap. If `MaxTransfer` were enforced against that process-wide total,
+the second job to reach the check would have been stopped almost
+immediately, well under 8 MiB — it wasn't. Both jobs independently ran to
+their *own* ~8 MiB cutoff, and the two per-job stats groups simply sum to
+the global total; the global figure is not itself an enforcement point.
+(The two jobs started only ~7ms apart, so job B's stats being unaffected by
+job A's is corroborating, not the main signal — the 16 MiB-vs-3 MiB gap is.)
 
 **Conclusion: `MaxTransfer` (and by extension `CutoffMode`) passed via
 per-call `_config` is scoped to that job's own stats group.** Two jobs
@@ -91,3 +94,13 @@ is exact — it can overshoot by up to `transfers × max file size` inside a
 single job. The ledger's own periodic check (sampling `core/stats` for that
 job's group) is still necessary and should not treat `MaxTransfer` alone as
 sufficient to hit a byte-exact cap.
+
+**Note on `CutoffMode`:** this spike used `CutoffMode: SOFT` (finishes
+in-flight transfers, as shown above) rather than PLAN.md §4.3's `cautious`.
+The per-job-vs-process-total scope finding is a property of which stats
+group `MaxTransfer` is checked against, and is independent of cutoff mode —
+but the *overshoot magnitude* documented above is specific to `SOFT` and has
+not been re-measured under `cautious` (expected to cut off sooner, since it
+avoids starting new transfers that would be projected to exceed the limit,
+so it should overshoot less, not more). Worth a quick re-check before
+Phase 3 relies on the exact overshoot figure.
