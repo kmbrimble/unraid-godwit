@@ -6,8 +6,10 @@ Offsite backup for Unraid, built as a GUI over [rclone](https://rclone.org/).
 Named for the bar-tailed godwit, the bird that holds the record for the
 longest non-stop flight of any species and lands in Australia every year.
 
-**Status: not yet built.** This repo is scaffolding; Phase 1 (packaging and
-the release pipeline) has not started.
+**Status: Phase 1 shipped.** The plugin installs, runs a supervised daemon
+(`rc.godwit` / `godwitd`) that manages a single bundled `rclone rcd`, and
+shows read-only status on Settings → Godwit. No remotes, jobs or uploads
+yet — those land in later phases.
 
 ## What it does
 
@@ -32,7 +34,11 @@ Add this URL in the Unraid Plugins tab ("Install Plugin"):
 https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg
 ```
 
-(Not yet published — nothing has shipped.)
+## Test
+
+```
+php tests/run.php
+```
 
 ## Licence
 

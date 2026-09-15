@@ -6,8 +6,46 @@ is never committed. This file is derived from it and from the repo as it
 stands — if the two conflict, re-derive this file from the current repo
 state, not from memory of an earlier plan.
 
-**Nothing is built yet.** Phase 1 (scaffold + release pipeline) has not
-started. There is no test command yet — add one here once Phase 1 lands it.
+**Phase 1 (scaffold + release pipeline) is built and verified on the host.**
+See PLAN.md §5 for the remaining phases.
+
+## Test command
+
+```
+php tests/run.php
+```
+
+(Requires `php-cli`, `php-sqlite3`, `php-curl`; `apt-get install -y php-cli
+php-sqlite3 php-curl` if missing. `scripts/build-plugin.sh` additionally
+needs `curl`, `unzip` and `xz-utils`.)
+
+## Deploy and verify
+
+1. `scripts/install-on-host.sh [version] [--forced]` — installs or upgrades
+   on the live host, waiting for the CDN copy of `godwit.plg` to converge on
+   the released version and md5 first (raw.githubusercontent.com caches for
+   up to 5 minutes), then checks: flash `.plg` version, package registration,
+   installed tree, stock README, bundled rclone reports v1.75.1, `rc.godwit`
+   status, exactly one `godwitd` and one `rcd` process (from the bundled
+   binary), the rcd unix socket present, `rclone.conf` created 0600, the
+   Plugins-tab row rendering through the host's own `ShowPlugins.php`, the
+   settings-page status call reporting the rclone version, and that
+   `/usr/sbin/rclone` and the Waseh plugin's files are byte-for-byte
+   unchanged (md5 + mtime snapshot before and after).
+2. `scripts/uninstall-on-host.sh` — removes and asserts a clean revert: no
+   flash `.plg`, no flash plugin dir (including `rclone.conf` — nothing to
+   preserve yet, see the decision recorded in `godwit.plg`'s remove block
+   and in CHANGELOG.md 0.1.0), no installed tree, no plugin-manager
+   registration, no `godwitd` process, no `rcd` process, no unix socket, no
+   `/var/run/godwit/` rundir, no pid file, no package entry. The heartbeat
+   db under `/mnt/cache/appdata/godwit/` is deliberately preserved.
+3. Watch the release workflow with `gh run list` / `gh run watch <id>
+   --exit-status` after every push to `main`. Release is automatic on merge
+   to `main` (`.github/workflows/release.yml`); only *then* run step 1.
+4. Host access for this phase is scoped to installing, uninstalling and
+   reinstalling Godwit itself, via `ssh -i /root/.ssh/unraid_secretsman
+   root@192.168.0.10` and the plugin manager (`plugin install`/`plugin
+   remove`) — no other plugin, container, share or config on that host.
 
 ## Non-negotiable constraints
 

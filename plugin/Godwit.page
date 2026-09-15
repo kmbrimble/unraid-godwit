@@ -1,0 +1,56 @@
+Menu="Utilities"
+Title="Godwit"
+Icon="upload"
+Tabs="false"
+Markdown="false"
+---
+<?php
+$pidFile = '/var/run/godwit.pid';
+$running = false;
+if (file_exists($pidFile)) {
+    $pid = (int) trim((string) file_get_contents($pidFile));
+    $running = $pid > 0 && posix_kill($pid, 0);
+}
+?>
+<h1>Godwit</h1>
+<p>Phase 1 — scaffold. No remotes, no jobs, no uploads yet; this page shows daemon status only.</p>
+<p>Service status: <b><?= $running ? 'running' : 'stopped' ?></b></p>
+
+<button id="godwit-start" type="button">Start</button>
+<button id="godwit-stop" type="button">Stop</button>
+
+<div id="godwit-status">Loading status…</div>
+
+<script>
+function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
+function godwitRender(data) {
+    var el = document.getElementById('godwit-status');
+    if (data.error) {
+        el.innerHTML = '<p>' + esc(data.error) + '</p>';
+        return;
+    }
+    var html = '';
+    html += '<p>Daemon: <b>' + (data.daemon_running ? 'running' : 'stopped') + '</b></p>';
+    html += '<p>Bundled rclone: ' + esc(data.rclone_version || 'unknown') + '</p>';
+    html += '<p>rcd listener: ' + esc(data.listener || 'none') + '</p>';
+    html += '<p>rc/noop: ' + (data.rc_noop_ok ? 'ok' : 'failed') + '</p>';
+    html += '<p>Last heartbeat: ' +
+        (data.last_heartbeat_ts ? esc(new Date(data.last_heartbeat_ts * 1000).toLocaleString()) : 'never') + '</p>';
+    el.innerHTML = html;
+}
+
+function godwitPoll(action) {
+    $.post('/plugins/godwit/scripts/godwit-api.php', { csrf_token: csrf_token, action: action || 'status' }, godwitRender, 'json');
+}
+
+document.getElementById('godwit-start').addEventListener('click', function () { godwitPoll('start'); });
+document.getElementById('godwit-stop').addEventListener('click', function () { godwitPoll('stop'); });
+
+godwitPoll();
+setInterval(godwitPoll, 15000);
+</script>

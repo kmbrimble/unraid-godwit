@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: json, sqlite3, pcntl, posix, curl
+
+      - name: Lint PHP
+        run: |
+          find plugin scripts tests -name '*.php' -print0 | xargs -0 -n1 php -l
+          php -l plugin/scripts/godwitd
+
+      - name: Run tests
+        run: php tests/run.php

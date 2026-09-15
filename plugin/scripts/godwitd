@@ -1,0 +1,186 @@
+#!/usr/bin/php
+<?php
+/**
+ * Godwit daemon — Phase 1. Starts and supervises a single bundled `rclone
+ * rcd` process, restarting it with backoff if it dies, and records a
+ * heartbeat (start time, rcd pid, listener, rc/noop + core/version results)
+ * to SQLite every 15s. No remotes, no jobs, no uploads yet.
+ *
+ * Paths are overridable via GODWIT_PIDFILE / GODWIT_LOG / GODWIT_RUNDIR /
+ * GODWIT_STATEDIR / GODWIT_CFGDIR / GODWIT_RCLONE so tests can exercise the
+ * argv builder without touching real paths. This file itself is not
+ * exercised end-to-end by tests/run.php (it supervises a real child
+ * process) — only its pure building blocks in lib.php are.
+ */
+declare(strict_types=1);
+
+require __DIR__ . '/lib.php';
+
+$pidFile = getenv('GODWIT_PIDFILE') ?: '/var/run/godwit.pid';
+$logFile = getenv('GODWIT_LOG') ?: '/var/log/godwit.log';
+$runDir = getenv('GODWIT_RUNDIR') ?: '/var/run/godwit';
+$stateDir = getenv('GODWIT_STATEDIR') ?: '/mnt/cache/appdata/godwit';
+$cfgDir = getenv('GODWIT_CFGDIR') ?: '/boot/config/plugins/godwit';
+$rcloneBin = getenv('GODWIT_RCLONE') ?: dirname(__DIR__) . '/bin/rclone';
+
+function godwit_log(string $logFile, string $message): void
+{
+    $line = sprintf('[%s] %s%s', date('Y-m-d H:i:s'), $message, PHP_EOL);
+    file_put_contents($logFile, $line, FILE_APPEND);
+}
+
+/**
+ * Tries a unix socket listener first; if rcd exits or the socket never
+ * appears within ~2s, falls back to 127.0.0.1 on a free port with generated
+ * credentials. Returns ['proc' => resource, 'listener' => array] on success,
+ * null if even the fallback failed to start.
+ */
+function godwit_start_rcd(string $rcloneBin, string $configPath, string $runDir, string $rcdLogFile, string $logFile): ?array
+{
+    $sockPath = $runDir . '/rcd.sock';
+    @unlink($sockPath);
+    $unixListener = ['type' => 'unix', 'path' => $sockPath];
+    $proc = godwit_spawn_rcd($rcloneBin, $configPath, $unixListener, $rcdLogFile);
+
+    for ($i = 0; $i < 20; $i++) {
+        usleep(100000);
+        if (file_exists($sockPath)) {
+            godwit_log($logFile, "rcd listening on unix socket $sockPath");
+            return ['proc' => $proc, 'listener' => $unixListener];
+        }
+        $status = proc_get_status($proc);
+        if (!$status['running']) {
+            break;
+        }
+    }
+
+    godwit_log($logFile, 'unix socket listener did not come up — falling back to tcp');
+    proc_terminate($proc);
+    proc_close($proc);
+
+    $tcpListener = [
+        'type' => 'tcp',
+        'host' => '127.0.0.1',
+        'port' => godwit_free_tcp_port(),
+        'user' => godwit_generate_credential(),
+        'pass' => godwit_generate_credential(),
+    ];
+    $proc = godwit_spawn_rcd($rcloneBin, $configPath, $tcpListener, $rcdLogFile);
+    usleep(500000);
+    $status = proc_get_status($proc);
+    if (!$status['running']) {
+        proc_close($proc);
+        godwit_log($logFile, 'tcp fallback listener failed to start');
+        return null;
+    }
+    godwit_log($logFile, "rcd listening on tcp {$tcpListener['host']}:{$tcpListener['port']}");
+    return ['proc' => $proc, 'listener' => $tcpListener];
+}
+
+function godwit_spawn_rcd(string $rcloneBin, string $configPath, array $listener, string $rcdLogFile)
+{
+    $argv = godwit_rcd_argv($rcloneBin, $configPath, $listener, $rcdLogFile);
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['file', $rcdLogFile, 'a'], 2 => ['file', $rcdLogFile, 'a']];
+    $proc = proc_open($argv, $descriptors, $pipes);
+    if ($proc === false) {
+        throw new \RuntimeException('failed to spawn rclone rcd');
+    }
+    fclose($pipes[0]);
+    return $proc;
+}
+
+file_put_contents($pidFile, getmypid() . PHP_EOL);
+godwit_log($logFile, 'godwitd started (pid ' . getmypid() . ')');
+
+if (!is_dir($cfgDir)) {
+    mkdir($cfgDir, 0755, true);
+}
+$configPath = $cfgDir . '/rclone.conf';
+if (!file_exists($configPath)) {
+    touch($configPath);
+}
+chmod($configPath, 0600);
+
+if (!is_dir($runDir)) {
+    mkdir($runDir, 0700, true);
+}
+
+if (!@is_dir($stateDir) && !@mkdir($stateDir, 0755, true)) {
+    godwit_log($logFile, "WARNING: could not create state dir $stateDir — heartbeat will not be recorded");
+}
+$dbPath = $stateDir . '/godwit.db';
+$db = null;
+try {
+    if (is_dir($stateDir)) {
+        $db = godwit_open_db($dbPath);
+    }
+} catch (\Throwable $e) {
+    godwit_log($logFile, 'WARNING: could not open heartbeat db: ' . $e->getMessage());
+}
+
+$running = true;
+pcntl_async_signals(true);
+pcntl_signal(SIGTERM, function () use (&$running) {
+    $running = false;
+});
+
+$daemonStartTs = time();
+$rcdLogFile = $runDir . '/rcd.log';
+$rcd = godwit_start_rcd($rcloneBin, $configPath, $runDir, $rcdLogFile, $logFile);
+$backoffSeconds = 1;
+$rcdStartedAt = time();
+$lastHeartbeat = 0;
+$lastTrim = 0;
+
+while ($running) {
+    sleep(1);
+    $now = time();
+
+    if ($rcd !== null) {
+        $status = proc_get_status($rcd['proc']);
+        if (!$status['running']) {
+            godwit_log($logFile, "rcd exited (pid {$status['pid']}) — restarting in {$backoffSeconds}s");
+            proc_close($rcd['proc']);
+            $rcd = null;
+            sleep($backoffSeconds);
+            $backoffSeconds = min($backoffSeconds * 2, 60);
+        } elseif ($now - $rcdStartedAt > 60) {
+            $backoffSeconds = 1;
+        }
+    }
+
+    if ($rcd === null && $running) {
+        $rcd = godwit_start_rcd($rcloneBin, $configPath, $runDir, $rcdLogFile, $logFile);
+        $rcdStartedAt = time();
+    }
+
+    if ($db !== null && $rcd !== null && $now - $lastHeartbeat >= 15) {
+        $status = proc_get_status($rcd['proc']);
+        $noop = godwit_rc_call($rcd['listener'], 'rc/noop');
+        $version = godwit_rc_call($rcd['listener'], 'core/version');
+        $listenerDesc = $rcd['listener']['type'] === 'unix'
+            ? 'unix:' . $rcd['listener']['path']
+            : 'tcp:' . $rcd['listener']['host'] . ':' . $rcd['listener']['port'];
+        godwit_record_heartbeat(
+            $db,
+            $now,
+            $daemonStartTs,
+            $status['pid'],
+            $listenerDesc,
+            $noop !== null,
+            $version['version'] ?? null
+        );
+        $lastHeartbeat = $now;
+    }
+
+    if ($db !== null && $now - $lastTrim >= 3600) {
+        godwit_trim_heartbeat($db, $now);
+        $lastTrim = $now;
+    }
+}
+
+if ($rcd !== null) {
+    proc_terminate($rcd['proc']);
+    proc_close($rcd['proc']);
+}
+godwit_log($logFile, 'godwitd stopping (pid ' . getmypid() . ')');

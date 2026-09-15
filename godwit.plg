@@ -1,0 +1,95 @@
+<?xml version="1.0" standalone="yes"?>
+
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "godwit">
+<!ENTITY author    "kmbrimble">
+<!ENTITY version   "0.1.0">
+<!ENTITY launch    "Settings/Godwit">
+<!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
+<!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
+<!ENTITY plgPATH   "/boot/config/plugins/&name;">
+<!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
+<!ENTITY md5       "00000000000000000000000000000000">
+]>
+
+<PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
+
+<CHANGES>
+###0.1.0
+- Initial scaffold release: plugin installs, registers an empty Settings/Godwit
+  page, and runs a supervised daemon (rc.godwit / godwitd) that starts and
+  restarts a single bundled rclone rcd process (unix socket, or a
+  127.0.0.1 fallback with generated credentials — never --rc-no-auth). No
+  remotes, jobs or uploads yet — this release proves the packaging and
+  release pipeline plus D10's bundled, SHA256-verified rclone binary.
+</CHANGES>
+
+<FILE Name="&plgPATH;/&name;-&version;.txz">
+<URL>&gitURL;/&name;-&version;.txz</URL>
+<MD5>&md5;</MD5>
+</FILE>
+
+<!--
+Install step. Every script invoked below is checked with `-f` (file exists),
+never `-x` (executable bit) — an executable-bit check can silently skip a
+script that lost its bit in transit. See CLAUDE.md non-negotiable 4.
+-->
+<FILE Run="/bin/bash">
+<INLINE>
+set -e
+
+# Stop any already-running daemon from a previous version first — rc.godwit's
+# start is idempotent (a no-op while a live pid exists), so without this an
+# upgrade would silently leave the OLD process (and its rcd child) running
+# under the newly unpacked files instead of restarting it.
+if [[ -f &emhttp;/scripts/rc.godwit ]]; then
+  bash &emhttp;/scripts/rc.godwit stop || true
+fi
+
+# Remove any previously installed package version before upgrading — leaves
+# no stale package entry in /var/log/packages from an older release.
+for pkg in /var/log/packages/&name;-*; do
+  if [[ -f "$pkg" ]]; then
+    removepkg "$(basename "$pkg")"
+  fi
+done
+
+upgradepkg --install-new &plgPATH;/&name;-&version;.txz
+
+mkdir -p &plgPATH;
+
+if [[ -f &emhttp;/scripts/rc.godwit ]]; then
+  bash &emhttp;/scripts/rc.godwit start
+fi
+
+echo "&name;: install complete"
+</INLINE>
+</FILE>
+
+<!--
+Remove step. Stops the daemon (which stops its rcd child), removes the
+package, the installed tree, the flash config dir (including rclone.conf —
+Phase 1 ships it empty, so there is nothing to preserve yet; this is
+revisited deliberately if Phase 2 adds OAuth tokens to it), and any runtime
+pid/log leftovers.
+-->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+if [[ -f &emhttp;/scripts/rc.godwit ]]; then
+  bash &emhttp;/scripts/rc.godwit stop || true
+fi
+
+removepkg &name;-&version; || true
+
+rm -rf &emhttp;
+rm -rf &plgPATH;
+rm -rf /var/run/godwit
+
+rm -f /var/run/godwit.pid
+rm -f /var/log/godwit.log
+
+echo "&name;: removed"
+</INLINE>
+</FILE>
+
+</PLUGIN>

@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_release: ${{ steps.tag.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from godwit.plg
+        id: version
+        run: |
+          VERSION=$(sed -rn 's|^<!ENTITY version[[:space:]]+"([^"]+)">.*|\1|p' godwit.plg)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if this version is already tagged
+        id: tag
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          extensions: json, sqlite3, pcntl, posix, curl
+
+      - name: Require a CHANGES entry for this version
+        run: grep -qx "###$VERSION" godwit.plg
+
+      - name: Version-sort guard (strcmp, matching dynamix.plugin.manager)
+        run: |
+          PREV_TAG=$(git tag --list 'v*' | sort -V | tail -n1)
+          if [[ -n "$PREV_TAG" ]]; then
+            PREV_VERSION="${PREV_TAG#v}"
+            php scripts/version-sorts-after.php "$PREV_VERSION" "$VERSION"
+          fi
+
+      - name: Lint
+        run: |
+          find plugin scripts tests -name '*.php' -print0 | xargs -0 -n1 php -l
+          php -l plugin/scripts/godwitd
+
+      - name: Test
+        run: php tests/run.php
+
+      - name: Build package
+        id: build
+        run: |
+          bash scripts/build-plugin.sh "$VERSION"
+          MD5=$(md5sum "dist/godwit-$VERSION.txz" | awk '{print $1}')
+          echo "md5=$MD5" >> "$GITHUB_OUTPUT"
+
+      - name: Write real md5 into godwit.plg
+        run: |
+          sed -ri "s|(<!ENTITY md5 *\")[^\"]*(\">)|\1${{ steps.build.outputs.md5 }}\2|" godwit.plg
+          grep -q "${{ steps.build.outputs.md5 }}" godwit.plg
+
+      - name: Commit md5 update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add godwit.plg
+          git commit -m "release: write md5 for v$VERSION"
+          git push origin HEAD:main
+
+      - name: Tag
+        run: |
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" \
+            "dist/godwit-$VERSION.txz" \
+            --title "v$VERSION" \
+            --notes "See CHANGELOG.md"
