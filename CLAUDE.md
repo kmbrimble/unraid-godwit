@@ -6,9 +6,11 @@ is never committed. This file is derived from it and from the repo as it
 stands — if the two conflict, re-derive this file from the current repo
 state, not from memory of an earlier plan.
 
-**Phase 1 (scaffold + release pipeline) is built; host verification is
-pending Step 8 of this session (see CHANGELOG.md).** See PLAN.md §5 for the
-remaining phases.
+**Phase 1 (scaffold + release pipeline) is built and verified on the host**
+(v0.1.0, verified 2026-09-15: install, uninstall, reinstall, all via
+`scripts/install-on-host.sh` / `scripts/uninstall-on-host.sh` against the
+live host over ssh — see CHANGELOG.md for the full checklist). See PLAN.md
+§5 for the remaining phases.
 
 ## Test command
 

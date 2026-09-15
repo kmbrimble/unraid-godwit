@@ -10,7 +10,7 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-09-15
+## [0.1.0] - 2026-09-15 (verified on host 2026-09-15)
 
 ### Added
 
@@ -74,6 +74,38 @@ sort *before* `1.0.9`.
   vfat mount (mode is mount-determined, not code-determined). The (e)
   status check now falls back to a CLI PHP invocation if the HTTP path is
   blocked by nginx's `auth_request`.
+
+### Verified on the live host (2026-09-15, install → uninstall → reinstall)
+
+- (a) flash `.plg` reports version 0.1.0.
+- (b) bundled `/usr/local/emhttp/plugins/godwit/bin/rclone version` → v1.75.1.
+- (c) exactly one `godwitd` and one `rcd` process from the bundled binary;
+  `/var/run/godwit/rcd.sock` present.
+- (d) the Plugins-tab row renders through the host's own `ShowPlugins.php`
+  (`cd /usr/local/emhttp && php plugins/dynamix.plugin.manager/include/ShowPlugins.php`).
+- (e) the settings-page status call reports `rclone_version":"v1.75.1"`. The
+  plain HTTP path (`curl http://localhost/plugins/godwit/scripts/godwit-api.php`)
+  returned nothing, as anticipated — the host's nginx `auth_request` blocks
+  an unauthenticated loopback call; the CLI-PHP fallback
+  (`php .../godwit-api.php` directly) is what actually produced the
+  evidence, and is the one that will need proving through a real browser
+  session with a valid `csrf_token` later.
+- (f) uninstall left no flash `.plg`, no flash config dir, no installed
+  tree, no plugin-manager registration, no `godwitd`/`rcd` process, no
+  socket, no rundir, no pidfile, no package entry — all ten checks passed.
+- (g) reinstall succeeded and repeated (a)-(e) cleanly.
+- `/usr/sbin/rclone` (md5 unchanged) and the Waseh plugin's files
+  (`rclone`/`rclone-beta` dirs, `rclone.plg`) were confirmed byte-for-byte
+  unchanged before vs. after the full install/uninstall/reinstall cycle.
+- The heartbeat db under `/mnt/cache/appdata/godwit/godwit.db` (WAL)
+  persisted across the uninstall/reinstall cycle, as designed.
+- Host's `/boot` mount has `fmask=0177`, which independently yields 0600 on
+  new files — `rclone.conf` got 0600 in practice on this host, though the
+  daemon's `chmod` there is still best-effort (not all vfat mounts share
+  this fmask).
+- Host's PHP has the `curl` extension (not in PLAN.md §2's confirmed list,
+  now confirmed) — `godwit_rc_call()`'s no-curl fallback exists for
+  portability but was not exercised live.
 
 ### Decisions made during this unattended session (not in PLAN.md)
 
