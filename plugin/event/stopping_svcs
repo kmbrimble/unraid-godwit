@@ -1,0 +1,8 @@
+#!/bin/bash
+# emhttpd fires this during cmdStop, about to stop network services — before
+# unmounting_disks. This is the right point to release godwitd's rcd child
+# (which will hold files open under /mnt/user in later phases) before the
+# array/cache actually unmount, matching how file.activity/unbalanced/
+# tips.and.tweaks stop their own daemons (confirmed via their installed
+# event/stopping_svcs scripts on the host).
+bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/rc.godwit" stop

@@ -7,6 +7,40 @@
 declare(strict_types=1);
 
 /**
+ * Whether $dir is a real mountpoint (a separate filesystem from its
+ * parent), via the `mountpoint` CLI. Used to refuse creating godwit's
+ * state dir under /mnt/cache before the cache pool is actually mounted —
+ * at boot, plugins install ~14s before that mount happens, and writing
+ * there beforehand silently lands on the RAM rootfs, covered up (and lost)
+ * once the real mount lands on top of it.
+ */
+function godwit_is_mountpoint(string $dir): bool
+{
+    if (!is_dir($dir)) {
+        return false;
+    }
+    exec('mountpoint -q ' . escapeshellarg($dir), $output, $exitCode);
+    return $exitCode === 0;
+}
+
+/**
+ * Resolves whether the cache mount is ready, honoring a test override so
+ * godwitd's refusal-to-start path is exercisable without a real mount:
+ * $override '1'/'0' forces true/false, anything else (including the false
+ * getenv() returns for an unset var) falls through to the real check.
+ */
+function godwit_resolve_cache_mounted($override, string $cacheDir): bool
+{
+    if ($override === '1') {
+        return true;
+    }
+    if ($override === '0') {
+        return false;
+    }
+    return godwit_is_mountpoint($cacheDir);
+}
+
+/**
  * Builds the argv for `rclone rcd`, given a listener spec. Never emits
  * --rc-no-auth (non-negotiable) and always emits --config. For a unix
  * socket listener no --rc-user/--rc-pass is added — the socket directory's

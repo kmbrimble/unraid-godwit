@@ -1,0 +1,9 @@
+#!/bin/bash
+# emhttpd fires this at the end of cmdStart, once the array and cache pool
+# are mounted (confirmed via /usr/local/sbin/emhttp_event's event-order
+# comments and by matching file.activity/unbalanced/tips.and.tweaks, which
+# hook this same event for their own daemon start). This is the real signal
+# godwitd needs — the .plg's install step only starts it immediately when
+# the array is already up (see array-ready.sh); on a boot-time install,
+# this hook is what actually starts it, once it's safe to.
+bash "$(cd "$(dirname "$0")/.." && pwd)/scripts/rc.godwit" start

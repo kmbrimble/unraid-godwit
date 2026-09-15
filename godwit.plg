@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.1.0">
+<!ENTITY version   "0.1.1">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,17 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.1.1
+- Fixes a boot-order bug: plugins install ~14s before the cache pool is
+  mounted, so 0.1.0's unconditional `rc.godwit start` in the install step
+  could create godwit's state dir on the RAM rootfs, silently covered by
+  the later cache mount and lost at shutdown. godwitd now starts via the
+  `started`/`stopping_svcs` emhttpd event hooks (matching file.activity,
+  unbalanced and tips.and.tweaks), and the install step only starts it
+  immediately when the array is already up. godwitd also refuses to run at
+  all if `/mnt/cache` isn't a real mountpoint, and `rc.godwit stop`
+  escalates to SIGKILL (daemon and its rcd child) if a graceful stop times
+  out.
 ###0.1.0
 - Initial scaffold release: plugin installs, registers an empty Settings/Godwit
   page, and runs a supervised daemon (rc.godwit / godwitd) that starts and
@@ -58,8 +69,19 @@ upgradepkg --install-new &plgPATH;/&name;-&version;.txz
 
 mkdir -p &plgPATH;
 
+# Plugins install ~14s before the cache pool mounts at boot (confirmed from
+# /boot/logs/syslog on the live host) — starting godwitd unconditionally
+# here, as 0.1.0 did, can create its state dir on the still-unmounted
+# /mnt/cache's RAM rootfs. Only start now if the array is already up (a
+# mid-session install/upgrade); a boot-time install defers to the
+# `started` event hook, which fires once the array and cache are actually
+# ready. See array-ready.sh.
 if [[ -f &emhttp;/scripts/rc.godwit ]]; then
-  bash &emhttp;/scripts/rc.godwit start
+  if [[ -f &emhttp;/scripts/array-ready.sh ]] && bash &emhttp;/scripts/array-ready.sh; then
+    bash &emhttp;/scripts/rc.godwit start
+  else
+    echo "&name;: array not started yet — godwitd will start via the 'started' event hook"
+  fi
 fi
 
 echo "&name;: install complete"

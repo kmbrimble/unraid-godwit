@@ -49,7 +49,11 @@ cp -a "$PLUGIN_DIR/." "$INSTALL_ROOT/"
 mkdir -p "$INSTALL_ROOT/bin"
 cp "$RCLONE_BIN" "$INSTALL_ROOT/bin/rclone"
 chmod +x "$INSTALL_ROOT/bin/rclone"
-chmod +x "$INSTALL_ROOT/scripts/rc.godwit" "$INSTALL_ROOT/scripts/godwitd"
+chmod +x "$INSTALL_ROOT/scripts/rc.godwit" "$INSTALL_ROOT/scripts/godwitd" "$INSTALL_ROOT/scripts/array-ready.sh"
+# emhttpd's event dispatcher (emhttp_event) checks the executable bit on
+# these directly, not existence — a lost +x here means the hook silently
+# never fires, the boot-order failure mode this release exists to fix.
+chmod +x "$INSTALL_ROOT/event/started" "$INSTALL_ROOT/event/stopping_svcs"
 
 mkdir -p "$OUT_DIR"
 TXZ="$OUT_DIR/$NAME-$VERSION.txz"

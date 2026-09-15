@@ -10,6 +10,31 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+### Plan — 2026-09-15: fix boot-order bug (0.1.1)
+
+0.1.0's `.plg` install step calls `rc.godwit start` unconditionally, but
+plugins install ~14s before `/mnt/cache` is mounted at boot (confirmed from
+`/boot/logs/syslog`) — godwitd then creates `appdata/godwit` and
+`godwit.db` on the RAM rootfs, which the later cache mount silently covers,
+losing all state at shutdown. Fix:
+
+- `plugin/event/started` + `plugin/event/stopping_svcs` (executable,
+  packaged) hook the real emhttpd lifecycle (confirmed via
+  `/usr/local/sbin/emhttp_event` and sibling plugins file.activity/
+  unbalanced/tips.and.tweaks) instead of relying on boot-time install order.
+- `plugin/scripts/array-ready.sh` (new): the install step starts the
+  daemon only if the array is already `STARTED` (`var.ini`) *and*
+  `/mnt/cache` is a real mountpoint; otherwise it defers to the `started`
+  event hook.
+- `godwitd` refuses to create/open the state dir unless `/mnt/cache` is a
+  real mountpoint (defense in depth, overridable via env var for tests).
+- `rc.godwit stop` escalates to SIGKILL (daemon + bundled rcd) if the
+  graceful wait times out, and verifies nothing from the bundled rclone
+  binary is left running.
+- Tests for the array-readiness decision, the mount-guard override, and the
+  escalation path. `godwit.plg`'s `launch`/page-menu pairing checked against
+  Dormouse's proven, installed shape — confirmed already correct, no change.
+
 ## [0.1.0] - 2026-09-15 (verified on host 2026-09-15)
 
 ### Added

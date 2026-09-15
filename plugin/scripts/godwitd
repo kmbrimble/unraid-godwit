@@ -22,6 +22,7 @@ $runDir = getenv('GODWIT_RUNDIR') ?: '/var/run/godwit';
 $stateDir = getenv('GODWIT_STATEDIR') ?: '/mnt/cache/appdata/godwit';
 $cfgDir = getenv('GODWIT_CFGDIR') ?: '/boot/config/plugins/godwit';
 $rcloneBin = getenv('GODWIT_RCLONE') ?: dirname(__DIR__) . '/bin/rclone';
+$cacheMountDir = getenv('GODWIT_CACHE_MOUNT_DIR') ?: '/mnt/cache';
 
 function godwit_log(string $logFile, string $message): void
 {
@@ -87,6 +88,18 @@ function godwit_spawn_rcd(string $rcloneBin, string $configPath, array $listener
     }
     fclose($pipes[0]);
     return $proc;
+}
+
+// Refuse to run at all if /mnt/cache isn't a real mountpoint yet — a boot-
+// time invocation before the cache pool mounts would otherwise create the
+// state dir on the RAM rootfs, silently covered by the later real mount.
+// This should never actually trigger in production now that the plg only
+// starts godwitd via the `started` event hook or an already-array-started
+// install, but it stays as the last line of defence. GODWIT_ASSUME_CACHE_MOUNTED
+// ('1'/'0') overrides the real check for tests.
+if (!godwit_resolve_cache_mounted(getenv('GODWIT_ASSUME_CACHE_MOUNTED') ?: null, $cacheMountDir)) {
+    godwit_log($logFile, "ERROR: $cacheMountDir is not a mountpoint — refusing to start (would create the state dir on the rootfs). Will start via the 'started' event hook once the array is up.");
+    exit(1);
 }
 
 file_put_contents($pidFile, getmypid() . PHP_EOL);

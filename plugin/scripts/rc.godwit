@@ -6,6 +6,9 @@ set -u
 PIDFILE="${GODWIT_PIDFILE:-/var/run/godwit.pid}"
 LOGFILE="${GODWIT_LOG:-/var/log/godwit.log}"
 DAEMON="$(dirname "$0")/godwitd"
+RCLONE_BIN="$(cd "$(dirname "$0")/.." && pwd)/bin/rclone"
+# 20 iterations x 0.5s = 10s in production; tests override this to stay fast.
+STOP_WAIT_ITERATIONS="${GODWIT_STOP_WAIT_ITERATIONS:-20}"
 
 is_running() {
     [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
@@ -31,11 +34,34 @@ stop() {
     local pid
     pid="$(cat "$PIDFILE")"
     kill -TERM "$pid" 2>/dev/null
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 "$STOP_WAIT_ITERATIONS"); do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.5
     done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "godwit did not stop gracefully within the wait — escalating to SIGKILL"
+        kill -KILL "$pid" 2>/dev/null
+        sleep 1
+    fi
+
+    # A SIGKILL bypasses godwitd's own shutdown handler (which normally
+    # stops its rcd child), so make sure nothing from the bundled rclone
+    # binary is left running regardless of how godwitd went down — this is
+    # the process that will hold files open under /mnt/user in later
+    # phases and must not survive rc.godwit stop under any path.
+    pkill -KILL -f "$RCLONE_BIN rcd" 2>/dev/null || true
+
     rm -f "$PIDFILE"
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "godwit stop FAILED — pid $pid still alive after SIGKILL"
+        return 1
+    fi
+    if pgrep -f "$RCLONE_BIN rcd" >/dev/null 2>&1; then
+        echo "godwit stop FAILED — a bundled rclone rcd process is still running"
+        return 1
+    fi
     echo "godwit stopped"
 }
 

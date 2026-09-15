@@ -79,6 +79,11 @@ t('godwit.plg: FILE Run blocks use a shebang-free bash INLINE (Run="/bin/bash" i
     assert_true(str_contains($plgRaw, 'Run="/bin/bash"'), 'expected Run="/bin/bash" on the install/remove FILE blocks');
 });
 
+t('godwit.plg: install step only starts godwitd when array-ready.sh says it is safe, gated on -f', function () use ($plgRaw) {
+    assert_true(str_contains($plgRaw, '[[ -f &emhttp;/scripts/array-ready.sh ]]'), 'expected an [[ -f ]] gate on array-ready.sh');
+    assert_true(str_contains($plgRaw, 'bash &emhttp;/scripts/array-ready.sh'), 'install step must consult array-ready.sh before starting');
+});
+
 // --- plugin/README.md stock shape ---------------------------------------
 
 t('plugin/README.md: bold title, blank line, one paragraph, no headings', function () use ($repoRoot) {
@@ -204,6 +209,9 @@ t('every script the .plg or rc.godwit invokes directly has a shebang', function 
     $scripts = [
         $repoRoot . '/plugin/scripts/rc.godwit',
         $repoRoot . '/plugin/scripts/godwitd',
+        $repoRoot . '/plugin/scripts/array-ready.sh',
+        $repoRoot . '/plugin/event/started',
+        $repoRoot . '/plugin/event/stopping_svcs',
         $repoRoot . '/scripts/build-plugin.sh',
         $repoRoot . '/scripts/verify-rclone-zip.sh',
         $repoRoot . '/scripts/install-on-host.sh',
@@ -215,44 +223,184 @@ t('every script the .plg or rc.godwit invokes directly has a shebang', function 
     }
 });
 
+t('event scripts invoke rc.godwit start/stop, and build-plugin.sh packages them executable', function () use ($repoRoot) {
+    $started = file_get_contents($repoRoot . '/plugin/event/started');
+    $stopping = file_get_contents($repoRoot . '/plugin/event/stopping_svcs');
+    assert_true(str_contains($started, 'rc.godwit" start'), 'event/started must invoke rc.godwit start');
+    assert_true(str_contains($stopping, 'rc.godwit" stop'), 'event/stopping_svcs must invoke rc.godwit stop');
+
+    $buildScript = file_get_contents($repoRoot . '/scripts/build-plugin.sh');
+    assert_true(str_contains($buildScript, 'event/started'), 'build-plugin.sh must chmod +x event/started — emhttp_event checks the executable bit, not -f');
+    assert_true(str_contains($buildScript, 'event/stopping_svcs'), 'build-plugin.sh must chmod +x event/stopping_svcs');
+});
+
+// --- array-ready.sh: the install-time array/cache-readiness decision -----
+
+function godwit_run_array_ready(string $repoRoot, array $env): array
+{
+    $envPrefix = implode(' ', array_map(fn ($k, $v) => $k . '=' . escapeshellarg((string) $v), array_keys($env), $env));
+    exec("$envPrefix bash " . escapeshellarg($repoRoot . '/plugin/scripts/array-ready.sh') . ' 2>&1', $output, $exitCode);
+    return [$exitCode, implode("\n", $output)];
+}
+
+t('array-ready.sh: array STARTED + cache mounted -> ready (exit 0)', function () use ($repoRoot) {
+    $tmp = sys_get_temp_dir() . '/godwit-array-ready-' . bin2hex(random_bytes(4));
+    mkdir($tmp);
+    $varIni = $tmp . '/var.ini';
+    file_put_contents($varIni, "mdState=\"STARTED\"\n");
+
+    [$code, ] = godwit_run_array_ready($repoRoot, ['GODWIT_VARINI' => $varIni, 'GODWIT_TEST_CACHE_MOUNTED' => '1']);
+    assert_eq(0, $code, 'expected ready when array is STARTED and cache is mounted');
+});
+
+t('array-ready.sh: array STARTED but cache NOT mounted -> not ready', function () use ($repoRoot) {
+    $tmp = sys_get_temp_dir() . '/godwit-array-ready-' . bin2hex(random_bytes(4));
+    mkdir($tmp);
+    $varIni = $tmp . '/var.ini';
+    file_put_contents($varIni, "mdState=\"STARTED\"\n");
+
+    [$code, ] = godwit_run_array_ready($repoRoot, ['GODWIT_VARINI' => $varIni, 'GODWIT_TEST_CACHE_MOUNTED' => '0']);
+    assert_true($code !== 0, 'must not be ready while the cache mount is not up yet — this is the exact boot-order bug');
+});
+
+t('array-ready.sh: cache mounted but array NOT started -> not ready', function () use ($repoRoot) {
+    $tmp = sys_get_temp_dir() . '/godwit-array-ready-' . bin2hex(random_bytes(4));
+    mkdir($tmp);
+    $varIni = $tmp . '/var.ini';
+    file_put_contents($varIni, "mdState=\"STOPPED\"\n");
+
+    [$code, ] = godwit_run_array_ready($repoRoot, ['GODWIT_VARINI' => $varIni, 'GODWIT_TEST_CACHE_MOUNTED' => '1']);
+    assert_true($code !== 0, 'must not be ready while the array is not started');
+});
+
+t('array-ready.sh: missing var.ini -> not ready', function () use ($repoRoot) {
+    [$code, ] = godwit_run_array_ready($repoRoot, ['GODWIT_VARINI' => '/nonexistent/var.ini', 'GODWIT_TEST_CACHE_MOUNTED' => '1']);
+    assert_true($code !== 0, 'must not be ready if var.ini cannot even be read');
+});
+
+// --- godwit_resolve_cache_mounted(): godwitd's own mount-guard override --
+
+t('godwit_resolve_cache_mounted: override "1" forces mounted regardless of the real check', function () {
+    assert_true(godwit_resolve_cache_mounted('1', '/definitely/not/a/real/mountpoint'), 'override 1 must force true');
+});
+
+t('godwit_resolve_cache_mounted: override "0" forces not-mounted regardless of the real check', function () {
+    assert_true(!godwit_resolve_cache_mounted('0', '/'), 'override 0 must force false even for a real mountpoint');
+});
+
+t('godwit_resolve_cache_mounted: no override falls through to the real mountpoint check', function () {
+    assert_true(!godwit_resolve_cache_mounted(null, '/definitely/not/a/real/mountpoint/' . bin2hex(random_bytes(4))), 'a nonexistent dir must not resolve as mounted');
+});
+
+// --- godwitd: refuses to start when the cache mount guard says no --------
+
+t('godwitd: refuses to start (exit non-zero, no state dir created) when GODWIT_ASSUME_CACHE_MOUNTED=0', function () use ($repoRoot) {
+    $tmp = sys_get_temp_dir() . '/godwit-mountguard-' . bin2hex(random_bytes(4));
+    mkdir($tmp);
+    $stateDir = $tmp . '/statedir';
+    $logFile = $tmp . '/godwit.log';
+    $pidFile = $tmp . '/godwit.pid';
+
+    $cmd = sprintf(
+        'GODWIT_PIDFILE=%s GODWIT_LOG=%s GODWIT_RUNDIR=%s GODWIT_STATEDIR=%s GODWIT_CFGDIR=%s GODWIT_ASSUME_CACHE_MOUNTED=0 timeout 5 php %s 2>&1',
+        escapeshellarg($pidFile),
+        escapeshellarg($logFile),
+        escapeshellarg($tmp . '/rundir'),
+        escapeshellarg($stateDir),
+        escapeshellarg($tmp . '/cfgdir'),
+        escapeshellarg($repoRoot . '/plugin/scripts/godwitd')
+    );
+    exec($cmd, $out, $exitCode);
+
+    assert_eq(1, $exitCode, 'godwitd must exit 1 when the cache mount guard fails: ' . implode("\n", $out));
+    assert_true(!is_dir($stateDir), 'state dir must never be created when the cache is not mounted');
+    $log = file_exists($logFile) ? file_get_contents($logFile) : '';
+    assert_true(str_contains($log, 'not a mountpoint'), 'expected a clear log line explaining the refusal, got: ' . $log);
+});
+
 // --- rc.godwit start/stop/status against temp paths -----------------------
 
-t('rc.godwit: start/status/stop lifecycle against a stub daemon', function () use ($repoRoot) {
+function godwit_rc_test_layout(string $repoRoot): string
+{
     $tmp = sys_get_temp_dir() . '/godwit-rc-test-' . bin2hex(random_bytes(4));
-    mkdir($tmp);
-    copy($repoRoot . '/plugin/scripts/rc.godwit', $tmp . '/rc.godwit');
-    chmod($tmp . '/rc.godwit', 0755);
+    mkdir($tmp . '/scripts', 0755, true);
+    mkdir($tmp . '/bin', 0755, true);
+    copy($repoRoot . '/plugin/scripts/rc.godwit', $tmp . '/scripts/rc.godwit');
+    chmod($tmp . '/scripts/rc.godwit', 0755);
+    return $tmp;
+}
 
-    // Stub daemon: writes nothing itself (rc.godwit writes the pidfile via
-    // the daemon in production, but here the daemon just needs to run until
-    // SIGTERM so start/status/stop can be exercised without a real rcd).
-    file_put_contents($tmp . '/godwitd', "#!/bin/bash\ntrap 'exit 0' TERM\nwhile true; do sleep 1; done\n");
-    chmod($tmp . '/godwitd', 0755);
+t('rc.godwit: start/status/stop lifecycle against a stub daemon', function () use ($repoRoot) {
+    $tmp = godwit_rc_test_layout($repoRoot);
+
+    // Stub daemon self-reports its own pid via $$, exactly like the real
+    // godwitd does with getmypid() — pgrep-ing for the pid from the test
+    // instead is a self-matching trap (PHP's exec() runs the pgrep command
+    // via `sh -c`, whose own argv contains the search pattern too).
+    file_put_contents($tmp . '/scripts/godwitd', "#!/bin/bash\necho \$\$ > \"\$GODWIT_PIDFILE\"\ntrap 'exit 0' TERM\nwhile true; do sleep 1; done\n");
+    chmod($tmp . '/scripts/godwitd', 0755);
 
     $pidFile = $tmp . '/godwit.pid';
     $logFile = $tmp . '/godwit.log';
     $env = "GODWIT_PIDFILE=" . escapeshellarg($pidFile) . " GODWIT_LOG=" . escapeshellarg($logFile);
 
-    // rc.godwit doesn't write the pidfile itself in this stub (godwitd
-    // normally does) — write it the same way the real daemon would, right
-    // after start, so status/stop have something to act on.
-    exec("$env bash {$tmp}/rc.godwit start 2>&1", $out, $code);
+    exec("$env bash {$tmp}/scripts/rc.godwit start 2>&1", $out, $code);
     assert_eq(0, $code, 'start should succeed: ' . implode("\n", $out));
+    usleep(200000);
 
-    // Find the backgrounded godwitd pid and write it, mimicking what the
-    // real daemon does on its own first line.
-    exec("pgrep -f " . escapeshellarg($tmp . '/godwitd'), $pgrepOut);
-    assert_true(count($pgrepOut) > 0, 'stub godwitd did not start');
-    file_put_contents($pidFile, $pgrepOut[0] . "\n");
-
-    exec("$env bash {$tmp}/rc.godwit status 2>&1", $statusOut, $statusCode);
+    exec("$env bash {$tmp}/scripts/rc.godwit status 2>&1", $statusOut, $statusCode);
     assert_eq(0, $statusCode, 'status should report running: ' . implode("\n", $statusOut));
 
-    exec("$env bash {$tmp}/rc.godwit stop 2>&1", $stopOut, $stopCode);
+    exec("$env bash {$tmp}/scripts/rc.godwit stop 2>&1", $stopOut, $stopCode);
     assert_eq(0, $stopCode, 'stop should succeed: ' . implode("\n", $stopOut));
 
-    exec("$env bash {$tmp}/rc.godwit status 2>&1", $statusOut2, $statusCode2);
+    exec("$env bash {$tmp}/scripts/rc.godwit status 2>&1", $statusOut2, $statusCode2);
     assert_eq(1, $statusCode2, 'status should report stopped after stop: ' . implode("\n", $statusOut2));
+});
+
+t('rc.godwit: escalates to SIGKILL (daemon + bundled rcd) when the daemon ignores SIGTERM', function () use ($repoRoot) {
+    $tmp = godwit_rc_test_layout($repoRoot);
+
+    // Stub daemon that ignores TERM entirely, and spawns a stub "rcd" child
+    // from the bundled binary path — mimicking a godwitd that is stuck and
+    // never runs its own shutdown handler. Both self-report their pid to a
+    // file ($$ / $!) so the test can verify liveness with `kill -0 <pid>`
+    // afterward — pgrep-ing for them externally is a self-matching trap
+    // (PHP's exec() runs the pgrep command via `sh -c`, whose own argv
+    // contains the search pattern too).
+    $rcdPidFile = $tmp . '/rcd.pid';
+    file_put_contents($tmp . '/bin/rclone', "#!/bin/bash\ntrap '' TERM\nwhile true; do sleep 1; done\n");
+    chmod($tmp . '/bin/rclone', 0755);
+    file_put_contents(
+        $tmp . '/scripts/godwitd',
+        "#!/bin/bash\necho \$\$ > \"\$GODWIT_PIDFILE\"\ntrap '' TERM\n"
+            . escapeshellarg($tmp . '/bin/rclone') . " rcd &\necho \$! > " . escapeshellarg($rcdPidFile) . "\nwhile true; do sleep 1; done\n"
+    );
+    chmod($tmp . '/scripts/godwitd', 0755);
+
+    $pidFile = $tmp . '/godwit.pid';
+    $logFile = $tmp . '/godwit.log';
+    // Small wait count so this test doesn't take the production 10s.
+    $env = "GODWIT_PIDFILE=" . escapeshellarg($pidFile) . " GODWIT_LOG=" . escapeshellarg($logFile) . " GODWIT_STOP_WAIT_ITERATIONS=2";
+
+    exec("$env bash {$tmp}/scripts/rc.godwit start 2>&1", $out, $code);
+    assert_eq(0, $code, 'start should succeed: ' . implode("\n", $out));
+
+    // Give the stub daemon and its rcd child a moment to write their pid files.
+    usleep(300000);
+    $daemonPid = (int) trim((string) file_get_contents($pidFile));
+    $rcdPid = (int) trim((string) file_get_contents($rcdPidFile));
+    assert_true($daemonPid > 0, 'stub godwitd did not record its own pid');
+    assert_true($rcdPid > 0, 'stub rcd child did not record its own pid');
+
+    exec("$env bash {$tmp}/scripts/rc.godwit stop 2>&1", $stopOut, $stopCode);
+    assert_eq(0, $stopCode, 'stop should still report success once escalation kills everything: ' . implode("\n", $stopOut));
+    assert_true(str_contains(implode("\n", $stopOut), 'escalating to SIGKILL'), 'expected an escalation log line');
+
+    exec("kill -0 $daemonPid 2>/dev/null", $o1, $daemonAlive);
+    assert_true($daemonAlive !== 0, 'stub godwitd must be gone after escalation');
+    exec("kill -0 $rcdPid 2>/dev/null", $o2, $rcdAlive);
+    assert_true($rcdAlive !== 0, 'stub rcd child must be gone after escalation');
 });
 
 // --- report ---------------------------------------------------------------
