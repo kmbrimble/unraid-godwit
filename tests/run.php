@@ -301,8 +301,16 @@ t('godwitd: refuses to start (exit non-zero, no state dir created) when GODWIT_A
     $logFile = $tmp . '/godwit.log';
     $pidFile = $tmp . '/godwit.pid';
 
+    // GODWIT_CACHE_MOUNT_DIR points at "/", which IS a real mountpoint —
+    // the override must force failure despite that, proving the "0" value
+    // actually reaches the guard rather than PHP's `?:` silently
+    // collapsing the string "0" to falsy and falling through to the real
+    // (in this case true) check. This is the exact bug this override
+    // exists to make verifiable: the plugin's other safety guard
+    // (array-ready.sh) papers over most premature-start paths, so this is
+    // the only place the mount refusal itself gets exercised at all.
     $cmd = sprintf(
-        'GODWIT_PIDFILE=%s GODWIT_LOG=%s GODWIT_RUNDIR=%s GODWIT_STATEDIR=%s GODWIT_CFGDIR=%s GODWIT_ASSUME_CACHE_MOUNTED=0 timeout 5 php %s 2>&1',
+        'GODWIT_PIDFILE=%s GODWIT_LOG=%s GODWIT_RUNDIR=%s GODWIT_STATEDIR=%s GODWIT_CFGDIR=%s GODWIT_CACHE_MOUNT_DIR=/ GODWIT_ASSUME_CACHE_MOUNTED=0 timeout 5 php %s 2>&1',
         escapeshellarg($pidFile),
         escapeshellarg($logFile),
         escapeshellarg($tmp . '/rundir'),
@@ -316,6 +324,47 @@ t('godwitd: refuses to start (exit non-zero, no state dir created) when GODWIT_A
     assert_true(!is_dir($stateDir), 'state dir must never be created when the cache is not mounted');
     $log = file_exists($logFile) ? file_get_contents($logFile) : '';
     assert_true(str_contains($log, 'not a mountpoint'), 'expected a clear log line explaining the refusal, got: ' . $log);
+});
+
+t('godwitd: GODWIT_ASSUME_CACHE_MOUNTED=1 forces past the guard even for a nonexistent dir', function () use ($repoRoot) {
+    $tmp = sys_get_temp_dir() . '/godwit-mountguard-' . bin2hex(random_bytes(4));
+    mkdir($tmp);
+    $stateDir = $tmp . '/statedir';
+
+    $cmd = sprintf(
+        'GODWIT_PIDFILE=%s GODWIT_LOG=%s GODWIT_RUNDIR=%s GODWIT_STATEDIR=%s GODWIT_CFGDIR=%s GODWIT_CACHE_MOUNT_DIR=%s GODWIT_ASSUME_CACHE_MOUNTED=1 GODWIT_RCLONE=/bin/false timeout 3 php %s 2>&1',
+        escapeshellarg($tmp . '/godwit.pid'),
+        escapeshellarg($tmp . '/godwit.log'),
+        escapeshellarg($tmp . '/rundir'),
+        escapeshellarg($stateDir),
+        escapeshellarg($tmp . '/cfgdir'),
+        escapeshellarg('/nonexistent/' . bin2hex(random_bytes(4))),
+        escapeshellarg($repoRoot . '/plugin/scripts/godwitd')
+    );
+    exec($cmd, $out, $exitCode);
+
+    // Exits non-zero eventually here only because GODWIT_RCLONE=/bin/false
+    // can never actually bind a listener (timeout kills the retry loop) —
+    // what this test is actually proving is that it got PAST the mount
+    // guard and created the state dir, not the final exit code.
+    assert_true(is_dir($stateDir), 'override "1" should force past the guard and create the state dir even for a nonexistent cache dir');
+});
+
+t('rc.godwit: pidfile is only removed after confirming the process is actually gone', function () use ($repoRoot) {
+    // A SIGKILL that fails to reap the pid (or a still-running rcd) must
+    // leave the pidfile in place — otherwise is_running() reports "not
+    // running" for a process that is, and `restart` (stop; start,
+    // unconditional) would spawn a second godwitd/rcd right alongside the
+    // orphan. Can't force a real SIGKILL to fail from a test, so this
+    // checks the source ordering directly: rm -f "$PIDFILE" must appear
+    // after both liveness checks, not before them.
+    $src = file_get_contents($repoRoot . '/plugin/scripts/rc.godwit');
+    $stopFnPos = strpos($src, 'stop() {');
+    $postEscalationCheckPos = strpos($src, 'kill -0 "$pid" 2>/dev/null; then', strpos($src, 'escalating to SIGKILL', $stopFnPos));
+    $rcdCheckPos = strpos($src, 'still running', $postEscalationCheckPos);
+    $rmPos = strpos($src, 'rm -f "$PIDFILE"', $rcdCheckPos);
+    assert_true($postEscalationCheckPos !== false && $rcdCheckPos !== false && $rmPos !== false, 'could not locate the relevant lines in rc.godwit');
+    assert_true($rmPos > $postEscalationCheckPos, 'rm -f "$PIDFILE" must come after both post-escalation liveness checks, not before them');
 });
 
 // --- rc.godwit start/stop/status against temp paths -----------------------

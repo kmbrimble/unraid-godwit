@@ -52,8 +52,11 @@ stop() {
     # phases and must not survive rc.godwit stop under any path.
     pkill -KILL -f "$RCLONE_BIN rcd" 2>/dev/null || true
 
-    rm -f "$PIDFILE"
-
+    # Only clear the pidfile once the process is actually confirmed gone —
+    # is_running() (and the `restart` case below, which runs stop then
+    # start unconditionally) key purely off pidfile presence, so removing
+    # it before confirming a failed SIGKILL would let a fresh start spawn a
+    # second godwitd/rcd right alongside the still-alive orphan.
     if kill -0 "$pid" 2>/dev/null; then
         echo "godwit stop FAILED — pid $pid still alive after SIGKILL"
         return 1
@@ -62,6 +65,7 @@ stop() {
         echo "godwit stop FAILED — a bundled rclone rcd process is still running"
         return 1
     fi
+    rm -f "$PIDFILE"
     echo "godwit stopped"
 }
 

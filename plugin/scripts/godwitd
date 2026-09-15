@@ -97,7 +97,8 @@ function godwit_spawn_rcd(string $rcloneBin, string $configPath, array $listener
 // starts godwitd via the `started` event hook or an already-array-started
 // install, but it stays as the last line of defence. GODWIT_ASSUME_CACHE_MOUNTED
 // ('1'/'0') overrides the real check for tests.
-if (!godwit_resolve_cache_mounted(getenv('GODWIT_ASSUME_CACHE_MOUNTED') ?: null, $cacheMountDir)) {
+$assumeCacheMounted = getenv('GODWIT_ASSUME_CACHE_MOUNTED');
+if (!godwit_resolve_cache_mounted($assumeCacheMounted === false ? null : $assumeCacheMounted, $cacheMountDir)) {
     godwit_log($logFile, "ERROR: $cacheMountDir is not a mountpoint — refusing to start (would create the state dir on the rootfs). Will start via the 'started' event hook once the array is up.");
     exit(1);
 }
