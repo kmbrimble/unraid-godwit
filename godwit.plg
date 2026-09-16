@@ -75,6 +75,17 @@ done
 
 upgradepkg --install-new &plgPATH;/&name;-&version;.txz
 
+# Delete superseded package files from flash — only after upgradepkg has
+# succeeded. Each .txz bundles rclone (~20MB); leaving every past version
+# on the USB flash drive on every upgrade is wasteful and unbounded.
+for old in &plgPATH;/&name;-*.txz; do
+  if [[ -f "$old" ]]; then
+    if [[ "$old" != &plgPATH;/&name;-&version;.txz ]]; then
+      rm -f "$old"
+    fi
+  fi
+done
+
 mkdir -p &plgPATH;
 
 # Plugins install ~14s before the cache pool mounts at boot (confirmed from

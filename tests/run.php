@@ -306,7 +306,7 @@ function godwit_extract_install_block(string $plgRaw): string
     return $m[1];
 }
 
-function godwit_run_install_block(string $plgRaw, int $arrayReadyExit): array
+function godwit_run_install_block(string $plgRaw, int $arrayReadyExit, array $seedFiles = [], bool $upgradepkgFails = false): array
 {
     $tmp = sys_get_temp_dir() . '/godwit-install-block-' . bin2hex(random_bytes(4));
     $emhttp = $tmp . '/emhttp';
@@ -317,7 +317,15 @@ function godwit_run_install_block(string $plgRaw, int $arrayReadyExit): array
     mkdir($plgPath, 0755, true);
     mkdir($bin, 0755, true);
 
-    file_put_contents($bin . '/upgradepkg', "#!/bin/bash\necho \"upgradepkg \$*\" >> " . escapeshellarg($callsLog) . "\n");
+    foreach ($seedFiles as $seedName => $seedContent) {
+        file_put_contents($plgPath . '/' . $seedName, $seedContent);
+    }
+
+    if ($upgradepkgFails) {
+        file_put_contents($bin . '/upgradepkg', "#!/bin/bash\necho \"upgradepkg \$*\" >> " . escapeshellarg($callsLog) . "\nexit 1\n");
+    } else {
+        file_put_contents($bin . '/upgradepkg', "#!/bin/bash\necho \"upgradepkg \$*\" >> " . escapeshellarg($callsLog) . "\n");
+    }
     chmod($bin . '/upgradepkg', 0755);
     file_put_contents($bin . '/removepkg', "#!/bin/bash\necho \"removepkg \$*\" >> " . escapeshellarg($callsLog) . "\n");
     chmod($bin . '/removepkg', 0755);
@@ -341,10 +349,11 @@ function godwit_run_install_block(string $plgRaw, int $arrayReadyExit): array
     $cmd = 'PATH=' . escapeshellarg($bin . ':' . getenv('PATH')) . ' bash ' . escapeshellarg($scriptPath) . ' 2>&1';
     exec($cmd, $output, $exitCode);
     $calls = file_exists($callsLog) ? file_get_contents($callsLog) : '';
+    $remainingFiles = array_values(array_diff(scandir($plgPath), ['.', '..']));
 
     exec('rm -rf ' . escapeshellarg($tmp));
 
-    return [$exitCode, implode("\n", $output), $calls];
+    return [$exitCode, implode("\n", $output), $calls, $remainingFiles];
 }
 
 t('install block: array not ready (boot-time case) still exits 0 and defers to the started hook', function () use ($plgRaw) {
@@ -358,6 +367,55 @@ t('install block: array ready starts godwitd immediately', function () use ($plg
     [$exitCode, $out, $calls] = godwit_run_install_block($plgRaw, 0);
     assert_eq(0, $exitCode, "install block should exit 0 when array-ready.sh exits 0: $out");
     assert_true(str_contains($calls, 'rc.godwit start'), "rc.godwit start must be called when the array is already ready, calls were: $calls");
+});
+
+// --- install block: superseded .txz cleanup on flash ----------------------
+//
+// Regression test for 0.1.3: /boot/config/plugins/godwit/ accumulated every
+// .txz ever installed (~20MB each) because the install block never deleted
+// old ones. After upgradepkg succeeds, only the current version's .txz
+// should remain, and nothing else in that directory should be touched.
+
+t('install block: deletes old .txz files but keeps the current one, rclone.conf and other files', function () use ($plgRaw) {
+    preg_match('/<!ENTITY version\s+"([^"]+)">/', $plgRaw, $vm);
+    $version = $vm[1];
+    $seed = [
+        'godwit-0.1.1.txz' => 'old-1',
+        'godwit-0.1.0.txz' => 'old-0',
+        "godwit-$version.txz" => 'current',
+        'rclone.conf' => 'conf',
+        'godwit-notes.txt' => 'decoy',
+    ];
+    [$exitCode, $out, $calls, $remaining] = godwit_run_install_block($plgRaw, 0, $seed);
+    assert_eq(0, $exitCode, "install block should exit 0: $out");
+    sort($remaining);
+    $expected = ["godwit-$version.txz", 'godwit-notes.txt', 'rclone.conf'];
+    sort($expected);
+    assert_eq($expected, $remaining, "expected only old .txz files removed, got: " . implode(', ', $remaining));
+});
+
+t('install block: cleanup is a no-op (still exits 0) when no old .txz files are present', function () use ($plgRaw) {
+    preg_match('/<!ENTITY version\s+"([^"]+)">/', $plgRaw, $vm);
+    $version = $vm[1];
+    $seed = ["godwit-$version.txz" => 'current'];
+    [$exitCode, $out, $calls, $remaining] = godwit_run_install_block($plgRaw, 0, $seed);
+    assert_eq(0, $exitCode, "install block must exit 0 when the old-.txz glob matches nothing: $out");
+    assert_eq(["godwit-$version.txz"], $remaining, "current .txz must remain: " . implode(', ', $remaining));
+});
+
+t('install block: upgradepkg failure deletes no .txz files and exits non-zero', function () use ($plgRaw) {
+    preg_match('/<!ENTITY version\s+"([^"]+)">/', $plgRaw, $vm);
+    $version = $vm[1];
+    $seed = [
+        'godwit-0.1.1.txz' => 'old-1',
+        "godwit-$version.txz" => 'current',
+    ];
+    [$exitCode, $out, $calls, $remaining] = godwit_run_install_block($plgRaw, 0, $seed, true);
+    assert_true($exitCode !== 0, "install block must fail when upgradepkg fails: $out");
+    sort($remaining);
+    $expected = ['godwit-0.1.1.txz', "godwit-$version.txz"];
+    sort($expected);
+    assert_eq($expected, $remaining, "no .txz files must be deleted when upgradepkg fails, got: " . implode(', ', $remaining));
 });
 
 // --- godwit_resolve_cache_mounted(): godwitd's own mount-guard override --

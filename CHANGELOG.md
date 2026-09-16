@@ -10,6 +10,23 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+### Plan: 0.1.3 — remove superseded package files from flash on upgrade
+
+Observed on the live host 2026-09-16: `/boot/config/plugins/godwit/` keeps
+every `.txz` ever installed (~20MB each, rclone bundled in), because the
+install block never deletes old ones — only `remove` wipes the directory.
+Each upgrade leaves another ~20MB on the USB flash drive.
+
+- `godwit.plg`'s install `<INLINE>`: after `upgradepkg --install-new`
+  succeeds, loop over `&plgPATH;/&name;-*.txz` and delete every one except
+  `&name;-&version;.txz`, gated on `[[ -f ]]`, safe under `set -e` when the
+  glob matches nothing, and touching nothing else in that directory
+  (`rclone.conf`, future config/token files).
+- New `tests/run.php` coverage on the existing install-block harness:
+  old `.txz` files plus current `.txz`, `rclone.conf` and a decoy file are
+  left correctly (only the old `.txz` gone); empty glob still exits 0;
+  `upgradepkg` failure deletes nothing and the block exits non-zero.
+
 ## [0.1.2] - 2026-09-16
 
 ### Fixed
