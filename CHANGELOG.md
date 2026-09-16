@@ -10,22 +10,38 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
-### Plan: 0.1.3 — remove superseded package files from flash on upgrade
+## [0.1.3] - 2026-09-16
 
-Observed on the live host 2026-09-16: `/boot/config/plugins/godwit/` keeps
-every `.txz` ever installed (~20MB each, rclone bundled in), because the
-install block never deletes old ones — only `remove` wipes the directory.
-Each upgrade leaves another ~20MB on the USB flash drive.
+### Fixed
 
-- `godwit.plg`'s install `<INLINE>`: after `upgradepkg --install-new`
-  succeeds, loop over `&plgPATH;/&name;-*.txz` and delete every one except
-  `&name;-&version;.txz`, gated on `[[ -f ]]`, safe under `set -e` when the
-  glob matches nothing, and touching nothing else in that directory
-  (`rclone.conf`, future config/token files).
-- New `tests/run.php` coverage on the existing install-block harness:
-  old `.txz` files plus current `.txz`, `rclone.conf` and a decoy file are
-  left correctly (only the old `.txz` gone); empty glob still exits 0;
-  `upgradepkg` failure deletes nothing and the block exits non-zero.
+Observed on the live host 2026-09-16: `/boot/config/plugins/godwit/` held
+both `godwit-0.1.1.txz` and `godwit-0.1.2.txz` (~20MB each, rclone bundled
+in), because the install block never deleted old ones — only `remove`
+wipes the whole directory. Every upgrade left another ~20MB on the USB
+flash drive.
+
+- `godwit.plg`'s install `<INLINE>`, after `upgradepkg --install-new`
+  succeeds, now loops over `&plgPATH;/&name;-[0-9]*.txz` (the `[0-9]`
+  restricts the match to the `&name;-<version>.txz` shape so a file like
+  `godwit-notes.txz` is never touched) and deletes every one except the
+  quoted `"&plgPATH;/&name;-&version;.txz"`, gated on `[[ -f ]]`, safe
+  under `set -e` when the glob matches nothing, and never touching anything
+  else in that directory (`rclone.conf`, future config/token files).
+- New `tests/run.php` coverage on the existing install-block harness: old
+  `.txz` files plus the current `.txz`, `rclone.conf`, a `.txt` decoy and a
+  non-version-shaped `.txz` decoy are left correctly (only the two old
+  version `.txz` files gone); an empty glob (no old versions present) still
+  exits 0; an `upgradepkg` failure deletes nothing and the block exits
+  non-zero. Only the first of these three is a genuine red-baseline test
+  against the pre-fix block (the other two are regression guards that
+  pass trivially against code that deletes nothing) — see handback.
+- Reviewed via `code-diff-reviewer`'s three-pass pipeline (band OWN, score
+  2): all three passes returned NO FINDINGS, which CLAUDE.md notes is a
+  known failure mode of that reviewer, not evidence of clean code. `advisor`
+  caught the real gaps instead: the original glob (`&name;-*.txz`) and
+  unquoted `!=` comparison didn't actually enforce the "match exactly the
+  `godwit-<version>.txz` shape" requirement, and the original decoy file
+  didn't exercise it. Tightened as above.
 
 ## [0.1.2] - 2026-09-16
 

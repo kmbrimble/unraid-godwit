@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.1.2">
+<!ENTITY version   "0.1.3">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,16 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.1.3
+- The install block bundled a new .txz on every upgrade into
+  /boot/config/plugins/godwit/ but never removed the old one (~20MB each,
+  rclone bundled in) — confirmed on the live host holding both the 0.1.1
+  and 0.1.2 package files. After upgradepkg succeeds, the install block
+  now deletes every old godwit-version.txz in that directory except the
+  one just installed, matching only the numeric-version .txz shape so it
+  never touches rclone.conf or any other file there. Safe under set -e
+  when the glob matches nothing, and no files are deleted if upgradepkg
+  itself fails.
 ###0.1.2
 - Fixes a boot-time install failure: the install block runs under `set -e`,
   and array-ready.sh's expected non-zero exit at boot (array not started,
@@ -78,9 +88,9 @@ upgradepkg --install-new &plgPATH;/&name;-&version;.txz
 # Delete superseded package files from flash — only after upgradepkg has
 # succeeded. Each .txz bundles rclone (~20MB); leaving every past version
 # on the USB flash drive on every upgrade is wasteful and unbounded.
-for old in &plgPATH;/&name;-*.txz; do
+for old in &plgPATH;/&name;-[0-9]*.txz; do
   if [[ -f "$old" ]]; then
-    if [[ "$old" != &plgPATH;/&name;-&version;.txz ]]; then
+    if [[ "$old" != "&plgPATH;/&name;-&version;.txz" ]]; then
       rm -f "$old"
     fi
   fi

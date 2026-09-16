@@ -385,11 +385,12 @@ t('install block: deletes old .txz files but keeps the current one, rclone.conf 
         "godwit-$version.txz" => 'current',
         'rclone.conf' => 'conf',
         'godwit-notes.txt' => 'decoy',
+        'godwit-notes.txz' => 'decoy-txz-non-version-shape',
     ];
     [$exitCode, $out, $calls, $remaining] = godwit_run_install_block($plgRaw, 0, $seed);
     assert_eq(0, $exitCode, "install block should exit 0: $out");
     sort($remaining);
-    $expected = ["godwit-$version.txz", 'godwit-notes.txt', 'rclone.conf'];
+    $expected = ["godwit-$version.txz", 'godwit-notes.txt', 'godwit-notes.txz', 'rclone.conf'];
     sort($expected);
     assert_eq($expected, $remaining, "expected only old .txz files removed, got: " . implode(', ', $remaining));
 });
