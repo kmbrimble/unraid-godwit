@@ -10,9 +10,14 @@ state, not from memory of an earlier plan.
 (v0.1.1, verified 2026-09-15: install, uninstall, reinstall, plus the
 `event/started`/`event/stopping_svcs` hooks fired by hand, all via
 `scripts/install-on-host.sh` / `scripts/uninstall-on-host.sh` and direct
-ssh — see CHANGELOG.md for the full checklist). A real reboot/array-stop
-test is still outstanding — see "Deploy and verify" below. See PLAN.md §5
-for the remaining phases.
+ssh — see CHANGELOG.md for the full checklist). v0.1.3 additionally verified
+2026-09-16: upgrading 0.1.2 → 0.1.3 via `scripts/install-on-host.sh` deletes
+`godwit-0.1.1.txz` and `godwit-0.1.2.txz` from `/boot/config/plugins/godwit/`,
+leaving exactly `godwit-0.1.3.txz` and an untouched `rclone.conf` (sha256
+unchanged, still the empty-file hash), one `godwitd` and one bundled `rcd`
+running, socket present, heartbeat advancing across the restart. A real
+reboot/array-stop test is still outstanding — see "Deploy and verify" below.
+See PLAN.md §5 for the remaining phases.
 
 ## Test command
 
