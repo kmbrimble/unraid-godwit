@@ -34,22 +34,48 @@ sort *before* `1.0.9`.
   active job (`$activeJobs[$name]['max_transfer']`) and, when no more
   specific textual signal (throttle, explicit cutoff text, auth-expiry)
   matched, classifies as `budget` if the transferred bytes landed within
-  2% of that limit either way. 2% is not a guess — ground-truthed locally
-  against the bundled v1.75.1 binary: CAUTIOUS mode can both overshoot
-  (many small, fast files can slip past the cutoff check before it's
-  re-evaluated — measured up to +1.6%) and undershoot (a
-  bandwidth-throttled transfer of larger files stops before starting one
-  that would exceed the limit — measured up to -1.6%) its own limit.
+  2% of that limit either way. 2% is not a guess — ground-truthed via an
+  ad-hoc local repro against the bundled v1.75.1 binary (3 repeats each
+  direction, no committed test pins these exact figures — the timing is
+  too environment-sensitive for CI; the committed end-to-end test instead
+  proves the fallback fires on one concrete run without hardcoding a
+  magnitude): CAUTIOUS mode can both **overshoot** its own limit — many
+  small (~1KB), fast-completing files on local disk let several slip past
+  the cutoff check before it's re-evaluated (+3878, +3996, +4063,
+  +3878..+4942 bytes on a ~300KB MaxTransfer, i.e. up to +1.6%) — and
+  **undershoot** it — a bandwidth-throttled (20 Mbit/s) transfer of larger
+  (~2MB) files, closer to the real Drive workload, stops before starting a
+  file that would exceed the limit (−1,953,219, −74,965, −54,957 bytes on
+  a ~121MB MaxTransfer, i.e. up to −1.6%). 2% is a deliberately generous
+  margin above both measured extremes.
+  **Known ceiling, documented not fixed** (`ponytail:` comment on
+  `godwit_bytes_near_max_transfer()`): the true undershoot bound is really
+  "the size of the one file that didn't fit", not a fixed percentage —
+  for Teegan's real single files (11.9GB, 134GB per CLAUDE.md), a masked
+  cutoff whose blocking file is one of those could undershoot by more than
+  2% of a ~140GiB gated-resume budget and still misclassify as `error`.
+  Upgrade path if this bites: rcd's own log carries a distinct NOTICE line
+  independent of `currentError()`'s precedence — a definitive signal, but
+  reading rcd's log (not just its rc API) is a bigger change than this
+  release's scope. The tolerance is not widened to compensate — there is
+  no upper bound on a single file's size, so no fixed percentage can fully
+  close this gap, and widening it risks exactly the false-positive this
+  function exists to avoid.
 - **The real error count is never hidden by the reclassification.**
   `godwit_job_status_label()` now appends "— N transfer errors also
   logged, see /var/log/godwit.log" to a budget/window pause when the
   stored error count exceeds the clean cutoff's own accounted baseline
   (the job's configured `Transfers` for a budget stop, 0 for a window
   stop — the same baseline `godwit_cap_stop_notification()` already used).
-  A clean cutoff (errors at or below the baseline) stays quiet, matching
-  0.4.1's existing notification behaviour; a genuinely elevated count (63
-  on the real Photos run, 508 on Kieren's) now surfaces on the page, not
-  just in a one-off notification.
+  Shows the raw stored count (not count-minus-baseline — the baseline is
+  only an upper bound on the cutoff's own bookkeeping, not an exact figure
+  to subtract), so this label always agrees with
+  `godwit_cap_stop_notification()`'s own wording for the same run. A clean
+  cutoff (errors at or below the baseline) stays quiet, matching 0.4.1's
+  existing notification behaviour; a genuinely elevated count (63 on the
+  real Photos run, 508 on Kieren's) now surfaces on the page itself, not
+  just in a one-off notification that's already gone by the time someone
+  looks.
 - **Decided, not silently changed: the threshold gate stays scoped to
   `outcome === 'budget'` only** (not `window`/`error`/`interrupted` too).
   Traced through the session/terminal-outcome mechanics rather than
@@ -66,6 +92,44 @@ sort *before* `1.0.9`.
   immediately re-selected on every tick while the gate that actually
   causes the trickle-restart problem (a live window or Run now) is still
   open. Gating only `budget` is therefore correct as built, not a gap.
+
+### Tests
+
+260 total (218 pre-existing + 30 from v0.4.2 + 12 new this release,
+stable across 3 repeat runs including the real-rcd end-to-end test). Red
+baseline confirmed by temporarily reverting `plugin/scripts/lib.php` and
+`plugin/scripts/godwitd` only (keeping the new tests): 7 genuinely red —
+3 `godwit_bytes_near_max_transfer()` tests (undefined function), 1
+`godwit_classify_job_outcome()` masking-case test (`error` instead of the
+expected `budget`), 3 status-text/`godwit_build_jobs_status()` suffix
+tests (no suffix without the new `$jobTransfers` param and baseline
+logic). A new end-to-end test spins up a real bundled-v1.75.1 rcd, forces
+a genuine per-file error via a destination name collision (a directory
+pre-created where a file needs to go) alongside a real MaxTransfer cutoff
+on ~400 small files, and proves both halves live: without the byte
+fallback the run classifies `error` (reproducing the bug), and with it
+(matching what godwitd now actually does) it classifies `budget` while
+the real error count still surfaces in the status label. Stable across 3
+repeat runs.
+
+### Review
+
+3 passes of `code-diff-reviewer`: 3× NO FINDINGS (a known failure mode of
+that reviewer, not treated as proof of correctness on its own).
+Escalation score 5 (OWN band: exposure 1, authority 1, data 1,
+reversibility 1, test gap 0, pattern divergence 0, module spread 1 — no
+counsel). `advisor` read the diff directly and found 4 real issues, all
+fixed before release: the status-text error count originally subtracted
+the baseline (disagreeing with the notification's raw count on the same
+run — fixed to show the raw count on both surfaces); this CHANGELOG
+originally pointed back to itself for the escalation score and red
+evidence instead of stating them (fixed — see above and the Review
+section); `godwit_bytes_near_max_transfer()`'s docblock originally
+claimed the ±1.6% figures lived in `tests/run.php` when they were ad-hoc
+local numbers (fixed — the actual figures are recorded above); and the
+large-single-file undershoot ceiling (Teegan's 11.9GB/134GB files) was
+initially undocumented (fixed — see the "Known ceiling" note above and
+the `ponytail:` comment on `godwit_bytes_near_max_transfer()`).
 
 ## [0.4.2] - 2026-09-18
 

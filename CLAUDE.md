@@ -464,16 +464,51 @@ key off `outcome === 'budget'`) need to see it as one.
   the trickle-restart problem (a live window or Run now) stays open.
   Gating only `budget` is therefore correct as built, not a gap left by
   oversight.
-- **Review**: `code-diff-reviewer`'s three-pass pipeline plus `advisor`
-  (see CHANGELOG.md 0.4.3 for the escalation score and findings, if any).
-- Verified offline (`php tests/run.php`; see CHANGELOG.md 0.4.3 for the
-  exact pass count and the red-baseline evidence), including a real-rcd
+- **Review**: 3 passes of `code-diff-reviewer` returned 3× NO FINDINGS (a
+  known failure mode of that reviewer, not proof of correctness on its
+  own). Escalation score 5 — OWN band (exposure 1, authority 1, data 1,
+  reversibility 1, test gap 0, pattern divergence 0, module spread 1) — no
+  counsel. `advisor` read the diff directly and found 4 real issues, all
+  fixed pre-merge: the status-text error suffix originally showed
+  errors-minus-baseline instead of the raw count (disagreed with
+  `godwit_cap_stop_notification()`'s own wording for the same run — fixed
+  to show the raw count on both surfaces); this file and CHANGELOG.md
+  0.4.3 originally pointed at each other for the evidence below instead of
+  stating it directly (fixed); `godwit_bytes_near_max_transfer()`'s
+  docblock claimed its ±1.6% figures lived in a committed test when they
+  were ad-hoc local numbers (fixed, real figures now in CHANGELOG.md
+  0.4.3); and the large-single-file undershoot ceiling below was initially
+  undocumented (fixed).
+- Verified offline: 260/260 (`php tests/run.php`; 218 pre-existing + 30
+  from v0.4.2 + 12 new this release), stable across 3 repeat runs. Red
+  baseline confirmed by reverting only `plugin/scripts/lib.php` and
+  `plugin/scripts/godwitd` (keeping the new tests): 7 genuinely red — 3
+  `godwit_bytes_near_max_transfer()` tests (undefined function), 1
+  `godwit_classify_job_outcome()` masking-case test (`error` instead of
+  `budget`), 3 status-text/`godwit_build_jobs_status()` suffix tests (no
+  suffix without the new `$jobTransfers` param). Includes a real-rcd
   end-to-end test against the bundled v1.75.1 binary that reproduces the
-  exact masking shape (many small files near a MaxTransfer cutoff, plus a
-  genuine destination-collision file error) and proves both that the bug
-  existed (classifying `error` without the byte fallback) and that the fix
-  works (classifying `budget` with it, while the real error count still
-  surfaces).
+  exact masking shape (~400 small files near a real MaxTransfer cutoff,
+  plus a genuine destination-collision file error) and proves both halves
+  live: without the byte fallback the run classifies `error` (reproducing
+  the bug), with it (what godwitd now actually does) it classifies
+  `budget` while the real error count still surfaces in the status label.
+- **Known ceiling, not fixed this release** (documented as a `ponytail:`
+  comment on `godwit_bytes_near_max_transfer()` in lib.php): the 2%
+  tolerance's undershoot bound is really "the size of the one file that
+  didn't fit" — for most shares (many small files) that's comfortably
+  under 2%, but Teegan's real single files run to 11.9GB and 134GB
+  (recorded elsewhere in this file); against a ~140GiB gated-resume
+  budget, a masked cutoff whose blocking file is one of those could
+  undershoot by more than 2% and still misclassify as `error`, silently
+  skipping the gate for that job. Upgrade path if this is ever observed
+  live: rcd's own log carries a distinct cutoff NOTICE line independent of
+  `currentError()`'s masking precedence — a definitive signal, but reading
+  rcd's log (not just its rc API) is a bigger change than this release's
+  scope. The tolerance was deliberately not widened to compensate — there
+  is no upper bound on a single file's size, so no fixed percentage can
+  fully close this gap, and widening it risks the exact false-positive
+  this function exists to avoid.
 
 **Not verified this release**: nothing against the live Google Drive
 remote — this was built read-only against the host, per the user's

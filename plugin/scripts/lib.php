@@ -1529,19 +1529,44 @@ function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastR
  * disabling both the v0.4.2 status wording and its threshold gate (which
  * both key off `outcome === 'budget'`).
  *
- * Tolerance is 2%, symmetric — ground-truthed locally against the bundled
- * v1.75.1 binary (see tests/run.php), not assumed: CAUTIOUS mode can both
+ * Tolerance is 2%, symmetric — ground-truthed via an ad-hoc local repro
+ * against the bundled v1.75.1 binary (3 repeats each direction, exact
+ * byte counts in CHANGELOG.md 0.4.3), not assumed and not asserted by any
+ * committed test (the repro's timing is too environment-sensitive to pin
+ * exact percentages in CI — the committed end-to-end test below instead
+ * proves the fallback fires and matches CAUTIOUS's real behaviour on one
+ * concrete run, without hardcoding a magnitude): CAUTIOUS mode can both
  * OVERSHOOT its own limit (many small, fast-completing files can let
  * several slip past the cutoff check before it's re-evaluated — measured
- * up to +1.6% with ~1KB files on local disk, three repeats) and UNDERSHOOT
- * it (a bandwidth-throttled transfer of larger files, closer to the real
- * Drive workload, stops before starting a file that would exceed the
- * limit — measured up to -1.6% with bwlimit-throttled ~2MB files, three
- * repeats). 2% is a deliberately generous margin above both measured
- * extremes. It cannot mistake a job that merely used a lot of a large
- * budget for a cutoff it never hit: that case has $errorMsg === '', so
+ * up to +1.6%) and UNDERSHOOT it (a bandwidth-throttled transfer of larger
+ * files, closer to the real Drive workload, stops before starting a file
+ * that would exceed the limit — measured up to -1.6%). 2% is a
+ * deliberately generous margin above both measured extremes.
+ *
+ * ponytail: known ceiling, not fixed here — the undershoot bound is really
+ * "the size of the one file that didn't fit", not a fixed percentage: on
+ * rclone's own accounting (fs/operations/copy.go), CAUTIOUS refuses to
+ * start a file once already-accounted bytes plus that file's size would
+ * reach the limit, so the true shortfall equals that file's size, which
+ * this function has no way to know. For many small files (a typical
+ * share) that shortfall is small and 2% comfortably covers it — but
+ * Teegan's real single files run to 11.9GB and 134GB (CLAUDE.md); against
+ * a ~140GiB gated-resume budget, 2% is only ~2.8GiB, so a masked cutoff
+ * whose blocking file is one of those large ones would fall outside this
+ * tolerance and still misclassify as `error`. Upgrade path if this bites:
+ * rcd's own stderr/log carries a distinct NOTICE line ("max transfer
+ * limit reached ... - stopping transfers") independent of
+ * currentError()'s precedence — a definitive per-job signal, unlike this
+ * byte-proximity guess, but it requires godwitd to read rcd's log instead
+ * of just its rc API, which is a bigger change than this release's scope.
+ * Does not widen the tolerance instead: there is no upper bound on a
+ * single file's size, so no fixed percentage can ever fully close this
+ * gap, and a wider tolerance would risk exactly the false-positive this
+ * function is designed to avoid (a job that merely used a lot of a large
+ * budget without ever being cut off — though that specific case is
+ * already excluded on its own: it has $errorMsg === '', so
  * godwit_classify_job_outcome() already returns 'completed' before this
- * function is ever called.
+ * function is ever called).
  */
 function godwit_bytes_near_max_transfer(int $bytesTransferred, ?int $maxTransferBytes, float $tolerance = 0.02): bool
 {
@@ -1678,9 +1703,17 @@ function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \
         case 'budget':
         case 'window':
             $reason = $lastRun['outcome'] === 'window' ? 'upload window closed' : 'daily upload cap reached';
+            // $jobTransfers is an UPPER BOUND on a clean cutoff's own
+            // bookkeeping errors (measured 1-4 at Transfers=8, see
+            // godwit_cap_stop_notification()'s docblock), not an exact
+            // count — subtracting it would under-report the real number.
+            // Show the raw stored count, gated on the same "> baseline"
+            // threshold godwit_cap_stop_notification() already uses, so
+            // this label and that notification never disagree on N for
+            // the same run.
             $baseline = $lastRun['outcome'] === 'window' ? 0 : $jobTransfers;
-            $extra = (int) ($lastRun['errors'] ?? 0) - $baseline;
-            $suffix = $extra > 0 ? sprintf(' — %d transfer error%s also logged, see /var/log/godwit.log', $extra, $extra === 1 ? '' : 's') : '';
+            $errorCount = (int) ($lastRun['errors'] ?? 0);
+            $suffix = $errorCount > $baseline ? sprintf(' — %d transfer error%s also logged, see /var/log/godwit.log', $errorCount, $errorCount === 1 ? '' : 's') : '';
             return "paused — $reason, resumes $resume ($bytes uploaded)$suffix";
         case 'throttled':
             return "error — Google's daily upload limit reached ($bytes) at $when";

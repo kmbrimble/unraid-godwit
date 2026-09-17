@@ -2683,7 +2683,12 @@ t('godwit_job_status_label: a budget pause with errors at or below the clean-cut
 t('godwit_job_status_label: a budget pause with errors above the baseline surfaces the extra count — must not go invisible', function () {
     $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
     $label = godwit_job_status_label(['outcome' => 'budget', 'bytes' => (int) round(669.2 * 1024 * 1024 * 1024), 'errors' => 63, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'), 4);
-    assert_true(str_contains($label, '59 transfer errors also logged'), "63 errors - 4 baseline = 59 extra, matching the real Photos run: $label");
+    // The raw stored count, not errors-minus-baseline (63-4=59 would
+    // under-report the real Photos-run number) — the baseline is only an
+    // upper bound on the cutoff's own bookkeeping, not an exact figure to
+    // subtract, and this label must agree with godwit_cap_stop_notification()'s
+    // own "N errors were also logged" wording on the same run.
+    assert_true(str_contains($label, '63 transfer errors also logged'), "matching the real Photos run's raw error count: $label");
     assert_true(str_contains($label, 'daily upload cap reached'), 'the calm framing must still be present: ' . $label);
 });
 
@@ -3464,7 +3469,7 @@ t('godwit_build_jobs_status: a budget-paused job with real errors above its own 
     $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
     $fc = null;
     foreach ($status['jobs'] as $j) { if ($j['name'] === 'Filing Cabinet') { $fc = $j; } }
-    assert_true(str_contains($fc['status_text'], '59 transfer errors also logged'), $fc['status_text']);
+    assert_true(str_contains($fc['status_text'], '63 transfer errors also logged'), $fc['status_text']);
     assert_true(str_contains($fc['status_text'], 'daily upload cap reached'), 'still calm, still says what happened: ' . $fc['status_text']);
 });
 
