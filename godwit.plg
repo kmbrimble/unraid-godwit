@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.2.4">
+<!ENTITY version   "0.3.0">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,15 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.3.0
+- Phase 3: Google full backup. One job per share (Filing Cabinet, Kieren,
+  Teegan, Photos) syncing /mnt/user/&lt;share&gt; to gdrive:godwit/&lt;share&gt;
+  with --backup-dir versioning, Kieren's TimeMachine/BombVault excluded. A
+  rolling-24h 700 GiB upload budget, a default 22:00-06:00 250 Mbit/s
+  window with a "Run now" override, one active job per remote, version
+  retention (30 days), and a Jobs section on the Settings page showing
+  per-job progress and per-remote budget. This is the first release that
+  writes to Google Drive — see CHANGELOG.md for the full detail.
 ###0.2.4
 - Replaced 0.2.3's "cannot choose automatically" OneDrive ambiguity error
   with a real drive picker: when an account has more than one drive, Add

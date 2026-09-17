@@ -10,6 +10,94 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-17
+
+### Added
+
+Phase 3 (PLAN.md §5 item 3): Google full backup. **This is the first
+release that writes to Google Drive.**
+
+- **Jobs.** One Google job per share (Filing Cabinet, Kieren, Teegan,
+  Photos), persisted in `jobs.json` under the flash config dir (preserved
+  by uninstall, same as `rclone.conf`). Source is always
+  `/mnt/user/<share>`, destination always `<remote>:godwit/<share>` — a
+  hard runtime assertion (`godwit_assert_job_direction()`) refuses to build
+  an rc call for any other shape, so a reversed direction is structurally
+  impossible, not just avoided by convention. Mode is `sync` with
+  `--backup-dir <remote>:godwit/_versions/<share>/<date>` by default (a
+  `copy`-only alternative is available per job), with a `--max-delete`
+  guard (default 1000). Kieren excludes `/TimeMachine/**` (live sparsebundle,
+  D13) and `/Backup/BombVault/**` (contains Godwit's own `rclone.conf` and
+  the SecretsMan store — must never sit unencrypted in Drive, D14); global
+  excludes (`.DS_Store`, `._*`, `.Trashes/**`, `.Recycle.Bin/**`,
+  `Thumbs.db`) apply to every job. Saving an overlapping pair of
+  destinations, or one that would sit inside `godwit/_versions`, is
+  rejected server-side before it ever reaches `jobs.json`.
+- **Runner.** `godwitd` starts at most one `sync/sync`/`sync/copy` `_async`
+  rc job per remote, in queue order (Filing Cabinet, Kieren, Teegan,
+  Photos — small first), with `Transfers`/`MaxDelete`/`CutoffMode=CAUTIOUS`/
+  `MaxTransfer` set per call and `RCLONE_DRIVE_CHUNK_SIZE=64M` /
+  `RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT=true` set once in rcd's own
+  environment (backend options, not `_config` keys). Every run is recorded
+  in SQLite (start/end, bytes, files, errors, outcome). A godwitd/rcd
+  restart always loses whatever rc job was in flight — the run row is
+  closed as `interrupted` on startup and picked back up by the normal
+  selection pass; sync is idempotent, so this is a plain requeue, not a
+  special case.
+- **Daily budget (§4.3).** A rolling-24h per-remote ledger, fed from
+  `core/stats` deltas every tick — the real guard, independent of
+  `MaxTransfer` (confirmed in Phase 1's spike to be able to overshoot by up
+  to transfers × average file size). Default cap 700 GiB for `gdrive`
+  (D12). A job that finishes after `--drive-stop-on-upload-limit` fires is
+  recorded as `throttled` and the remote is blocked for 24h.
+- **Windows and speed (§4.5, D12).** Default window every day 22:00–06:00
+  at 250 Mbit/s, applied via `core/bwlimit` only when the desired rate
+  changes. Mbit/s is converted to an explicit byte count with rclone's `B`
+  suffix, never its `M` (MiB, not Mbit) suffix — `31.25M` would actually be
+  ~262 Mbit/s, a silent 5% overshoot. Outside every window, no new job
+  starts; a job already running got `MaxDuration` set to the seconds left
+  in its window at start time (`CutoffMode=CAUTIOUS`), so rclone itself
+  stops picking up new files at the boundary and lets an in-flight transfer
+  finish rather than hard-killing it (a 134 GB file at 250 Mbit/s takes
+  ~1.3h — Drive's resumable uploads don't survive an rclone restart, so
+  this matters). **"Run now" (D15)** starts the queue immediately
+  regardless of the window, still honouring the speed limit and budget,
+  and clears itself once the queue drains. Line-profile presets
+  (`1000/400`, `500/50`) warn on the Jobs page when the window's limit is
+  at or above 80% of the profile's upstream.
+- **Status page.** A Jobs section: per-job enabled/mode/transfers/excludes
+  (editable, saved server-side with the same direction/overlap validation
+  as the daemon), running state with live bytes/files/ETA, last-run outcome,
+  and queue position; per-remote 24h budget bar and throttled-until; a
+  windows/profile editor with the 80% warning; Run now / Pause / Resume-all.
+- **Version retention.** `godwit/_versions/<share>/<date>` directories older
+  than 30 days (configurable) are purged once a day via `operations/purge`
+  — every path is rebuilt and re-validated by
+  `godwit_assert_purge_path()`/`godwit_purge_call_params()` immediately
+  before the call (must match exactly
+  `godwit/_versions/<share>/YYYY-MM-DD`, whole date directories only),
+  never a hand-built string.
+- **Notifications**, using the existing notify-once logic: a run ending in
+  error, budget reached (once per remote per day), throttled (once on
+  entering the state), and a share's first full seed completing (once ever
+  per job).
+
+### Tests
+
+170 new offline tests (178 total): job builder + hard direction assertion
+(including the reversed-direction case), filter compilation verified
+against the real bundled rclone binary (`lsf -R --filter-from`, proving
+both the anchored Kieren excludes and the unanchored Mac-junk excludes),
+budget ledger maths (rolling window, boundary, overshoot), window
+evaluation (midnight wrap, weekday-restricted windows, DST-free
+`Australia/Brisbane`), Mbit→bytes/s conversion, line-profile warning,
+one-job-per-remote queue selection and ordering, requeue-after-restart,
+retention purge path safety (including deliberately malformed inputs),
+notification rules, and the new `jobs_save`/`settings_save`/`jobs_status`
+web actions (including a caught bug where a partial `settings_save` would
+have reset the budget cap back to default, and a caught bug in the queue-
+position calculation).
+
 ## [0.2.4] - 2026-09-17
 
 ### Fixed
