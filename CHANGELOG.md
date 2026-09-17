@@ -10,6 +10,44 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+### Plan: 2026-09-17 — Remotes page swallows every result and error
+
+Kieren reported Test/Add doing "nothing". Root cause: `godwitRemoteAction()`
+always calls `godwitRemotesRefresh()`, whose success handler unconditionally
+clears `#godwit-remotes-message`, wiping any result/error milliseconds after
+it's shown. Separately, timed-out health checks were misclassified as
+`unchecked` instead of `error`.
+
+Fix, in `plugin/Godwit.page` and `plugin/scripts/lib.php`:
+- Split "user action" postbacks (message persists, shows pending/result/error
+  state, has a `.fail()` handler) from "background refresh" postbacks (silent,
+  never touches the action message div). Message div moved directly under the
+  remotes table.
+- Test/Add/Reauth/Delete buttons disable during the call and show a pending
+  label; Add clears its token/secret fields only on success.
+- Name inputs get real default values instead of placeholders.
+- `godwit_extract_token_json()` tolerates the `rclone authorize` paste wrapper
+  and surrounding whitespace before validating access_token/refresh_token.
+- `godwit_rc_call_params()` takes a timeout + optional `$meta` out-param so a
+  curl timeout is distinguishable from other transport failures;
+  `godwit_check_remote_about()` now always returns `error` (with "timed out
+  after Ns") on a failed check — `unchecked` is reserved for "never checked",
+  set by `remotes_list` for a remote with no health row yet. Timeout raised
+  to 60s for `operations/about` and the config walk.
+- `godwit_health_notifications()` gains a consecutive-failure counter:
+  ok→error notifies only on the 2nd consecutive failure, auth-expired still
+  notifies immediately, matching nginx's generous `fastcgi_read_timeout`.
+- `godwit_handle_remote_action()` logs every on-demand test/add/reauth/delete
+  (redacted) to `/var/log/godwit.log`, and touches the existing (previously
+  unwired) `check-now` marker after a successful add so the new remote gets
+  checked within a second instead of waiting up to an hour.
+
+Tests added to `tests/run.php` for: token extraction (incl. the exact
+`--->`/`<---End paste` wrapper), timeout classification (via dependency
+injection, same pattern as `godwit_walk_config_state`), the notify rule, and
+the new log lines. The page JS itself has no harness — verified instead by
+reading the installed page source on the host post-deploy.
+
 ## [0.2.1] - 2026-09-17
 
 ### Fixed
