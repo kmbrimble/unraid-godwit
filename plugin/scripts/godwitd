@@ -40,13 +40,24 @@ function godwit_start_rcd(string $rcloneBin, string $configPath, string $runDir,
 {
     $sockPath = $runDir . '/rcd.sock';
     @unlink($sockPath);
-    $unixListener = ['type' => 'unix', 'path' => $sockPath];
+    // Every listener now carries generated credentials, unix included — see
+    // godwit_rcd_argv()'s docblock: rclone's rc auth gate is not exempted by
+    // unix-socket transport, and config/*+operations/about (Phase 2) are not
+    // NoAuth commands. The socket directory's own permissions (0700,
+    // godwit-only) still gate who can even attempt a connection.
+    $unixListener = [
+        'type' => 'unix',
+        'path' => $sockPath,
+        'user' => godwit_generate_credential(),
+        'pass' => godwit_generate_credential(),
+    ];
     $proc = godwit_spawn_rcd($rcloneBin, $configPath, $unixListener, $rcdLogFile);
 
     for ($i = 0; $i < 20; $i++) {
         usleep(100000);
         if (file_exists($sockPath)) {
             godwit_log($logFile, "rcd listening on unix socket $sockPath");
+            godwit_write_rc_credentials($runDir, $unixListener);
             return ['proc' => $proc, 'listener' => $unixListener];
         }
         $status = proc_get_status($proc);
@@ -75,6 +86,7 @@ function godwit_start_rcd(string $rcloneBin, string $configPath, string $runDir,
         return null;
     }
     godwit_log($logFile, "rcd listening on tcp {$tcpListener['host']}:{$tcpListener['port']}");
+    godwit_write_rc_credentials($runDir, $tcpListener);
     return ['proc' => $proc, 'listener' => $tcpListener];
 }
 
@@ -149,6 +161,12 @@ $backoffSeconds = 1;
 $rcdStartedAt = time();
 $lastHeartbeat = 0;
 $lastTrim = 0;
+// 0 forces a health check on the very first loop tick (startup), not an
+// hour in — host verification (and Kieren, after a fresh install) should
+// not have to wait an hour to see a remote's status.
+$lastHealthCheck = 0;
+$healthCheckIntervalSeconds = (int) (getenv('GODWIT_HEALTH_INTERVAL') ?: 3600);
+$checkNowMarker = $runDir . '/check-now';
 
 while ($running) {
     sleep(1);
@@ -202,6 +220,26 @@ while ($running) {
     if ($db !== null && $now - $lastTrim >= 3600) {
         godwit_trim_heartbeat($db, $now);
         $lastTrim = $now;
+    }
+
+    // Remote health checks: hourly, on the very first tick, or whenever the
+    // web page drops a marker file for an on-demand check (its own "Test
+    // connection" / status refresh action). Read-only rc calls only
+    // (operations/about) — must never wake the array pool on its own, and
+    // never writes to Drive/OneDrive in this phase.
+    $checkNowRequested = file_exists($checkNowMarker);
+    if ($db !== null && $rcd !== null && ($checkNowRequested || $now - $lastHealthCheck >= $healthCheckIntervalSeconds)) {
+        if ($checkNowRequested) {
+            @unlink($checkNowMarker);
+        }
+        $remotes = godwit_list_remotes($rcd['listener']);
+        if ($remotes !== null) {
+            foreach ($remotes as $remote) {
+                $result = godwit_run_health_check($db, $rcd['listener'], $remote['name']);
+                godwit_log($logFile, "health check: {$remote['name']} -> {$result['status']}");
+            }
+        }
+        $lastHealthCheck = $now;
     }
 }
 

@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.1.3">
+<!ENTITY version   "0.2.0">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,22 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.2.0
+- Phase 2: a Remotes section on the Godwit page lists configured rclone
+  remotes (name, type, health status, quota) and can add a Google Drive or
+  OneDrive remote from a pasted `rclone authorize` token, re-authorise,
+  test-connect and delete one — all via rcd's config API, never the bundled
+  CLI, so a live rcd always sees the change immediately. No client_secret,
+  client_id or token value is ever returned to the browser. godwitd now
+  health-checks every configured remote hourly (read-only `operations/about`
+  only — no writes to Drive/OneDrive in this phase), stores the result in
+  SQLite, detects auth-expiry distinctly from other errors, and sends an
+  Unraid notification once per OK/failed transition and once per 90% quota
+  crossing.
+- Uninstall now preserves &plgPATH; (rclone.conf and any future
+  godwit.cfg/jobs.json) instead of deleting it — it holds live OAuth
+  credentials as of this release. Only the installed .txz package files are
+  removed from that directory.
 ###0.1.3
 - The install block bundled a new .txz on every upgrade into
   /boot/config/plugins/godwit/ but never removed the old one (~20MB each,
@@ -133,10 +149,13 @@ echo "&name;: install complete"
 
 <!--
 Remove step. Stops the daemon (which stops its rcd child), removes the
-package, the installed tree, the flash config dir (including rclone.conf —
-Phase 1 ships it empty, so there is nothing to preserve yet; this is
-revisited deliberately if Phase 2 adds OAuth tokens to it), and any runtime
-pid/log leftovers.
+package and the installed tree, and any runtime pid/log leftovers. As of
+0.2.0, &plgPATH; (rclone.conf and any future godwit.cfg/jobs.json) is
+deliberately preserved — it now holds live OAuth credentials for Google
+Drive/OneDrive remotes, and losing them on every uninstall/reinstall cycle
+would mean re-authorising by hand each time. Only the installed .txz package
+files are removed from that directory; everything else there survives. See
+README.md for how to delete rclone.conf by hand if a full wipe is wanted.
 -->
 <FILE Run="/bin/bash" Method="remove">
 <INLINE>
@@ -147,13 +166,13 @@ fi
 removepkg &name;-&version; || true
 
 rm -rf &emhttp;
-rm -rf &plgPATH;
+rm -f &plgPATH;/&name;-*.txz
 rm -rf /var/run/godwit
 
 rm -f /var/run/godwit.pid
 rm -f /var/log/godwit.log
 
-echo "&name;: removed"
+echo "&name;: removed (rclone.conf and any other config preserved under &plgPATH;)"
 </INLINE>
 </FILE>
 

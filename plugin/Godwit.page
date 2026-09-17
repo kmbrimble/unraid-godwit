@@ -13,7 +13,7 @@ if (file_exists($pidFile)) {
 }
 ?>
 <h1>Godwit</h1>
-<p>Phase 1 — scaffold. No remotes, no jobs, no uploads yet; this page shows daemon status only.</p>
+<p>Phase 2 — remotes. Still no jobs, no uploads; this page manages rclone remotes and shows daemon status.</p>
 <p>Service status: <b><?= $running ? 'running' : 'stopped' ?></b></p>
 
 <button id="godwit-start" type="button">Start</button>
@@ -21,11 +21,52 @@ if (file_exists($pidFile)) {
 
 <div id="godwit-status">Loading status…</div>
 
+<h2>Remotes</h2>
+<div id="godwit-remotes-list">Loading remotes…</div>
+
+<h3>Add Google Drive</h3>
+<p>On another machine with a browser, run:</p>
+<pre>rclone authorize "drive" "&lt;CLIENT_ID&gt;" "&lt;CLIENT_SECRET&gt;"</pre>
+<p>Sign in as the account the Client ID/Secret belong to (see PLAN.md §3 for how to create them), then paste the
+token JSON it prints below. The client ID and secret are only ever sent to rcd; Godwit never returns them to this
+page once saved.</p>
+<div>
+    <label>Name <input type="text" id="drive-name" placeholder="gdrive"></label><br>
+    <label>Client ID <input type="text" id="drive-client-id" size="60"></label><br>
+    <label>Client secret <input type="text" id="drive-client-secret" size="60"></label><br>
+    <label>Token JSON<br><textarea id="drive-token" rows="4" cols="70"></textarea></label><br>
+    <button id="drive-add" type="button">Add Google Drive remote</button>
+</div>
+
+<h3>Add OneDrive (personal)</h3>
+<p>On another machine with a browser, run:</p>
+<pre>rclone authorize "onedrive"</pre>
+<p>A custom client ID/secret is optional — leave blank to use rclone's own default OneDrive app. Paste the token
+JSON it prints below. Godwit resolves the account's drive_id/drive_type itself via rclone's own config flow;
+see CHANGELOG 0.2.0 for how this was verified.</p>
+<div>
+    <label>Name <input type="text" id="onedrive-name" placeholder="onedrive"></label><br>
+    <label>Client ID (optional) <input type="text" id="onedrive-client-id" size="60"></label><br>
+    <label>Client secret (optional) <input type="text" id="onedrive-client-secret" size="60"></label><br>
+    <label>Token JSON<br><textarea id="onedrive-token" rows="4" cols="70"></textarea></label><br>
+    <button id="onedrive-add" type="button">Add OneDrive remote</button>
+</div>
+
+<div id="godwit-remotes-message"></div>
+
 <script>
 function esc(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
         return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
+}
+
+function fmtBytes(n) {
+    if (n === null || n === undefined) { return 'unknown'; }
+    var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    var i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return n.toFixed(1) + ' ' + units[i];
 }
 
 function godwitRender(data) {
@@ -48,9 +89,94 @@ function godwitPoll(action) {
     $.post('/plugins/godwit/scripts/godwit-api.php', { csrf_token: csrf_token, action: action || 'status' }, godwitRender, 'json');
 }
 
+function godwitRemoteAction(action, params, onDone) {
+    var post = Object.assign({ csrf_token: csrf_token, action: action }, params || {});
+    $.post('/plugins/godwit/scripts/godwit-api.php', post, function (data) {
+        var msgEl = document.getElementById('godwit-remotes-message');
+        if (data.error) {
+            msgEl.innerHTML = '<p style="color:red">' + esc(data.error) + '</p>';
+        } else {
+            msgEl.innerHTML = '';
+        }
+        if (onDone) { onDone(data); }
+        godwitRemotesRefresh();
+    }, 'json');
+}
+
+function godwitRemotesRefresh() {
+    godwitRemoteAction('remotes_list', {}, function (data) {
+        var el = document.getElementById('godwit-remotes-list');
+        var remotes = data.remotes || [];
+        if (remotes.length === 0) {
+            el.innerHTML = '<p>No remotes configured yet.</p>';
+            return;
+        }
+        var html = '<table border="1" cellpadding="4"><tr><th>Name</th><th>Type</th><th>Status</th>' +
+            '<th>Last checked</th><th>Used / Total</th><th>Actions</th></tr>';
+        remotes.forEach(function (r) {
+            var checked = r.checked_ts ? new Date(r.checked_ts * 1000).toLocaleString() : 'never';
+            var quota = (r.total !== null && r.total !== undefined)
+                ? fmtBytes(r.used) + ' / ' + fmtBytes(r.total) + (r.pct !== null ? ' (' + r.pct.toFixed(1) + '%)' : '')
+                : (r.used !== null ? fmtBytes(r.used) + ' used (unlimited)' : 'unknown');
+            html += '<tr>' +
+                '<td>' + esc(r.name) + '</td>' +
+                '<td>' + esc(r.type) + '</td>' +
+                '<td>' + esc(r.status) + '</td>' +
+                '<td>' + esc(checked) + '</td>' +
+                '<td>' + esc(quota) + '</td>' +
+                '<td>' +
+                '<button type="button" class="godwit-test" data-name="' + esc(r.name) + '">Test</button> ' +
+                '<button type="button" class="godwit-reauth" data-name="' + esc(r.name) + '">Re-authorise</button> ' +
+                '<button type="button" class="godwit-delete" data-name="' + esc(r.name) + '">Delete</button>' +
+                '</td></tr>';
+        });
+        html += '</table>';
+        el.innerHTML = html;
+
+        el.querySelectorAll('.godwit-test').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                godwitRemoteAction('remotes_test', { name: btn.dataset.name });
+            });
+        });
+        el.querySelectorAll('.godwit-reauth').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                var token = window.prompt('Paste the new token JSON for "' + btn.dataset.name + '" (from rclone authorize):');
+                if (!token) { return; }
+                godwitRemoteAction('remotes_reauth', { name: btn.dataset.name, token: token });
+            });
+        });
+        el.querySelectorAll('.godwit-delete').forEach(function (btn) {
+            btn.addEventListener('click', function () {
+                if (!window.confirm('Delete remote "' + btn.dataset.name + '"? This cannot be undone.')) { return; }
+                godwitRemoteAction('remotes_delete', { name: btn.dataset.name, confirm: '1' });
+            });
+        });
+    });
+}
+
 document.getElementById('godwit-start').addEventListener('click', function () { godwitPoll('start'); });
 document.getElementById('godwit-stop').addEventListener('click', function () { godwitPoll('stop'); });
 
+document.getElementById('drive-add').addEventListener('click', function () {
+    godwitRemoteAction('remotes_add_drive', {
+        name: document.getElementById('drive-name').value,
+        client_id: document.getElementById('drive-client-id').value,
+        client_secret: document.getElementById('drive-client-secret').value,
+        token: document.getElementById('drive-token').value,
+    });
+});
+
+document.getElementById('onedrive-add').addEventListener('click', function () {
+    godwitRemoteAction('remotes_add_onedrive', {
+        name: document.getElementById('onedrive-name').value,
+        client_id: document.getElementById('onedrive-client-id').value,
+        client_secret: document.getElementById('onedrive-client-secret').value,
+        token: document.getElementById('onedrive-token').value,
+    });
+});
+
 godwitPoll();
 setInterval(godwitPoll, 15000);
+godwitRemotesRefresh();
+setInterval(godwitRemotesRefresh, 30000);
 </script>

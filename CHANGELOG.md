@@ -10,6 +10,98 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+### Added — Phase 2: Remotes (PLAN.md §5 item 2)
+
+A Remotes section on Settings → Godwit lists configured rclone remotes
+(name, type, health status, quota) and can add a Google Drive or OneDrive
+remote from a pasted `rclone authorize` token, re-authorise, test-connect
+and delete one. `godwitd` health-checks every remote hourly (plus on
+daemon startup) with a read-only `operations/about` call, stores the
+result in SQLite, and sends an Unraid notification once per OK/failed
+transition and once per 90% quota crossing. Still no jobs, no uploads —
+Godwit makes no write calls to Google Drive or OneDrive in this phase.
+
+- **Remote config now lives in rcd's memory, not just on disk**, so
+  managing it has to go through rcd's own rc API rather than the bundled
+  CLI (a CLI `--config` write would leave a running rcd blind to the
+  change until its next restart, and hourly health checks would fail
+  against a remote the page just "created"). `godwit_handle_remote_action()`
+  in `plugin/scripts/lib.php` is the single entry point for every
+  `remotes_*` action posted from the page.
+- **Ground-truthed discovery mid-implementation:** rclone's rc auth gate
+  is *not* exempted by unix-socket transport — only commands rclone
+  itself marks NoAuth (`rc/noop`, `core/version`, the only two Phase 1's
+  heartbeat ever called) skip it. `config/create`, `config/update`,
+  `config/delete` and `operations/about` all 403 with "authentication
+  must be set up on the rc server" against a unix listener with no
+  credentials, which is what Phase 1 shipped (no `--rc-user`/`--rc-pass`
+  on the unix socket, relying only on the socket directory's 0700
+  permissions). Confirmed locally against the bundled rclone v1.75.1
+  binary with a scratch `--config` file, no network. Fixed by generating
+  `--rc-user`/`--rc-pass` for *every* listener now, unix included —
+  `godwit_rcd_argv()`'s docblock has the full evidence. `godwitd` writes
+  the current listener (address + credentials) to a new runtime-only file,
+  `$GODWIT_RUNDIR/rc-credentials.json` (0600, same directory as the
+  socket, same trust boundary), on every rcd (re)start; the web SAPI reads
+  it back to build authenticated rc calls
+  (`godwit_write_rc_credentials()` / `godwit_read_rc_credentials()`). This
+  is a deliberate architecture change from Phase 1's "the web SAPI never
+  needs rcd credentials" — Phase 2's remote management genuinely does.
+  `--rc-no-auth` is still never used anywhere (unchanged non-negotiable).
+- **Non-interactive remote creation**, ground-truthed against the bundled
+  rclone v1.75.1 binary locally (scratch `--config` file, fake/syntactically-
+  valid tokens, no network, no real credentials anywhere in this repo):
+  - `config create <name> drive client_id=.. client_secret=.. scope=drive
+    token=<json>` persists the remote section immediately even though it
+    returns a non-empty `State` (a follow-up question); declining every
+    follow-up (`result=false`: "replace the token?", "Shared Drive?") over
+    rc's `config/update --continue` walks the state machine to `State ""`
+    without changing anything already set.
+  - Over the rc API, `config/create` needs `opt={"nonInteractive":true}`
+    or it hangs (rcd has no stdin to prompt against), and `config/update
+    --continue` needs a `parameters` key present (an empty object
+    suffices) with `state`/`result` nested *inside* `opt` — confirmed by
+    the rc framework's "Didn't find key parameters" 400 until that was
+    added.
+  - OneDrive's chain reaches a `choose_type_done` state that must be
+    answered `"onedrive"` (not declined) — that answer makes rclone's own
+    onedrive backend call Microsoft Graph (`/me/drives`, `/me/drive`)
+    using the pasted access_token to resolve `drive_id`/`drive_type`
+    itself, so Godwit never has to. Tested against a syntactically-invalid
+    token, which surfaced as `HTTP 401 InvalidAuthenticationToken` on that
+    exact call — the same shape is this feature's auth-expired
+    classification, and the "unverified until a real OneDrive token
+    exists" case flagged in the handback: rclone then asks to enter the
+    drive ID manually, a fallback this phase doesn't support, so the walk
+    raises instead of silently creating a broken remote.
+  - rclone's own remote-name validation error text is mirrored exactly by
+    `godwit_validate_remote_name()`.
+- **No secret ever reaches the browser or a log line.** `config/dump` is
+  filtered server-side to `name, type, has_client_secret, has_token,
+  scope, drive_type` before it leaves `godwit_list_remotes()` —
+  `client_id` is not just emptied, the key is absent entirely.
+  `godwit_redact()` strips token/client_secret/client_id-shaped values
+  from both the ini and JSON key=value/`"key":"value"` shapes before
+  anything is logged.
+- **Uninstall now preserves `&plgPATH;`** (`rclone.conf`, and any future
+  `godwit.cfg`/`jobs.json`) instead of deleting it — see the "Deleting
+  credentials" section of README.md for how to wipe it by hand. Only the
+  installed `.txz` package files are removed from that directory on
+  uninstall now. A new remove-block extraction harness in `tests/run.php`
+  (`godwit_extract_remove_block()`/`godwit_run_remove_block()`, mirroring
+  the existing install-block harness) proved the pre-fix block deleted a
+  fixture `rclone.conf` (red baseline), then that the fix preserves it
+  alongside a stale `.txz` cleanup.
+- 31 new tests (67 total, up from 36): redaction, name/token validation,
+  rc param builders, the drive/onedrive config-state walk (including the
+  auth-expired fixture), `config/dump` secret-stripping, error
+  classification, quota parsing (including the "unlimited" null-pct
+  case), notify-once transition logic (OK↔auth-expired/error, 90% quota
+  crossing with reset), the notify script wrapper (stubbed), the
+  credentials file round-trip, and one end-to-end test against a real
+  bundled rcd instance (add → list → delete) confirming no secret value
+  ever appears in a `remotes_list` response.
+
 ## [0.1.3] - 2026-09-16
 
 ### Fixed

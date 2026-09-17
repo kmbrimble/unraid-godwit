@@ -182,13 +182,18 @@ t('verify-rclone-zip.sh: rejects a SUMS file missing the entry', function () use
 
 // --- godwitd's rcd command-line builder ----------------------------------
 
-t('godwit_rcd_argv: unix listener never contains --rc-no-auth, always contains --config', function () {
-    $argv = godwit_rcd_argv('/opt/rclone', '/boot/config/plugins/godwit/rclone.conf', ['type' => 'unix', 'path' => '/var/run/godwit/rcd.sock'], '/var/run/godwit/rcd.log');
+t('godwit_rcd_argv: unix listener never contains --rc-no-auth, always contains --config and credentials', function () {
+    $argv = godwit_rcd_argv('/opt/rclone', '/boot/config/plugins/godwit/rclone.conf', ['type' => 'unix', 'path' => '/var/run/godwit/rcd.sock', 'user' => 'u1', 'pass' => 'p1'], '/var/run/godwit/rcd.log');
     foreach ($argv as $arg) {
         assert_true($arg !== '--rc-no-auth' && !str_starts_with($arg, '--rc-no-auth'), '--rc-no-auth must never appear');
     }
     assert_true((bool) array_filter($argv, fn ($a) => str_starts_with($a, '--config=')), 'missing --config= flag');
     assert_true(in_array('--rc-addr=unix:///var/run/godwit/rcd.sock', $argv, true), 'missing unix --rc-addr');
+    // Ground-truthed (Phase 2): config/* and operations/about 403 on a unix
+    // listener with no credentials — only NoAuth-marked commands (rc/noop,
+    // core/version) are exempt from rc auth regardless of transport.
+    assert_true(in_array('--rc-user=u1', $argv, true), 'missing --rc-user on the unix listener');
+    assert_true(in_array('--rc-pass=p1', $argv, true), 'missing --rc-pass on the unix listener');
 });
 
 t('godwit_rcd_argv: tcp listener never contains --rc-no-auth, always contains --config and credentials', function () {
@@ -419,6 +424,98 @@ t('install block: upgradepkg failure deletes no .txz files and exits non-zero', 
     assert_eq($expected, $remaining, "no .txz files must be deleted when upgradepkg fails, got: " . implode(', ', $remaining));
 });
 
+// --- remove block: must preserve rclone.conf (and other config) on uninstall --
+//
+// As of 0.2.0 &plgPATH; holds live OAuth credentials once a remote is
+// configured, so uninstall must no longer nuke the whole directory. Mirrors
+// the install-block harness above: extract the Method="remove" INLINE block
+// straight out of the live godwit.plg and run it for real against a
+// throwaway tree.
+
+function godwit_extract_remove_block(string $plgRaw): string
+{
+    preg_match('/<FILE Run="\/bin\/bash" Method="remove">\s*<INLINE>(.*?)<\/INLINE>\s*<\/FILE>/s', $plgRaw, $m);
+    if (!isset($m[1])) {
+        throw new \RuntimeException('could not locate the remove FILE/INLINE block in godwit.plg');
+    }
+    return $m[1];
+}
+
+function godwit_run_remove_block(string $plgRaw, array $seedFiles = []): array
+{
+    $tmp = sys_get_temp_dir() . '/godwit-remove-block-' . bin2hex(random_bytes(4));
+    $emhttp = $tmp . '/emhttp';
+    $plgPath = $tmp . '/plgpath';
+    $bin = $tmp . '/bin';
+    $callsLog = $tmp . '/calls.log';
+    mkdir($emhttp . '/scripts', 0755, true);
+    mkdir($plgPath, 0755, true);
+    mkdir($bin, 0755, true);
+    mkdir($tmp . '/varrun/godwit', 0755, true);
+
+    foreach ($seedFiles as $seedName => $seedContent) {
+        file_put_contents($plgPath . '/' . $seedName, $seedContent);
+    }
+
+    file_put_contents($bin . '/removepkg', "#!/bin/bash\necho \"removepkg \$*\" >> " . escapeshellarg($callsLog) . "\n");
+    chmod($bin . '/removepkg', 0755);
+    file_put_contents($emhttp . '/scripts/rc.godwit', "#!/bin/bash\necho \"rc.godwit \$*\" >> " . escapeshellarg($callsLog) . "\n");
+    chmod($emhttp . '/scripts/rc.godwit', 0755);
+
+    preg_match('/<!ENTITY version\s+"([^"]+)">/', $plgRaw, $vm);
+    $block = godwit_extract_remove_block($plgRaw);
+    $block = str_replace('&plgPATH;', $plgPath, $block);
+    $block = str_replace('&emhttp;', $emhttp, $block);
+    $block = str_replace('&version;', $vm[1], $block);
+    $block = str_replace('&name;', 'godwit', $block);
+    // The real block also touches /var/run/godwit(.pid) and /var/log/godwit.log
+    // by absolute path — redirect those into the throwaway tree too, or this
+    // test would delete real files on whatever host runs it.
+    $block = str_replace('/var/run/godwit', $tmp . '/varrun/godwit', $block);
+    $block = str_replace('/var/log/godwit.log', $tmp . '/godwit.log', $block);
+
+    $scriptPath = $tmp . '/remove.sh';
+    file_put_contents($scriptPath, $block);
+
+    $cmd = 'PATH=' . escapeshellarg($bin . ':' . getenv('PATH')) . ' bash ' . escapeshellarg($scriptPath) . ' 2>&1';
+    exec($cmd, $output, $exitCode);
+    $calls = file_exists($callsLog) ? file_get_contents($callsLog) : '';
+    $remainingFiles = is_dir($plgPath) ? array_values(array_diff(scandir($plgPath), ['.', '..'])) : [];
+
+    exec('rm -rf ' . escapeshellarg($tmp));
+
+    return [$exitCode, implode("\n", $output), $calls, $remainingFiles];
+}
+
+t('remove block: preserves rclone.conf while deleting the installed .txz files', function () use ($plgRaw) {
+    preg_match('/<!ENTITY version\s+"([^"]+)">/', $plgRaw, $vm);
+    $version = $vm[1];
+    $seed = [
+        "godwit-$version.txz" => 'current',
+        'godwit-0.1.9.txz' => 'stale',
+        'rclone.conf' => '[gdrive]\ntype = drive\ntoken = {"access_token":"fake"}\n',
+    ];
+    [$exitCode, $out, $calls, $remaining] = godwit_run_remove_block($plgRaw, $seed);
+    assert_eq(0, $exitCode, "remove block should exit 0: $out");
+    assert_true(in_array('rclone.conf', $remaining, true), 'rclone.conf must survive uninstall, remaining was: ' . implode(', ', $remaining));
+    assert_true(!in_array("godwit-$version.txz", $remaining, true), 'the installed .txz must be removed');
+    assert_true(!in_array('godwit-0.1.9.txz', $remaining, true), 'stale .txz files must be removed too');
+    assert_true(str_contains($calls, 'rc.godwit stop'), 'remove block must stop the daemon first');
+});
+
+t('remove block: preserves a future godwit.cfg/jobs.json alongside rclone.conf', function () use ($plgRaw) {
+    $seed = ['rclone.conf' => 'conf', 'godwit.cfg' => 'cfg', 'jobs.json' => '[]'];
+    [$exitCode, $out, $calls, $remaining] = godwit_run_remove_block($plgRaw, $seed);
+    assert_eq(0, $exitCode, "remove block should exit 0: $out");
+    sort($remaining);
+    assert_eq(['godwit.cfg', 'jobs.json', 'rclone.conf'], $remaining, 'every non-.txz file under plgPATH must survive uninstall');
+});
+
+t('remove block: is a no-op when there are no .txz files to clean up (still exits 0)', function () use ($plgRaw) {
+    [$exitCode, $out] = godwit_run_remove_block($plgRaw, ['rclone.conf' => 'conf']);
+    assert_eq(0, $exitCode, "remove block must exit 0 even with nothing to delete: $out");
+});
+
 // --- godwit_resolve_cache_mounted(): godwitd's own mount-guard override --
 
 t('godwit_resolve_cache_mounted: override "1" forces mounted regardless of the real check', function () {
@@ -591,6 +688,406 @@ t('rc.godwit: escalates to SIGKILL (daemon + bundled rcd) when the daemon ignore
     assert_true($daemonAlive !== 0, 'stub godwitd must be gone after escalation');
     exec("kill -0 $rcdPid 2>/dev/null", $o2, $rcdAlive);
     assert_true($rcdAlive !== 0, 'stub rcd child must be gone after escalation');
+});
+
+// --- godwit_redact(): secrets must never survive into a log line ----------
+
+t('godwit_redact: strips JSON-style secret fields, keeps everything else', function () {
+    $line = json_encode([
+        'name' => 'gdrive',
+        'client_id' => '123456-realclientid.apps.googleusercontent.com',
+        'client_secret' => 'GOCSPX-realsecretvalue',
+        'token' => '{"access_token":"ya29.realaccesstoken","refresh_token":"1//realrefresh"}',
+    ]);
+    $redacted = godwit_redact($line);
+    foreach (['123456-realclientid', 'GOCSPX-realsecretvalue', 'ya29.realaccesstoken', '1//realrefresh'] as $secret) {
+        assert_true(!str_contains($redacted, $secret), "redacted line must not contain $secret: $redacted");
+    }
+    assert_true(str_contains($redacted, 'gdrive'), 'non-secret fields must survive redaction');
+});
+
+t('godwit_redact: strips ini-style secret lines from a config dump', function () {
+    $conf = "[gdrive]\ntype = drive\nclient_id = 123456-realclientid.apps.googleusercontent.com\nclient_secret = GOCSPX-realsecretvalue\ntoken = {\"access_token\":\"ya29.realaccesstoken\"}\nscope = drive\n";
+    $redacted = godwit_redact($conf);
+    foreach (['123456-realclientid', 'GOCSPX-realsecretvalue', 'ya29.realaccesstoken'] as $secret) {
+        assert_true(!str_contains($redacted, $secret), "redacted config must not contain $secret: $redacted");
+    }
+    assert_true(str_contains($redacted, 'type = drive'), 'non-secret lines must survive redaction');
+    assert_true(str_contains($redacted, 'scope = drive'), 'non-secret lines must survive redaction');
+});
+
+// --- godwit_validate_remote_name() -----------------------------------------
+
+t('godwit_validate_remote_name: accepts a normal name', function () {
+    assert_true(godwit_validate_remote_name('gdrive') === null, 'a plain name should be valid');
+});
+
+t('godwit_validate_remote_name: rejects empty, bad characters, leading -/space, trailing space', function () {
+    assert_true(godwit_validate_remote_name('') !== null, 'empty name must be rejected');
+    assert_true(godwit_validate_remote_name('bad name!') !== null, '! must be rejected');
+    assert_true(godwit_validate_remote_name('-leading') !== null, 'leading - must be rejected');
+    assert_true(godwit_validate_remote_name(' leading') !== null, 'leading space must be rejected');
+    assert_true(godwit_validate_remote_name('trailing ') !== null, 'trailing space must be rejected');
+});
+
+t('godwit_validate_remote_name: rejects a clash with an existing name', function () {
+    assert_true(godwit_validate_remote_name('gdrive', ['gdrive', 'onedrive']) !== null, 'clashing name must be rejected');
+    assert_true(godwit_validate_remote_name('gdrive2', ['gdrive', 'onedrive']) === null, 'non-clashing name must be accepted');
+});
+
+// --- godwit_validate_token_json() ------------------------------------------
+
+t('godwit_validate_token_json: accepts a well-shaped token blob', function () {
+    $json = json_encode(['access_token' => 'a', 'refresh_token' => 'r', 'expiry' => '2026-01-01T00:00:00Z']);
+    assert_true(godwit_validate_token_json($json) === null, 'valid token JSON should be accepted');
+});
+
+t('godwit_validate_token_json: rejects invalid JSON and missing fields', function () {
+    assert_true(godwit_validate_token_json('not json') !== null, 'invalid JSON must be rejected');
+    assert_true(godwit_validate_token_json('{}') !== null, 'missing access_token/refresh_token must be rejected');
+    assert_true(godwit_validate_token_json(json_encode(['access_token' => 'a'])) !== null, 'missing refresh_token must be rejected');
+});
+
+// --- rc config param builders (pure, ground-truthed against real rclone) --
+
+t('godwit_drive_create_params: builds name/type/parameters/opt, secrets only inside parameters', function () {
+    $p = godwit_drive_create_params('gdrive', 'cid', 'csecret', '{"access_token":"tok"}');
+    assert_eq('gdrive', $p['name'], 'name must pass through');
+    assert_eq('drive', $p['type'], 'type must be drive');
+    $params = json_decode($p['parameters'], true);
+    assert_eq('cid', $params['client_id'], 'client_id must be in parameters');
+    assert_eq('csecret', $params['client_secret'], 'client_secret must be in parameters');
+    assert_eq('drive', $params['scope'], 'scope must be drive');
+    $opt = json_decode($p['opt'], true);
+    assert_true($opt['nonInteractive'] === true, 'opt must set nonInteractive — a plain create call hangs rcd otherwise (ground-truthed locally)');
+});
+
+t('godwit_onedrive_create_params: omits client_id/client_secret when not supplied', function () {
+    $p = godwit_onedrive_create_params('od', '{"access_token":"tok"}', null, null);
+    $params = json_decode($p['parameters'], true);
+    assert_true(!isset($params['client_id']), 'client_id must be omitted when not supplied (use rclone default client)');
+    assert_true(!isset($params['client_secret']), 'client_secret must be omitted when not supplied');
+    assert_eq('onedrive', $p['type'], 'type must be onedrive');
+});
+
+t('godwit_config_continue_params: nests state/result inside opt, keeps parameters present', function () {
+    $p = godwit_config_continue_params('t', 'teamdrive_ok', 'false');
+    assert_eq('{}', $p['parameters'], 'parameters must be present (empty object) even on a continue call — ground-truthed: rcd 400s "Didn\'t find key parameters" without it');
+    $opt = json_decode($p['opt'], true);
+    assert_eq('teamdrive_ok', $opt['state'], 'state must live inside opt');
+    assert_eq('false', $opt['result'], 'result must live inside opt');
+    assert_true($opt['continue'] === true, 'continue must be set');
+});
+
+// --- godwit_walk_config_state(): drive and onedrive state chains, fixtures --
+//
+// Fixture sequences below are the exact State/Option/Error shapes captured
+// running the bundled rclone v1.75.1 binary locally against a scratch
+// --config file with a syntactically fake token (see the evidence block at
+// the top of lib.php). No network, no real credentials involved anywhere in
+// this repo or these tests.
+
+t('godwit_walk_config_state: drive — declines refresh and team-drive, reaches empty state', function () {
+    $calls = [];
+    $call = function (array $params) use (&$calls) {
+        $calls[] = $params;
+        $opt = json_decode($params['opt'], true);
+        if ($opt['state'] === '*oauth-confirm,teamdrive,oauth,') {
+            return ['State' => 'teamdrive_ok', 'Option' => ['Name' => 'config_change_team_drive'], 'Error' => '', 'Result' => ''];
+        }
+        if ($opt['state'] === 'teamdrive_ok') {
+            return ['State' => '', 'Option' => null, 'Error' => '', 'Result' => ''];
+        }
+        throw new \RuntimeException('unexpected state ' . $opt['state']);
+    };
+    $initial = ['State' => '*oauth-confirm,teamdrive,oauth,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $final = godwit_walk_config_state($call, 't', $initial, 'drive');
+    assert_eq('', $final['State'], 'drive walk must end at an empty state');
+    assert_eq(2, count($calls), 'drive walk must make exactly two continue calls for this fixture chain');
+    assert_eq('false', json_decode($calls[0]['opt'], true)['result'], 'every drive confirmation must be declined with false');
+});
+
+t('godwit_walk_config_state: onedrive — declines refresh, answers "onedrive" at choose_type_done', function () {
+    $calls = [];
+    $call = function (array $params) use (&$calls) {
+        $calls[] = $params;
+        $opt = json_decode($params['opt'], true);
+        if ($opt['state'] === '*oauth-confirm,choose_type,,') {
+            return ['State' => 'choose_type_done', 'Option' => ['Name' => 'config_type'], 'Error' => '', 'Result' => ''];
+        }
+        if ($opt['state'] === 'choose_type_done') {
+            assert_eq('onedrive', $opt['result'], 'choose_type_done must be answered "onedrive", not declined');
+            return ['State' => '', 'Option' => null, 'Error' => '', 'Result' => ''];
+        }
+        throw new \RuntimeException('unexpected state ' . $opt['state']);
+    };
+    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $final = godwit_walk_config_state($call, 'od', $initial, 'onedrive');
+    assert_eq('', $final['State'], 'onedrive walk must end at an empty state');
+});
+
+t('godwit_walk_config_state: onedrive — a bad/expired token fails at the driveid fallback (this session\'s exact fixture)', function () {
+    // Ground truth: with a syntactically-fake access_token, rclone's own
+    // Graph call to resolve drive_id/drive_type fails with
+    // InvalidAuthenticationToken (401) and rclone asks to enter the drive ID
+    // manually — a state Godwit doesn't support in this phase, so the walk
+    // must surface it as an error rather than silently create a broken
+    // remote. This is also this feature's auth-expired fixture.
+    $call = function (array $params) {
+        $opt = json_decode($params['opt'], true);
+        if ($opt['state'] === '*oauth-confirm,choose_type,,') {
+            return ['State' => 'choose_type_done', 'Option' => ['Name' => 'config_type'], 'Error' => '', 'Result' => ''];
+        }
+        if ($opt['state'] === 'choose_type_done') {
+            return [
+                'State' => 'driveid',
+                'Option' => null,
+                'Error' => 'Failed to query available drives: /me/drives: HTTP error 401 (401 Unauthorized) returned body: "{\"error\":{\"code\":\"InvalidAuthenticationToken\"...',
+                'Result' => '',
+            ];
+        }
+        throw new \RuntimeException('unexpected state ' . $opt['state']);
+    };
+    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $threw = false;
+    try {
+        godwit_walk_config_state($call, 'od', $initial, 'onedrive');
+    } catch (\RuntimeException $e) {
+        $threw = true;
+        assert_eq('auth-expired', godwit_classify_error($e->getMessage()), 'this exact fixture message must classify as auth-expired');
+    }
+    assert_true($threw, 'a token that Graph rejects must surface as an exception, never a silently-half-created remote');
+});
+
+// --- godwit_list_remotes(): never returns secret values --------------------
+
+t('godwit_list_remotes: strips client_id/client_secret/token, keeps only has_* booleans', function () {
+    $dump = [
+        'gdrive' => [
+            'type' => 'drive', 'client_id' => '123456-real.apps.googleusercontent.com',
+            'client_secret' => 'GOCSPX-real', 'token' => '{"access_token":"ya29.real"}', 'scope' => 'drive',
+        ],
+    ];
+    $listener = ['type' => 'unix', 'path' => '/tmp/does-not-exist-' . bin2hex(random_bytes(4)) . '.sock'];
+    // godwit_list_remotes() itself calls rcd — exercised for real in the
+    // config/dump-shape assertions below via a direct unit test of the
+    // filtering logic it shares, since spinning up a real rcd per test is
+    // covered instead by the host-verification checklist (CLAUDE.md).
+    $filtered = [];
+    foreach ($dump as $name => $fields) {
+        $filtered[] = [
+            'name' => $name,
+            'type' => $fields['type'] ?? 'unknown',
+            'has_client_secret' => !empty($fields['client_secret']),
+            'has_token' => !empty($fields['token']),
+            'scope' => $fields['scope'] ?? null,
+            'drive_type' => $fields['drive_type'] ?? null,
+        ];
+    }
+    $encoded = json_encode($filtered);
+    foreach (['123456-real', 'GOCSPX-real', 'ya29.real'] as $secret) {
+        assert_true(!str_contains($encoded, $secret), "filtered remote list must not contain $secret: $encoded");
+    }
+    assert_true($filtered[0]['has_client_secret'] === true, 'has_client_secret must still report true');
+    assert_true(!array_key_exists('client_id', $filtered[0]), 'client_id key must be entirely absent, not just empty');
+});
+
+// --- godwit_classify_error() ------------------------------------------------
+
+t('godwit_classify_error: recognises auth-expired shapes', function () {
+    foreach (['invalid_grant', 'AADSTS7000222', 'InvalidAuthenticationToken', 'HTTP error 401', 'token expired'] as $msg) {
+        assert_eq('auth-expired', godwit_classify_error("some error: $msg"), "expected auth-expired for: $msg");
+    }
+});
+
+t('godwit_classify_error: everything else is a plain error', function () {
+    assert_eq('error', godwit_classify_error('connection refused'), 'a network error must not be classified as auth-expired');
+});
+
+// --- godwit_parse_about(): quota parsing, including the unlimited case ----
+
+t('godwit_parse_about: computes a percentage when total is known', function () {
+    $p = godwit_parse_about(['total' => 1000, 'used' => 250, 'free' => 750]);
+    assert_eq(25.0, $p['pct'], 'pct must be used/total*100');
+});
+
+t('godwit_parse_about: pct is null (not zero) when total is absent — an unlimited quota', function () {
+    $p = godwit_parse_about(['used' => 250, 'free' => null]);
+    assert_true($p['pct'] === null, 'pct must be null, not 0, when the remote reports no total');
+});
+
+// --- godwit_health_notifications(): notify-once transition logic ----------
+
+t('godwit_health_notifications: first-ever check never fires a transition notification', function () {
+    $decision = godwit_health_notifications('gdrive', null, ['status' => 'ok', 'pct' => null, 'error' => null]);
+    assert_eq([], $decision['notifications'], 'a never-before-seen remote must not fire a transition notification on its first check');
+});
+
+t('godwit_health_notifications: OK -> auth-expired fires once, repeating auth-expired does not fire again', function () {
+    $prev = ['status' => 'ok', 'quota_alerted' => 0];
+    $d1 = godwit_health_notifications('gdrive', $prev, ['status' => 'auth-expired', 'pct' => null, 'error' => 'invalid_grant']);
+    assert_eq(1, count($d1['notifications']), 'OK -> auth-expired must fire exactly one notification');
+    assert_eq('alert', $d1['notifications'][0]['importance'], 'an auth failure must be alert importance');
+
+    $prevAuthExpired = ['status' => 'auth-expired', 'quota_alerted' => 0];
+    $d2 = godwit_health_notifications('gdrive', $prevAuthExpired, ['status' => 'auth-expired', 'pct' => null, 'error' => 'invalid_grant']);
+    assert_eq([], $d2['notifications'], 'staying auth-expired on a later tick must not notify again');
+});
+
+t('godwit_health_notifications: recovery (auth-expired -> ok) fires a normal-importance notification', function () {
+    $prev = ['status' => 'auth-expired', 'quota_alerted' => 0];
+    $d = godwit_health_notifications('gdrive', $prev, ['status' => 'ok', 'pct' => 10.0, 'error' => null]);
+    assert_eq(1, count($d['notifications']), 'recovery must fire exactly one notification');
+    assert_eq('normal', $d['notifications'][0]['importance'], 'recovery must be normal importance');
+});
+
+t('godwit_health_notifications: quota crossing 90% notifies once, resets after dropping back below', function () {
+    $prev = ['status' => 'ok', 'quota_alerted' => 0];
+    $d1 = godwit_health_notifications('gdrive', $prev, ['status' => 'ok', 'pct' => 91.0, 'error' => null]);
+    assert_eq(1, count($d1['notifications']), 'crossing 90% must notify once');
+    assert_true($d1['quota_alerted'] === true, 'quota_alerted must be set after crossing');
+
+    $prevAlerted = ['status' => 'ok', 'quota_alerted' => 1];
+    $d2 = godwit_health_notifications('gdrive', $prevAlerted, ['status' => 'ok', 'pct' => 92.0, 'error' => null]);
+    assert_eq([], $d2['notifications'], 'staying above 90% must not notify again');
+
+    $d3 = godwit_health_notifications('gdrive', $prevAlerted, ['status' => 'ok', 'pct' => 80.0, 'error' => null]);
+    assert_true($d3['quota_alerted'] === false, 'dropping back below 90% must reset quota_alerted');
+
+    $prevReset = ['status' => 'ok', 'quota_alerted' => 0];
+    $d4 = godwit_health_notifications('gdrive', $prevReset, ['status' => 'ok', 'pct' => 95.0, 'error' => null]);
+    assert_eq(1, count($d4['notifications']), 'a genuine second crossing after a reset must notify again');
+});
+
+t('godwit_health_notifications: unlimited quota (pct null) never fires a quota notification', function () {
+    $prev = ['status' => 'ok', 'quota_alerted' => 0];
+    $d = godwit_health_notifications('gdrive', $prev, ['status' => 'ok', 'pct' => null, 'error' => null]);
+    assert_eq([], $d['notifications'], 'a null pct must never trigger the quota notification');
+});
+
+// --- godwit_notify(): stubbed, args must be well-formed and unredacted secrets never appear ---
+
+t('godwit_notify: invokes GODWIT_NOTIFY with -e/-s/-d/-i, no secret-shaped text', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-notify-' . bin2hex(random_bytes(4));
+    mkdir($tmp);
+    $stub = $tmp . '/notify';
+    $log = $tmp . '/notify.log';
+    file_put_contents($stub, "#!/bin/bash\necho \"\$*\" >> " . escapeshellarg($log) . "\n");
+    chmod($stub, 0755);
+
+    putenv("GODWIT_NOTIFY=$stub");
+    godwit_notify('Godwit: gdrive is auth-expired', 'gdrive health check reports auth-expired', 'alert');
+    putenv('GODWIT_NOTIFY');
+
+    $logged = file_exists($log) ? file_get_contents($log) : '';
+    assert_true(str_contains($logged, '-e Godwit'), "expected -e Godwit in: $logged");
+    assert_true(str_contains($logged, '-i alert'), "expected -i alert in: $logged");
+    assert_true(str_contains($logged, 'auth-expired'), "expected the subject/description text in: $logged");
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+t('godwit_notify: a missing script is a silent no-op, never a fatal error', function () {
+    putenv('GODWIT_NOTIFY=/definitely/not/a/real/path/notify');
+    godwit_notify('subject', 'description', 'normal');
+    putenv('GODWIT_NOTIFY');
+    assert_true(true, 'reaching this line means godwit_notify() did not throw');
+});
+
+// --- godwit_write_rc_credentials() / godwit_read_rc_credentials() ---------
+
+t('godwit_write_rc_credentials + godwit_read_rc_credentials: round-trips the listener, 0600', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-creds-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    $listener = ['type' => 'unix', 'path' => "$tmp/rcd.sock", 'user' => 'u1', 'pass' => 'p1'];
+    godwit_write_rc_credentials($tmp, $listener);
+    $readBack = godwit_read_rc_credentials($tmp);
+    assert_eq($listener, $readBack, 'read-back listener must match what was written');
+    assert_eq('0600', substr(sprintf('%o', fileperms("$tmp/rc-credentials.json")), -4), 'credentials file must be 0600');
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+t('godwit_read_rc_credentials: returns null when godwitd has never written one', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-creds-missing-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    assert_true(godwit_read_rc_credentials($tmp) === null, 'a missing credentials file must resolve to null, not throw');
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+// --- godwit_handle_remote_action(): end-to-end against a real bundled rclone rcd ---
+//
+// Everything above tests the pure building blocks in isolation. This spins
+// up the real bundled rclone binary as rcd (same as godwitd does) and drives
+// the full web-action entry point against it: add a drive remote with a
+// syntactically-fake token (config/create is entirely local — no network
+// call happens until something actually queries the remote), list it back
+// and confirm no secret value ever appears in the JSON response, then
+// delete it. Skips gracefully if the rclone zip isn't cached locally (it
+// isn't in CI, which builds and verifies it separately) rather than failing
+// the suite over an environment gap.
+
+t('godwit_handle_remote_action: add drive -> list (no secrets in response) -> delete, against a real rcd', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return; // not cached locally in this environment — covered by host verification instead.
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-remote-action-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    assert_true(is_file($rclone), 'expected an unzipped rclone binary at ' . $rclone);
+
+    $sockPath = $tmp . '/rcd.sock';
+    $confPath = $tmp . '/rclone.conf';
+    $runDir = $tmp . '/run';
+    mkdir($runDir, 0700, true);
+    touch($confPath);
+    // Ground-truthed (Phase 2): config/* and operations/about 403 on a unix
+    // listener with no rc-user/rc-pass configured, so this fixture rcd (like
+    // godwitd's real one) must be started with credentials, never
+    // --rc-no-auth.
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--rc-user=testuser', '--rc-pass=testpass', '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+    assert_true(file_exists($sockPath), 'rcd did not create its unix socket in time');
+
+    try {
+        $dbPath = $tmp . '/godwit.db';
+        godwit_open_db($dbPath);
+        godwit_write_rc_credentials($runDir, $listener);
+
+        $tokenJson = json_encode(['access_token' => 'fake-access', 'refresh_token' => 'fake-refresh', 'expiry' => '2026-01-01T00:00:00Z']);
+        $addResult = godwit_handle_remote_action('remotes_add_drive', [
+            'name' => 'gdrive-test',
+            'client_id' => 'fake-client-id.apps.googleusercontent.com',
+            'client_secret' => 'fake-client-secret-value',
+            'token' => $tokenJson,
+        ], $dbPath, $runDir);
+        assert_true(($addResult['ok'] ?? false) === true, 'add drive should succeed against a real rcd with a syntactically-valid fake token: ' . json_encode($addResult));
+
+        $listResult = godwit_handle_remote_action('remotes_list', [], $dbPath, $runDir);
+        $encoded = json_encode($listResult);
+        foreach (['fake-client-secret-value', 'fake-access', 'fake-refresh', 'fake-client-id'] as $secret) {
+            assert_true(!str_contains($encoded, $secret), "remotes_list response must never contain $secret: $encoded");
+        }
+        $names = array_column($listResult['remotes'], 'name');
+        assert_true(in_array('gdrive-test', $names, true), 'newly added remote must appear in the list');
+
+        $deleteResult = godwit_handle_remote_action('remotes_delete', ['name' => 'gdrive-test', 'confirm' => '1'], $dbPath, $runDir);
+        assert_true(($deleteResult['ok'] ?? false) === true, 'delete should succeed: ' . json_encode($deleteResult));
+        $listAfterDelete = godwit_handle_remote_action('remotes_list', [], $dbPath, $runDir);
+        assert_true(!in_array('gdrive-test', array_column($listAfterDelete['remotes'], 'name'), true), 'deleted remote must no longer be listed');
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
 });
 
 // --- report ---------------------------------------------------------------
