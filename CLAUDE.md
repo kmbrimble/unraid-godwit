@@ -493,6 +493,9 @@ key off `outcome === 'budget'`) need to see it as one.
   live: without the byte fallback the run classifies `error` (reproducing
   the bug), with it (what godwitd now actually does) it classifies
   `budget` while the real error count still surfaces in the status label.
+  **Correction, v0.4.4: this test never actually executed in the worktree
+  that built this release** — see the v0.4.4 entry below for why, and for
+  what "stable across 3 repeat runs" above should be read as instead.
 - **Known ceiling, not fixed this release** (documented as a `ponytail:`
   comment on `godwit_bytes_near_max_transfer()` in lib.php): the 2%
   tolerance's undershoot bound is really "the size of the one file that

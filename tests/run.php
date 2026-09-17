@@ -2971,16 +2971,20 @@ t('v0.4.3 end-to-end against a real rcd: a genuine per-file error masking the Ma
     // close to MaxTransfer rather than being bounded by one huge file's
     // size — the same shape that produced the real host's 0.003%-scale
     // shortfall. Deliberately NOT split across subdirectories with one
-    // oversized file in a second directory: an earlier version of this
-    // test did that, and rclone's march can discover the oversized file
-    // BEFORE any file in the other directory (directory traversal order
-    // is not guaranteed) — when that race lands that way, the cutoff
-    // trips on the very first candidate and cancels the whole job with
-    // zero bytes transferred and errorMsg "context canceled", which
-    // reproduced nothing about the masking bug and was flaky in CI
-    // (deterministic-but-different per machine/load, not "rare"). A flat
-    // directory of uniform-sized files has no such race: ground-truthed
-    // locally at 4/4 runs landing within ~0.15% of MaxTransfer.
+    // oversized file in a second directory: v0.4.3's version did that,
+    // and rclone's march can discover the oversized file BEFORE any file
+    // in the other directory (directory traversal order is not
+    // guaranteed) — when that race lands that way, the cutoff trips on
+    // the very first candidate and cancels the whole job with zero bytes
+    // transferred and errorMsg "context canceled", which reproduced
+    // nothing about the masking bug. This was never caught in the
+    // worktree that built v0.4.3, or in CI — both lack build/ (see
+    // CLAUDE.md's Test command section), so this test silently SKIPPED
+    // (not passed) in both; the failure was only ever observed on a
+    // checkout with build/ actually populated. A flat directory of
+    // uniform-sized files has no such race: ground-truthed with build/
+    // confirmed present at 15/15 repeat runs (10 before this comment was
+    // written, 5 more after) landing within ~0.15% of MaxTransfer.
     $total = 0;
     for ($i = 0; $i < 400; $i++) {
         $sz = 900 + random_int(0, 200);
