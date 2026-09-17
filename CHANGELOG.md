@@ -10,6 +10,63 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-09-18
+
+### Fixed
+
+- **v0.4.2's minimum-budget-threshold gate and calm status wording were
+  dead on arrival.** Verified against the live host: `grep -c "stopped
+  mid-run" /var/log/godwit.log` returned 0 — godwitd's own mid-run
+  ledger-based budget stop (the second line of defence) had never fired,
+  and every budget-capped run that night (Photos, Teegan, Kieren) was
+  still recorded as `error`, not `budget`. Root cause: `MaxTransfer` is
+  set to the remaining budget at job start, so rclone's own CAUTIOUS
+  cutoff always trips before godwitd's ledger-based `remaining <= 0`
+  check ever sees zero — `$stoppedForBudget` was therefore always
+  `false`, leaving the cutoff's own error text as the only signal, and
+  that text is a `NoRetryError`, the lowest-precedence kind
+  `job/status`'s `currentError()` can return. Any genuine per-file error
+  occurring in the same run (every one of that night's three runs had
+  one) always won and overwrote it before `godwit_classify_job_outcome()`
+  ever saw it. `godwit_classify_job_outcome()` gained a byte-proximity
+  fallback (`godwit_bytes_near_max_transfer()`, 2% tolerance, symmetric):
+  godwitd now also carries the exact `MaxTransfer` it passed to each
+  active job (`$activeJobs[$name]['max_transfer']`) and, when no more
+  specific textual signal (throttle, explicit cutoff text, auth-expiry)
+  matched, classifies as `budget` if the transferred bytes landed within
+  2% of that limit either way. 2% is not a guess — ground-truthed locally
+  against the bundled v1.75.1 binary: CAUTIOUS mode can both overshoot
+  (many small, fast files can slip past the cutoff check before it's
+  re-evaluated — measured up to +1.6%) and undershoot (a
+  bandwidth-throttled transfer of larger files stops before starting one
+  that would exceed the limit — measured up to -1.6%) its own limit.
+- **The real error count is never hidden by the reclassification.**
+  `godwit_job_status_label()` now appends "— N transfer errors also
+  logged, see /var/log/godwit.log" to a budget/window pause when the
+  stored error count exceeds the clean cutoff's own accounted baseline
+  (the job's configured `Transfers` for a budget stop, 0 for a window
+  stop — the same baseline `godwit_cap_stop_notification()` already used).
+  A clean cutoff (errors at or below the baseline) stays quiet, matching
+  0.4.1's existing notification behaviour; a genuinely elevated count (63
+  on the real Photos run, 508 on Kieren's) now surfaces on the page, not
+  just in a one-off notification.
+- **Decided, not silently changed: the threshold gate stays scoped to
+  `outcome === 'budget'` only** (not `window`/`error`/`interrupted` too).
+  Traced through the session/terminal-outcome mechanics rather than
+  guessed: `error` is a terminal outcome (`godwit_terminal_job_outcomes()`),
+  so a job that ends in `error` is never re-selected again this session
+  regardless of gating — no trickle-restart risk exists for it. `window`
+  can only occur when `MaxDuration` was set, which only happens when a
+  window was active and it's NOT a "Run now" override — meaning the
+  window that caused it has, by definition, just closed, so the
+  candidate-start loop won't attempt selection again until the window
+  reopens (hours away) or Run now is triggered — again, no 15s-tick
+  trickle-restart risk. `budget` is the only outcome that is both
+  non-terminal (stays eligible within the same session) and can be
+  immediately re-selected on every tick while the gate that actually
+  causes the trickle-restart problem (a live window or Run now) is still
+  open. Gating only `budget` is therefore correct as built, not a gap.
+
 ## [0.4.2] - 2026-09-18
 
 ### Added

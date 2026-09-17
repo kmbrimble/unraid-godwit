@@ -461,6 +461,11 @@ while ($running) {
                     'last_bytes' => 0,
                     'stop_reason' => null,
                     'transfers' => (int) ($job['transfers'] ?? 4),
+                    // The exact MaxTransfer passed to this job at start
+                    // (v0.4.3) — fed to godwit_classify_job_outcome() as a
+                    // fallback signal for the masked-cutoff case, since
+                    // godwitd is the only place that actually knows it.
+                    'max_transfer' => $remaining,
                 ];
                 godwit_log($logFile, "job started: {$job['name']} -> {$fs['dstFs']} (rc jobid $jobid, remaining budget $remaining bytes)");
             }
@@ -511,7 +516,7 @@ while ($running) {
             // observed, which misclassified (and alerted on) a job that
             // simply finished a few seconds after its window closed.
             $stoppedForBudget = ($aj['stop_reason'] ?? null) === 'budget';
-            $outcome = godwit_classify_job_outcome($errorMsg, $stoppedForBudget);
+            $outcome = godwit_classify_job_outcome($errorMsg, $stoppedForBudget, $bytes, $aj['max_transfer'] ?? null);
             if ($outcome === 'throttled') {
                 $wasThrottled = godwit_throttled_until($db, $aj['remote'], $now) !== null;
                 godwit_mark_throttled($db, $aj['remote'], $now + 86400);

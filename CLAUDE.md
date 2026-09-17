@@ -396,6 +396,91 @@ which happens from tonight's first budget-triggered stop onward. No live
 browser click-through of the updated status text or phase-free intro
 paragraph — same gap as 0.4.0, unchanged by this release.
 
+**v0.4.3 (built and offline-verified, 2026-09-18) fixes v0.4.2's threshold
+gate and calm status wording being dead on arrival in production — found
+by the user reading the live host, not inferred.** Evidence: `grep -c
+"stopped mid-run" /var/log/godwit.log` on the host returned 0 — godwitd's
+own mid-run ledger-based budget stop had never fired once. Root cause:
+`MaxTransfer` is set to the remote's remaining budget at job start, so
+rclone's own CAUTIOUS cutoff always trips *before* godwitd's own
+`remaining <= 0` ledger check ever sees zero — `$stoppedForBudget` was
+therefore always `false`. That left the cutoff's own error text as the
+only signal `godwit_classify_job_outcome()` had, and that text is a
+`NoRetryError`, the lowest-precedence kind `job/status`'s `currentError()`
+returns — any genuine per-file error in the same run (every one of that
+night's three budget-capped runs had one: Photos 63, Teegan 85, Kieren
+508) always won and overwrote it. The docblock this function carried into
+0.4.2 explicitly accepted this as "correct" (a masked cutoff "genuinely
+needs attention"); live evidence proved that judgement wrong for the
+actual case — a run that hit the cap AND had file errors is still a cap
+stop, and both the v0.4.2 threshold gate and status wording (which both
+key off `outcome === 'budget'`) need to see it as one.
+
+- **Byte-proximity fallback**, ground-truthed locally against the bundled
+  v1.75.1 binary before being trusted (never guessed): godwitd now carries
+  the exact `MaxTransfer` it passed to each active job
+  (`$activeJobs[$name]['max_transfer']`) through to
+  `godwit_classify_job_outcome()`, which — only after every more specific
+  textual signal (throttle, explicit cutoff/duration text, auth-expiry)
+  has had a chance to match — falls back to `godwit_bytes_near_max_transfer()`:
+  within 2% of the configured limit, either direction, counts as a budget
+  stop. 2% was chosen from three repeated local measurements each way, not
+  assumed: many small, fast-completing files let CAUTIOUS *overshoot* its
+  own limit by up to +1.6% (several files slip past the cutoff check
+  before it's re-evaluated); a bandwidth-throttled transfer of larger
+  files (closer to the real Drive workload) *undershoots* by up to -1.6%
+  instead (the check fires before starting a file that would exceed the
+  limit). It cannot mistake a job that merely used a lot of a large budget
+  for one that was actually cut off: that case has `$errorMsg === ''`, so
+  `godwit_classify_job_outcome()` already returns `completed` before the
+  byte check is ever reached.
+- **The real error count is never hidden by the reclassification** — the
+  bug report's explicit constraint. `godwit_job_status_label()` now
+  appends "— N transfer errors also logged, see /var/log/godwit.log" to a
+  budget/window pause whenever the stored error count exceeds the clean
+  cutoff's own accounted baseline (the job's currently configured
+  `Transfers` for a budget stop, 0 for a window stop — mirroring
+  `godwit_cap_stop_notification()`'s existing baseline concept, since
+  `job_runs` has no column recording what `Transfers` actually was during
+  a historical run). A clean cutoff (errors at/below baseline) stays
+  quiet; 63 real errors on a Transfers=4 job now surfaces as "59 transfer
+  errors also logged" on the page itself, not just in a one-off
+  notification that's already gone by the time someone looks.
+- **Decided, not silently left as-is: the threshold gate stays scoped to
+  `outcome === 'budget'` only.** The bug report asked directly whether a
+  job whose last run ended `window` or `error` with outstanding work
+  should also be gated. Traced through the mechanics rather than guessed:
+  `error` is a terminal outcome (`godwit_terminal_job_outcomes()`), so a
+  job that ends in `error` is never re-selected again this session
+  regardless of gating — no trickle-restart risk exists for it, gated or
+  not. `window` can only occur when `MaxDuration` was set, which only
+  happens when a window was active and it is NOT a "Run now" override —
+  meaning the window that produced it has, by definition, just closed, so
+  the candidate-start loop will not attempt selection again until the
+  window reopens (hours later) or Run now is triggered — again no 15s-tick
+  trickle-restart risk. `budget` is the only outcome that is both
+  non-terminal (stays eligible for re-selection within the same session)
+  and can genuinely be re-picked on every tick while the gate that causes
+  the trickle-restart problem (a live window or Run now) stays open.
+  Gating only `budget` is therefore correct as built, not a gap left by
+  oversight.
+- **Review**: `code-diff-reviewer`'s three-pass pipeline plus `advisor`
+  (see CHANGELOG.md 0.4.3 for the escalation score and findings, if any).
+- Verified offline (`php tests/run.php`; see CHANGELOG.md 0.4.3 for the
+  exact pass count and the red-baseline evidence), including a real-rcd
+  end-to-end test against the bundled v1.75.1 binary that reproduces the
+  exact masking shape (many small files near a MaxTransfer cutoff, plus a
+  genuine destination-collision file error) and proves both that the bug
+  existed (classifying `error` without the byte fallback) and that the fix
+  works (classifying `budget` with it, while the real error count still
+  surfaces).
+
+**Not verified this release**: nothing against the live Google Drive
+remote — this was built read-only against the host, per the user's
+explicit instruction (they installed and are verifying v0.4.2 live; no
+install, no daemon/rcd restart, no mutating rc call was made this
+session). The user installs v0.4.3 by hand once released.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

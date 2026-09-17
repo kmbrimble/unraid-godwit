@@ -1516,6 +1516,42 @@ function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastR
 }
 
 /**
+ * Whether $bytesTransferred landed close enough to $maxTransferBytes that
+ * godwitd's own MaxTransfer cutoff is almost certainly what actually
+ * stopped the job — used as a fallback signal (v0.4.3) for exactly the
+ * masking case godwit_classify_job_outcome()'s docblock used to accept as
+ * unavoidable: job/status's cutoff text is a NoRetryError, the lowest
+ * precedence currentError() can return, so ANY real per-file error in the
+ * same run overwrites it in $errorMsg. Live host evidence (2026-09-18)
+ * showed this masking is common, not rare — every one of that night's
+ * budget-capped runs (Photos, Teegan, Kieren) had real per-file errors
+ * riding along and were misclassified `error` as a result, silently
+ * disabling both the v0.4.2 status wording and its threshold gate (which
+ * both key off `outcome === 'budget'`).
+ *
+ * Tolerance is 2%, symmetric — ground-truthed locally against the bundled
+ * v1.75.1 binary (see tests/run.php), not assumed: CAUTIOUS mode can both
+ * OVERSHOOT its own limit (many small, fast-completing files can let
+ * several slip past the cutoff check before it's re-evaluated — measured
+ * up to +1.6% with ~1KB files on local disk, three repeats) and UNDERSHOOT
+ * it (a bandwidth-throttled transfer of larger files, closer to the real
+ * Drive workload, stops before starting a file that would exceed the
+ * limit — measured up to -1.6% with bwlimit-throttled ~2MB files, three
+ * repeats). 2% is a deliberately generous margin above both measured
+ * extremes. It cannot mistake a job that merely used a lot of a large
+ * budget for a cutoff it never hit: that case has $errorMsg === '', so
+ * godwit_classify_job_outcome() already returns 'completed' before this
+ * function is ever called.
+ */
+function godwit_bytes_near_max_transfer(int $bytesTransferred, ?int $maxTransferBytes, float $tolerance = 0.02): bool
+{
+    if ($maxTransferBytes === null || $maxTransferBytes <= 0) {
+        return false;
+    }
+    return abs($bytesTransferred - $maxTransferBytes) <= $maxTransferBytes * $tolerance;
+}
+
+/**
  * Classifies a finished rc job's outcome from its job/status error text (and
  * whether godwitd itself issued the mid-run job/stop that caused it — its
  * own job/stop produces a generic "context canceled", not a distinguishing
@@ -1530,28 +1566,37 @@ function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastR
  * misclassified a job that legitimately completed a few seconds after its
  * window closed, and suppressed its first-seed notification.
  *
- * Why matching on $errorMsg text is enough to also catch a genuine
- * transfer failure that happens in the same run, without a separate error
- * count check here (ground-truthed by reading rclone v1.75.1's
- * fs/sync/sync.go): job/status's error is `currentError()`, which resolves
- * in fixed precedence — fatalErr, then a plain err, then noRetryErr.
- * MaxTransfer's CAUTIOUS/graceful cutoff is a NoRetryError (lowest
- * precedence), so a real per-file error occurring in the same run (a plain
- * err) always wins and is what ends up in $errorMsg instead — this
- * function then falls through to 'error', which is correct: the run
- * genuinely needs attention beyond "resume next window". A `budget`
- * result here therefore already means nothing else outranked the cutoff.
+ * Why matching on $errorMsg text alone is NOT enough to also catch a
+ * genuine transfer failure co-occurring with a MaxTransfer cutoff
+ * (ground-truthed by reading rclone v1.75.1's fs/sync/sync.go, then
+ * disproven live on 2026-09-18): job/status's error is `currentError()`,
+ * which resolves in fixed precedence — fatalErr, then a plain err, then
+ * noRetryErr. MaxTransfer's CAUTIOUS/graceful cutoff is a NoRetryError
+ * (lowest precedence), so a real per-file error occurring in the same run
+ * (a plain err) always wins and is what ends up in $errorMsg instead. An
+ * earlier version of this function accepted that as correct — "the run
+ * genuinely needs attention beyond resume next window" — but live evidence
+ * showed the opposite: a run that hit the cap AND had file errors is still
+ * a cap stop, and both godwit_job_budget_gated() (v0.4.2's threshold gate)
+ * and godwit_job_status_label() need to see it as one. $bytesTransferred/
+ * $maxTransferBytes (v0.4.3, both known exactly by godwitd — the ledger's
+ * own tracked bytes and the MaxTransfer it passed at job start) are a
+ * fallback for exactly this masking case via godwit_bytes_near_max_transfer()
+ * — checked only after every more specific textual signal (throttle,
+ * explicit cutoff text, auth-expiry) has had a chance to match, so a
+ * clearly-labelled failure is never overridden by a numeric coincidence.
+ * The real error count is never hidden by this reclassification — it is
+ * still stored on the run (job_runs.errors) and still surfaces via
+ * godwit_cap_stop_notification()'s baseline-aware "N errors were also
+ * logged" text and (v0.4.3) godwit_job_status_label()'s own suffix.
  * MaxDuration's cutoff is a *fatal* error (highest precedence), so it is
- * immune to being masked by an unrelated plain error the way the old
- * directory-modtime bug masked MaxTransfer — but the reverse asymmetry
- * exists in principle: a real error co-occurring with a duration cutoff
- * could theoretically lose to the fatal error's precedence and be
- * misread as 'window' from this text alone. Accepted: godwitd still
- * stores the real core/stats error count on every outcome (see
- * godwit_cap_stop_notification()), so it's never silently lost — only
- * the outcome label could, in that rare combination, undersell it.
+ * immune to this masking the way MaxTransfer's cutoff is — a real error
+ * co-occurring with a duration cutoff could in principle still lose to the
+ * fatal error's precedence and be misread as 'window' from text alone, but
+ * that direction has no byte-based fallback here (there is no equivalent
+ * "MaxDuration bytes" signal to fall back on) — accepted, same as before.
  */
-function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget): string
+function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget, ?int $bytesTransferred = null, ?int $maxTransferBytes = null): string
 {
     if ($errorMsg === '') {
         return 'completed';
@@ -1567,6 +1612,9 @@ function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget): 
     }
     if (godwit_classify_error($errorMsg) === 'auth-expired') {
         return 'auth';
+    }
+    if ($bytesTransferred !== null && godwit_bytes_near_max_transfer($bytesTransferred, $maxTransferBytes)) {
+        return 'budget';
     }
     return 'error';
 }
@@ -1598,8 +1646,21 @@ function godwit_format_bytes(int $bytes): string
  * is no stored error text to reclassify them from, and guessing would be
  * dishonest (see CLAUDE.md). This is only ever wrong for pre-0.4.1 rows;
  * every run classified from 0.4.1 onward is accurate.
+ *
+ * $jobTransfers (v0.4.3, the job's currently configured Transfers — the
+ * best available proxy for what it was during the stored run, matching
+ * godwitd's own $aj['transfers'] baseline concept in
+ * godwit_cap_stop_notification()) is used to decide whether a budget/
+ * window stop's stored error count is just the cutoff's own clean
+ * bookkeeping (up to one per in-flight transfer slot for a budget stop, 0
+ * for a window stop — see godwit_cap_stop_notification()'s docblock) or
+ * genuinely elevated. A calm "paused" label must never let a real,
+ * elevated error count go unmentioned on the page — that's the whole
+ * reason v0.4.3 exists: a run that hit the cap AND had real file errors
+ * (the 2026-09-18 masking incident) must show both facts, not just the
+ * cap.
  */
-function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \DateTimeImmutable $now): string
+function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \DateTimeImmutable $now, int $jobTransfers = 4): string
 {
     if ($gated) {
         return 'waiting for daily cap to free up';
@@ -1615,9 +1676,12 @@ function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \
         case 'completed':
             return "completed ($bytes) at $when";
         case 'budget':
-            return "paused — daily upload cap reached, resumes $resume ($bytes uploaded)";
         case 'window':
-            return "paused — upload window closed, resumes $resume ($bytes uploaded)";
+            $reason = $lastRun['outcome'] === 'window' ? 'upload window closed' : 'daily upload cap reached';
+            $baseline = $lastRun['outcome'] === 'window' ? 0 : $jobTransfers;
+            $extra = (int) ($lastRun['errors'] ?? 0) - $baseline;
+            $suffix = $extra > 0 ? sprintf(' — %d transfer error%s also logged, see /var/log/godwit.log', $extra, $extra === 1 ? '' : 's') : '';
+            return "paused — $reason, resumes $resume ($bytes uploaded)$suffix";
         case 'throttled':
             return "error — Google's daily upload limit reached ($bytes) at $when";
         case 'auth':
@@ -2131,7 +2195,7 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
                 'outcome' => $last['outcome'],
             ] : null,
             'queue_position' => $pos,
-            'status_text' => godwit_job_status_label($last, $gated, $settings['windows'] ?? [], $nowDt),
+            'status_text' => godwit_job_status_label($last, $gated, $settings['windows'] ?? [], $nowDt, (int) ($job['transfers'] ?? 4)),
         ];
     }
 

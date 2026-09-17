@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.4.2">
+<!ENTITY version   "0.4.3">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,15 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.4.3
+- Fixed v0.4.2's budget threshold and calm status wording never actually
+  engaging: a run that hit the daily upload cap AND had ordinary file
+  errors was still recorded as "error", because rclone's own cutoff
+  message always loses to a real per-file error in the same run. Godwit
+  now also recognises a cap stop by how close the transferred bytes
+  landed to the configured limit, not just by the error text — a real
+  error is still shown, just alongside the correct "paused" status, not
+  in place of it.
 ###0.4.2
 - Godwit no longer restarts a job that hit its daily upload cap on every
   small trickle of freed budget: it now waits until at least 20% of the

@@ -2376,6 +2376,47 @@ t('godwit_classify_job_outcome: a directory-modtime failure — the exact rcd.lo
     assert_eq('error', godwit_classify_job_outcome($realHostLogLine, false), 'a masked cutoff message is indistinguishable from a real error once the cutoff text itself is gone — the fix belongs in never producing this error, not in special-casing its text here');
 });
 
+// --- v0.4.3: byte-proximity fallback for a masked MaxTransfer cutoff -------
+// --- (the real 2026-09-18 bug: every budget-capped run that night also had
+// --- real per-file errors, whose text always outranks the cutoff's own, so
+// --- $stoppedForBudget was always false and the text match never fired) ---
+
+t('godwit_bytes_near_max_transfer: within the 2% tolerance in both directions (CAUTIOUS measured to both overshoot and undershoot locally — see docblock)', function () {
+    assert_true(godwit_bytes_near_max_transfer(98_000_000, 100_000_000), '2% under is exactly at the boundary — must count');
+    assert_true(godwit_bytes_near_max_transfer(102_000_000, 100_000_000), '2% over is exactly at the boundary — must count');
+    assert_true(godwit_bytes_near_max_transfer(100_000_000, 100_000_000), 'exact match');
+});
+
+t('godwit_bytes_near_max_transfer: outside the tolerance in either direction is not a match', function () {
+    assert_true(!godwit_bytes_near_max_transfer(97_000_000, 100_000_000), '3% under is outside the 2% margin');
+    assert_true(!godwit_bytes_near_max_transfer(103_000_000, 100_000_000), '3% over is outside the 2% margin');
+    assert_true(!godwit_bytes_near_max_transfer(10_000_000, 100_000_000), 'a job that transferred a small fraction of a huge budget must not match');
+});
+
+t('godwit_bytes_near_max_transfer: null/zero maxTransferBytes never matches (nothing to compare against)', function () {
+    assert_true(!godwit_bytes_near_max_transfer(1000, null), 'null maxTransferBytes');
+    assert_true(!godwit_bytes_near_max_transfer(1000, 0), 'zero maxTransferBytes');
+});
+
+t('godwit_classify_job_outcome: a real per-file error masking the cutoff text still classifies as budget when bytes transferred landed near the configured MaxTransfer (v0.4.3 fix for the 2026-09-18 incident)', function () {
+    $realPerFileError = 'open /dst/badfile: is a directory';
+    assert_eq('budget', godwit_classify_job_outcome($realPerFileError, false, 98_500_000, 100_000_000), 'bytes within 2% of MaxTransfer despite a masking per-file error');
+});
+
+t('godwit_classify_job_outcome: a real per-file error is NOT reclassified as budget when bytes are far from MaxTransfer (the job genuinely just failed, nowhere near the cap)', function () {
+    $realPerFileError = 'open /dst/badfile: is a directory';
+    assert_eq('error', godwit_classify_job_outcome($realPerFileError, false, 5_000_000, 100_000_000), 'far below MaxTransfer — a real failure, not a masked cutoff');
+});
+
+t('godwit_classify_job_outcome: throttle/auth-expiry text still wins over the byte-proximity fallback even when bytes happen to land near MaxTransfer — the more specific, known signal takes priority', function () {
+    assert_eq('throttled', godwit_classify_job_outcome('googleapi: uploadLimitExceeded', false, 99_000_000, 100_000_000), 'throttle text must win');
+    assert_eq('auth', godwit_classify_job_outcome('invalid_grant: token expired', false, 99_000_000, 100_000_000), 'auth-expiry text must win');
+});
+
+t('godwit_classify_job_outcome: with no bytes/maxTransfer args at all (the pre-0.4.3 2-arg call shape), behaviour is unchanged — a masked error still reads as error', function () {
+    assert_eq('error', godwit_classify_job_outcome('some unrelated per-file error', false), 'omitting the new args must not change existing behaviour');
+});
+
 // --- Requeue after restart --------------------------------------------------
 
 t('godwit_interrupt_open_runs: closes an in-flight run as interrupted and reports it for requeue', function () {
@@ -2630,6 +2671,28 @@ t('godwit_job_status_label: window reads as a calm pause distinct from budget', 
     assert_true(str_contains($label, '11.1 GiB uploaded'), $label);
 });
 
+// --- v0.4.3: a budget/window pause must not hide a genuinely elevated -----
+// --- error count (Kieren's Photos/Teegan/Kieren runs had 63/85/508) -------
+
+t('godwit_job_status_label: a budget pause with errors at or below the clean-cutoff baseline (job Transfers) stays quiet — no suffix', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $label = godwit_job_status_label(['outcome' => 'budget', 'bytes' => 100, 'errors' => 4, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'), 4);
+    assert_true(!str_contains($label, 'also logged'), "4 errors at Transfers=4 is the clean cutoff's own bookkeeping, not a real problem: $label");
+});
+
+t('godwit_job_status_label: a budget pause with errors above the baseline surfaces the extra count — must not go invisible', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $label = godwit_job_status_label(['outcome' => 'budget', 'bytes' => (int) round(669.2 * 1024 * 1024 * 1024), 'errors' => 63, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'), 4);
+    assert_true(str_contains($label, '59 transfer errors also logged'), "63 errors - 4 baseline = 59 extra, matching the real Photos run: $label");
+    assert_true(str_contains($label, 'daily upload cap reached'), 'the calm framing must still be present: ' . $label);
+});
+
+t('godwit_job_status_label: a window pause\'s baseline is 0 (MaxDuration\'s fatal cutoff never accounts an error itself) — any stored error at all surfaces', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $label = godwit_job_status_label(['outcome' => 'window', 'bytes' => 100, 'errors' => 1, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'), 4);
+    assert_true(str_contains($label, '1 transfer error also logged'), $label);
+});
+
 t('godwit_job_status_label: a genuine failure still plainly says error', function () {
     $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
     $label = godwit_job_status_label(['outcome' => 'error', 'bytes' => 0, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
@@ -2873,6 +2936,117 @@ t('godwit_build_sync_params + rc sync/copy: a MaxTransfer cutoff that skips an e
         // configured Transfers, which here is 1, matching this assertion.
         $stats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $jobid], 15);
         assert_eq(1, (int) ($stats['errors'] ?? -1), 'a clean cutoff at Transfers=1 should account for exactly the cutoff itself: ' . json_encode($stats));
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
+});
+
+t('v0.4.3 end-to-end against a real rcd: a genuine per-file error masking the MaxTransfer cutoff text is still classified budget via the byte-proximity fallback, and the real error is not hidden — reproduces the exact shape of the 2026-09-18 Photos/Teegan/Kieren incident, where every budget-capped run also had real per-file errors', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-maskedbudget-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/Photos';
+    mkdir($src . '/subdirA', 0755, true);
+    mkdir($src . '/subdirB', 0755, true);
+    // Many small files (like a real photo share), all individually well
+    // within budget, so the cutoff lands close to MaxTransfer rather than
+    // being bounded by one huge file's size — the same shape that produced
+    // the real host's 0.003%-scale shortfall.
+    $subdirATotal = 0;
+    for ($i = 0; $i < 400; $i++) {
+        $sz = 900 + random_int(0, 200);
+        file_put_contents($src . "/subdirA/f$i.bin", random_bytes($sz));
+        $subdirATotal += $sz;
+    }
+    // A real, deterministic per-file error unrelated to the budget cutoff:
+    // the destination path is pre-created as a DIRECTORY, so rclone's own
+    // attempt to write this file there fails with a genuine plain error —
+    // exactly the kind of error that outranks the cutoff's own NoRetryError
+    // in currentError()'s precedence and masks it in job/status's text.
+    file_put_contents($src . '/subdirA/badfile', random_bytes(500));
+    // subdirB is far too large to fit in what's left of the budget after
+    // subdirA — this is what actually triggers the MaxTransfer cutoff.
+    file_put_contents($src . '/subdirB/big.bin', random_bytes($subdirATotal * 5));
+
+    $dst = $tmp . '/dst';
+    mkdir($dst . '/subdirA/badfile', 0755, true); // the collision itself
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+
+    try {
+        $job = ['name' => 'Photos', 'share' => 'Photos', 'remote' => 'localdst', 'mode' => 'copy', 'transfers' => 1, 'max_delete' => 1000, 'excludes' => []];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        // Budget set to subdirA's real transferable total — everything that
+        // CAN transfer (subdirA minus the doomed badfile) should just about
+        // fit; subdirB (5x larger) cannot, so the cutoff genuinely fires.
+        $maxTransfer = $subdirATotal;
+        $params = godwit_build_sync_params($job, $fs, $filterFile, $maxTransfer, null, null, false, $shareRoot);
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));
+        $jobid = $resp['jobid'];
+        $status = null;
+        for ($i = 0; $i < 100; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $jobid], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish within 10s: ' . json_encode($status));
+        $errorMsg = trim((string) ($status['error'] ?? ''));
+        $stats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $jobid], 15);
+        $bytes = (int) ($stats['bytes'] ?? -1);
+        $errors = (int) ($stats['errors'] ?? -1);
+
+        // The masking must actually have happened — otherwise this test
+        // proves nothing about the fallback path.
+        assert_true(!str_contains($errorMsg, 'as set by --max-transfer'), 'the real per-file error was expected to mask the cutoff text: ' . var_export($errorMsg, true));
+        assert_true($errors >= 2, "expected at least the badfile collision plus the cutoff's own bookkeeping error: $errors");
+
+        // The behaviour under test: text alone reads as a plain error...
+        assert_eq('error', godwit_classify_job_outcome($errorMsg, false), 'without the byte fallback, a masked cutoff still misreads as error — confirms the bug this release fixes');
+        // ...but with the byte-proximity fallback (what godwitd now actually
+        // does), it correctly reads as budget.
+        assert_eq('budget', godwit_classify_job_outcome($errorMsg, false, $bytes, $maxTransfer), "bytes ($bytes) vs MaxTransfer ($maxTransfer) should be close enough to confirm this was really a cutoff: " . var_export($errorMsg, true));
+
+        // Constraint from the bug report: the real error must not become
+        // invisible just because the outcome now reads as budget — Transfers
+        // is 1 here, so the clean-cutoff baseline is 1; the collision error
+        // must push the count above that.
+        assert_true($errors > 1, "the real per-file error must still be visible above the clean-cutoff baseline of 1: $errors");
+        $label = godwit_job_status_label(
+            ['outcome' => 'budget', 'bytes' => $bytes, 'errors' => $errors, 'ended_ts' => time(), 'started_ts' => time()],
+            false,
+            godwit_default_windows(),
+            new \DateTimeImmutable('now', new \DateTimeZone('Australia/Brisbane')),
+            1
+        );
+        assert_true(str_contains($label, 'also logged'), "the real error must surface in the status text, not just 'paused': $label");
+        assert_true(str_contains($label, 'daily upload cap reached'), $label);
     } finally {
         proc_terminate($proc);
         proc_close($proc);
@@ -3275,6 +3449,23 @@ t('godwit_build_jobs_status: the same budget-stopped job is NOT gated once enoug
     foreach ($status['jobs'] as $j) { if ($j['name'] === 'Filing Cabinet') { $fc = $j; } }
     assert_true(str_contains($fc['status_text'], 'daily upload cap reached'), $fc['status_text']);
     assert_true(!str_contains(strtolower($fc['status_text']), 'error'), $fc['status_text']);
+});
+
+t('godwit_build_jobs_status: a budget-paused job with real errors above its own configured Transfers baseline surfaces the extra count in status_text, not just "paused"', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    godwit_record_ledger_delta($db, 'gdrive', 1900, 100 * 1024 * 1024 * 1024);
+    $runId = godwit_start_job_run($db, 'Filing Cabinet', 'gdrive', 1000);
+    // Filing Cabinet's default Transfers is 4 (godwit_default_jobs()) — 63
+    // errors matches the real 2026-09-18 Photos incident's error count.
+    godwit_finish_job_run($db, $runId, 1500, 669 * 1024 * 1024 * 1024, 100, 63, 'budget');
+    $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
+    $fc = null;
+    foreach ($status['jobs'] as $j) { if ($j['name'] === 'Filing Cabinet') { $fc = $j; } }
+    assert_true(str_contains($fc['status_text'], '59 transfer errors also logged'), $fc['status_text']);
+    assert_true(str_contains($fc['status_text'], 'daily upload cap reached'), 'still calm, still says what happened: ' . $fc['status_text']);
 });
 
 function godwit_test_job_env(): array
