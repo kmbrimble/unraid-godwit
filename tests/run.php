@@ -868,7 +868,7 @@ t('godwit_walk_config_state: onedrive — declines refresh, answers "onedrive" a
 // test must fail against the pre-fix walker (blanket "false") before the
 // fix and pass after — see the FAIL run in the handback.
 
-function godwit_test_onedrive_sequence_call(array $params, array $drives, ?callable &$afterDriveIdCall = null)
+function godwit_test_onedrive_sequence_call(array $params, array $drives)
 {
     $opt = json_decode($params['opt'], true);
     switch ($opt['state']) {
@@ -935,6 +935,24 @@ t('godwit_walk_config_state: onedrive — two drives, neither/both ambiguous, fa
         assert_true(!str_contains($e->getMessage(), 'b!oneId'), 'ambiguous error must not leak drive IDs: ' . $e->getMessage());
     }
     assert_true($threw, 'an ambiguous drive choice (no personal drive) must fail rather than guess');
+});
+
+t('godwit_walk_config_state: onedrive — two personal-labelled drives is still ambiguous, fails with a clear no-ID error', function () {
+    $drives = [
+        ['Value' => 'b!firstId', 'Help' => 'Work OneDrive (personal)'],
+        ['Value' => 'b!secondId', 'Help' => 'Old OneDrive (personal)'],
+    ];
+    $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
+    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $threw = false;
+    try {
+        godwit_walk_config_state($call, 'od', $initial, 'onedrive');
+    } catch (\RuntimeException $e) {
+        $threw = true;
+        assert_true(str_contains($e->getMessage(), 'Work OneDrive'), 'ambiguous error must name the drives, not IDs: ' . $e->getMessage());
+        assert_true(!str_contains($e->getMessage(), 'b!firstId'), 'ambiguous error must not leak drive IDs: ' . $e->getMessage());
+    }
+    assert_true($threw, 'two drives both labelled (personal) must still fail rather than silently pick the first');
 });
 
 t('godwit_walk_config_state: unknown question with a Default answers it instead of failing', function () {

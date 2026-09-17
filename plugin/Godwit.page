@@ -270,7 +270,8 @@ function godwitAdd(type, label, fieldIds) {
         }
         fields.client_secret.value = '';
         fields.token.value = '';
-        godwitShowMessage('<p style="color:green">Added ' + esc(data.name) + ' (' + esc(label) + ') — checking connection…</p>');
+        var driveNote = data.drive ? ' — drive: ' + esc(data.drive) : '';
+        godwitShowMessage('<p style="color:green">Added ' + esc(data.name) + ' (' + esc(label) + ')' + driveNote + ' — checking connection…</p>');
     });
 }
 

@@ -537,17 +537,16 @@ function godwit_choose_onedrive_drive(?array $opt, ?string &$driveChosen): strin
         throw new \RuntimeException('OneDrive returned no drives to choose from');
     }
     if (count($examples) === 1) {
-        $driveChosen = (string) ($examples[0]['Help'] ?? $examples[0]['Value']);
+        $driveChosen = (string) ($examples[0]['Help'] ?? '');
         return (string) $examples[0]['Value'];
     }
-    foreach ($examples as $ex) {
-        if (stripos((string) ($ex['Help'] ?? ''), '(personal)') !== false) {
-            $driveChosen = (string) $ex['Help'];
-            return (string) $ex['Value'];
-        }
+    $personal = array_values(array_filter($examples, fn ($ex) => stripos((string) ($ex['Help'] ?? ''), '(personal)') !== false));
+    if (count($personal) === 1) {
+        $driveChosen = (string) ($personal[0]['Help'] ?? '');
+        return (string) $personal[0]['Value'];
     }
     $names = array_map(fn ($ex) => (string) ($ex['Help'] ?? ''), $examples);
-    throw new \RuntimeException('multiple OneDrive drives found and none is personal — cannot choose automatically: ' . implode(', ', $names));
+    throw new \RuntimeException('multiple OneDrive drives found and none is uniquely personal — cannot choose automatically: ' . implode(', ', $names));
 }
 
 /**
@@ -1038,7 +1037,11 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
         // remote gets its first health check within a second or two instead
         // of waiting up to an hour — see godwitd's docblock for the marker.
         @touch($runDir . '/check-now');
-        return ['ok' => true, 'name' => $name, 'type' => $type];
+        $result = ['ok' => true, 'name' => $name, 'type' => $type];
+        if ($driveChosen !== null) {
+            $result['drive'] = $driveChosen;
+        }
+        return $result;
     }
 
     if ($action === 'remotes_reauth') {

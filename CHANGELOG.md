@@ -10,6 +10,55 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-17
+
+### Fixed
+
+Kieren reported adding a real OneDrive remote failing with `Failed to query
+root for drive "false": HTTP error 400 ... "ObjectHandle is Invalid"`.
+
+Root cause: `godwit_walk_config_state()` (`plugin/scripts/lib.php`) answered
+every rclone config-wizard question with a blanket `"false"`, except
+`choose_type_done` → `"onedrive"`. OneDrive's drive-selection question
+(`config_driveid`, state `driveid_final`) must be answered with one of the
+real drive IDs rclone offered (`Option.Examples[].Value`), not `"false"` —
+sending `"false"` made rclone `GET /drives/false/root` and 400. Verified
+against rclone v1.75.1 source (`backend/onedrive/onedrive.go`,
+`fs/backend_config.go`, `fs/registry.go`, `lib/oauthutil/oauthutil.go`).
+
+Fix: the walker now answers each question by its `Option.Name` instead of
+guessing:
+- `config_refresh_token`, `config_change_team_drive` → `false` (unchanged —
+  Google Drive's live add path is untouched)
+- `config_type` → `onedrive` (unchanged)
+- `config_driveid` (OneDrive only) → picked from `Option.Examples`: the only
+  one if there's one, the one *uniquely* whose Help contains `(personal)` if
+  several (two personal-labelled drives is still ambiguous, not a silent
+  pick of the first), otherwise a clear error naming the drives (no IDs)
+  rather than guessing
+- `config_drive_ok` → `true` (was previously declined, which would have
+  looped the wizard back to `choose_type` had a drive question ever
+  succeeded before this fix)
+- any other question: the Option's own `DefaultStr` if it has one,
+  otherwise a clear error naming the question instead of guessing `false`
+- the chosen drive's label is now included in the `remote add ... ok` log
+  line and in the action's JSON response (`drive`), which `Godwit.page`
+  shows in the success message
+
+Also: backend/rclone-reported failures (a bad token, a 400 from Graph) are
+now logged as `failed:` rather than `failed validation:` — the latter is
+reserved for Godwit's own input checks (name, token shape, client
+id/secret).
+
+Tests (`tests/run.php`): a fixture reproducing the exact reported sequence
+and error text (proven to fail against the pre-fix walker — see PR/commit
+for the red run), one-drive, two-drives-one-personal, two-drives-ambiguous
+(clear ID-free error), `config_drive_ok` answered `true`, an unrecognised
+question with and without a `DefaultStr`, and a step-cap regression test
+rewritten to use a recognised-but-never-terminating question (the old
+version relied on the removed blanket-`"false"` behaviour). The existing
+Google Drive and original OneDrive fixtures are unchanged and still pass.
+
 ## [0.2.2] - 2026-09-17
 
 ### Fixed
