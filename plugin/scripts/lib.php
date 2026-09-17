@@ -2196,24 +2196,32 @@ function godwit_job_error_notification(string $jobName, ?string $errorMessage): 
  * since these are already infrequent, discrete events.
  *
  * $errorCount > $baselineErrors is the signal that something beyond the
- * cutoff itself also went wrong. $baselineErrors is NOT a constant — three
- * ground-truthed local-backend measurements against the bundled binary
- * found three different clean-cutoff counts, one per way a run can stop:
- *   - MaxTransfer's own graceful cutoff (rclone stops itself, matched via
- *     text): exactly 1 (rclone accounts the cutoff itself as an error even
- *     with zero real per-file failures).
- *   - MaxDuration's cutoff (fatal, matched via text): exactly 0.
- *   - godwitd's own mid-run job/stop ($stoppedForBudget — the ledger
- *     guard firing before rclone's own MaxTransfer): one per transfer
- *     slot in flight when stopped ("Removing partially written file on
- *     error: context canceled" per worker), up to the job's configured
- *     Transfers.
- * Passing a single hardcoded baseline (an earlier version used 1
- * unconditionally) would have made every $stoppedForBudget stop with
- * Transfers=4 report "4 errors were also logged" on a perfectly clean
- * run — the exact false-alarm class this notification exists to end.
- * The caller (godwitd) knows which of the three paths produced this
- * outcome and passes the matching baseline.
+ * cutoff itself also went wrong. $baselineErrors is NOT a constant — it is
+ * not even a constant *within* the 'budget' outcome. Ground-truthed
+ * locally against the bundled binary at Transfers up to 8, repeated 20+
+ * times per shape because the count is racy, not fixed:
+ *   - A budget stop — whether rclone's own graceful MaxTransfer cutoff
+ *     (fs/operations/copy.go's checkLimits(), CutoffMode CAUTIOUS) or
+ *     godwitd's own mid-run job/stop ($stoppedForBudget, the ledger guard
+ *     firing before rclone's own MaxTransfer) — costs *up to one error per
+ *     transfer slot in flight when it trips*, not a fixed number: each
+ *     worker independently discovers the cutoff/cancellation the next time
+ *     it tries to start a file, and how many do so before the pipe drains
+ *     depends on scheduling. Measured 1 through 4 at Transfers=8 across
+ *     repeated runs of the exact same config — an earlier version of this
+ *     fix assumed rclone's own cutoff was always exactly 1 (true only at
+ *     Transfers=1, where this was first measured) and would have reported
+ *     "N errors were also logged" on a perfectly clean multi-worker
+ *     budget stop. The job's configured Transfers is therefore the
+ *     correct upper-bound baseline for either budget path — conservative
+ *     by construction (an occasional genuine extra error blended in below
+ *     that ceiling goes unflagged, which is the safe side of this
+ *     trade-off: never re-cry-wolf on a clean stop).
+ *   - MaxDuration's cutoff (fatal, matched via text): exactly 0, including
+ *     at Transfers=8 (repeated 10x) — fs/sync/sync.go's fatal path never
+ *     calls fs.CountError, unlike the graceful path above.
+ * The caller (godwitd) picks 0 for 'window' and the job's Transfers for
+ * 'budget'.
  */
 function godwit_cap_stop_notification(string $jobName, string $outcome, int $bytes, int $errorCount, int $baselineErrors): array
 {

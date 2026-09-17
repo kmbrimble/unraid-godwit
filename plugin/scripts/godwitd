@@ -486,18 +486,15 @@ while ($running) {
                 $n = godwit_job_error_notification($name, $errorMsg);
                 godwit_notify($n['subject'], $n['description'], $n['importance']);
             } elseif ($outcome === 'budget' || $outcome === 'window') {
-                // Three different clean-cutoff error baselines, ground-truthed
-                // locally against the bundled binary (see
-                // godwit_cap_stop_notification()) — godwitd's own mid-run stop
-                // costs up to one error per in-flight transfer slot; rclone's
-                // own MaxTransfer cutoff costs exactly 1; MaxDuration costs 0.
-                if ($stoppedForBudget) {
-                    $baselineErrors = $aj['transfers'];
-                } elseif ($outcome === 'window') {
-                    $baselineErrors = 0;
-                } else {
-                    $baselineErrors = 1;
-                }
+                // Two clean-cutoff error baselines, ground-truthed locally
+                // against the bundled binary at Transfers up to 8 (see
+                // godwit_cap_stop_notification()): a budget stop — whether
+                // rclone's own graceful MaxTransfer cutoff or godwitd's own
+                // mid-run job/stop — costs up to one error per in-flight
+                // transfer slot (each worker independently discovers the
+                // cutoff/cancellation when it next tries to start a file);
+                // MaxDuration's fatal cutoff costs exactly 0.
+                $baselineErrors = $outcome === 'window' ? 0 : $aj['transfers'];
                 $n = godwit_cap_stop_notification($name, $outcome, $bytes, $errors, $baselineErrors);
                 godwit_notify($n['subject'], $n['description'], $n['importance']);
             }

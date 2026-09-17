@@ -2670,8 +2670,14 @@ t('godwit_build_sync_params + rc sync/copy: a MaxTransfer cutoff that skips an e
         $bothPresent = is_file($dst . '/subdirA/f1') && is_file($dst . '/subdirB/f2');
         assert_true(!$bothPresent, 'the 2000-byte cap must not have let both directories fully transfer: ' . json_encode(scandir($dst)));
 
+        // At this job's Transfers=1, a clean graceful cutoff costs exactly
+        // 1 error (its own bookkeeping, no real per-file failures) — see
+        // godwit_cap_stop_notification()'s docblock for why this count is
+        // NOT a universal constant (measured 1-4 at Transfers=8 across
+        // repeated runs): the baseline godwitd actually uses is the job's
+        // configured Transfers, which here is 1, matching this assertion.
         $stats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $jobid], 15);
-        assert_eq(1, (int) ($stats['errors'] ?? -1), 'a clean cutoff (no real per-file failures) should account for exactly the cutoff itself: ' . json_encode($stats));
+        assert_eq(1, (int) ($stats['errors'] ?? -1), 'a clean cutoff at Transfers=1 should account for exactly the cutoff itself: ' . json_encode($stats));
     } finally {
         proc_terminate($proc);
         proc_close($proc);
@@ -2758,6 +2764,81 @@ t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --
         foreach (glob($dst . '/*.bin') as $f) {
             assert_eq(200000, filesize($f), "no partial/truncated file should be left at $f");
         }
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
+});
+
+t('rc sync/copy: rclone\'s OWN graceful MaxTransfer cutoff (not godwitd\'s job/stop) also costs more than 1 error at Transfers>1 — this is the exact assumption a pre-merge self-review caught wrong (an earlier version of this fix assumed rclone\'s own cutoff was always exactly 1, measured only at Transfers=1)', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-multitransfer-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/Kieren';
+    mkdir($src, 0755, true);
+    $transfers = 8;
+    for ($i = 0; $i < 30; $i++) {
+        file_put_contents($src . "/f$i.bin", str_repeat('x', 1024));
+    }
+    $dst = $tmp . '/dst';
+    mkdir($dst, 0755, true);
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+
+    try {
+        // Throttled so 8 workers are genuinely concurrent when the cutoff
+        // trips, rather than racing through near-instantly.
+        godwit_rc_call_params($listener, 'core/bwlimit', ['rate' => '4000B'], 15);
+        $job = ['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'localdst', 'mode' => 'copy', 'transfers' => $transfers, 'excludes' => []];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        $params = godwit_build_sync_params($job, $fs, $filterFile, 5000, null, null, false, $shareRoot);
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));
+        $jobid = $resp['jobid'];
+        $status = null;
+        for ($i = 0; $i < 100; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $jobid], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish within 10s: ' . json_encode($status));
+        $errorMsg = trim((string) ($status['error'] ?? ''));
+        assert_eq('budget', godwit_classify_job_outcome($errorMsg, false), 'rclone\'s own graceful cutoff at Transfers=8: ' . var_export($errorMsg, true));
+
+        $stats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $jobid], 15);
+        $errorCount = (int) ($stats['errors'] ?? -1);
+        assert_true($errorCount >= 1 && $errorCount <= $transfers, "expected 1..$transfers errors from a clean multi-worker cutoff, not a fixed 1: " . json_encode($stats));
+
+        // The whole point: godwitd must use Transfers (not a hardcoded 1)
+        // as the baseline for this exact path, or this clean stop would
+        // spuriously read as carrying real errors.
+        $n = godwit_cap_stop_notification('Kieren', 'budget', (int) ($stats['bytes'] ?? 0), $errorCount, $transfers);
+        assert_true(!str_contains($n['description'], 'errors were also logged'), "a clean multi-worker cutoff ($errorCount errors) within the Transfers=$transfers baseline must not read as a real failure: " . $n['description']);
     } finally {
         proc_terminate($proc);
         proc_close($proc);

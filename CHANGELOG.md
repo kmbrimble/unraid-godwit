@@ -56,21 +56,29 @@ sort *before* `1.0.9`.
   cannot be masked by a directory-modtime-style error, but in principle
   could itself mask a genuine co-occurring failure's text.
   Accepted, and covered defensively, but **not with a single hardcoded
-  threshold** — an early draft of this fix used "more than 1 error", which
-  a pre-merge self-review caught as wrong: ground-truthing all three ways
-  a run can stop against the bundled binary found three different
-  clean-stop baselines, not one — MaxTransfer's own graceful cutoff costs
-  exactly 1, MaxDuration's fatal cutoff costs exactly 0, and godwitd's own
-  mid-run `job/stop` (the ledger guard firing before rclone's own
-  MaxTransfer, §4.3) costs up to one "context canceled" per in-flight
-  transfer slot — proven live at `Transfers=4` costing exactly 4 on an
-  otherwise clean stop. A hardcoded ">1" would have made every ledger-
-  triggered stop (the common path in practice) report "4 errors were also
-  logged" on a perfectly clean run — reintroducing the same false-alarm
-  class this release exists to fix, just reshaped. `godwit_cap_stop_
-  notification()` now takes an explicit `$baselineErrors` the caller
-  selects per path, and only a count *above* that path's own baseline
-  reads as "something beyond the cutoff itself also failed — check
+  threshold** — getting the right baseline took two rounds of ground-
+  truthing, both caught by self-review before merge, not by the three
+  automated review passes (which returned no findings on either round):
+  round one assumed rclone's own graceful MaxTransfer cutoff always costs
+  exactly 1 error — true, but only measured at `Transfers=1`. Repeating
+  the same config at `Transfers=8` twenty times over found 1 through 4,
+  never a fixed number: each transfer worker independently discovers the
+  cutoff the next time it tries to start a file, and how many do so
+  before the pipe drains is racy. The same is true, separately, of
+  godwitd's own mid-run `job/stop` (the ledger guard firing before
+  rclone's own MaxTransfer, §4.3) — proven live at `Transfers=4` costing
+  exactly 4 "context canceled" errors on an otherwise clean stop, one per
+  in-flight slot. A hardcoded "1" (or any other fixed number) would have
+  made a multi-worker clean budget stop — the common case in practice,
+  since the default job `Transfers` is 4 — report a false "N errors were
+  also logged" on a perfectly clean run: the exact false-alarm class this
+  release exists to fix, just reshaped. MaxDuration's fatal cutoff, by
+  contrast, costs exactly 0 at any Transfers count up to 8 (repeated 10x)
+  — rclone's fatal path never calls `fs.CountError`, unlike the graceful
+  path. `godwit_cap_stop_notification()` now takes an explicit
+  `$baselineErrors`: the job's configured `Transfers` for either budget
+  path, 0 for window, and only a count *above* that baseline reads as
+  "something beyond the cutoff itself also failed — check
   /var/log/godwit.log."
 - **Skipped delete phase on a truncated run — investigated, not a bug.**
   The same host log showed `"not deleting files/directories as there were
@@ -83,7 +91,26 @@ sort *before* `1.0.9`.
   other errors present. This is correct, conservative rclone behaviour
   (never reconcile deletions against a destination the sync didn't fully
   reach) and needs no fix — deletion resumes normally on any run that
-  completes a full pass within budget.
+  completes a full pass within budget. Not just conservative by policy: a
+  `--ignore-errors`-style override would be unsafe here, not merely
+  unwanted — `processError()` calls `s.inCancel()` on the graceful cutoff,
+  and the destination-side march runs on that same cancelled context
+  (`march.March{Ctx: s.inCtx, ...}`), so the destination listing is itself
+  cut off mid-walk. Deleting against a directory listing that didn't
+  finish would risk deleting things Godwit never actually got a chance to
+  check for.
+- **Known pre-existing sharp edge, not touched by this release**:
+  `godwit_classify_job_outcome()`'s `$stoppedForBudget` flag short-
+  circuits to `budget` *before* looking at `$errorMsg` at all — so if
+  godwitd's own ledger-triggered stop happens to coincide with a real
+  per-file error, that error's text is never even inspected, only its
+  count (still stored in `job_runs` and checked against the `Transfers`
+  baseline above). This is the same class of "a real error could in
+  principle be masked" tradeoff written down for MaxDuration above, on a
+  third path — accepted for the same reason: the error count is still
+  visible, and out of scope for this release, which is about ending the
+  specific false alarm recorded on the host, not auditing every
+  precedence interaction.
 
 ## [0.4.0] - 2026-09-18
 

@@ -246,17 +246,29 @@ sync/copy job. A `budget`/`window` outcome now sends a `normal`-importance
 "stopped at the cap/window, resumes next window" notification instead of
 an alert, via a new `godwit_cap_stop_notification()`; genuine transfer
 errors riding along with a cutoff still surface, via a per-path error-
-count baseline (1 for MaxTransfer's own cutoff, 0 for MaxDuration's, up
-to the job's configured `Transfers` for godwitd's own ledger-triggered
-`job/stop`) rather than one hardcoded number — an early draft used a flat
-">1 error" threshold, which a pre-merge self-review caught as wrong
-(ground-truthed live: a clean ledger-triggered stop at `Transfers=4`
-costs exactly 4 errors, which would have reintroduced a reshaped version
-of the same false-alarm bug). Verified offline (217/217, `php
-tests/run.php`) against real local-backend rcd fixtures for all three
-cutoff paths, including a regression test reproducing the exact
-directory-skip shape from the live incident and proving it now classifies
-`budget`, not `error`. **Not verified this release**: none of the above
+count baseline (the job's configured `Transfers` for either budget path —
+rclone's own graceful MaxTransfer cutoff or godwitd's own ledger-
+triggered `job/stop` — and 0 for MaxDuration's fatal cutoff) rather than
+one hardcoded number. Getting this right took two rounds of self-review,
+both catching a wrong assumption the automated review passes didn't
+flag: first that a hardcoded ">1" was wrong (a clean ledger-triggered
+stop at `Transfers=4` costs exactly 4 errors, not 1), then that "exactly
+1" for rclone's own graceful cutoff was ALSO wrong — that number had only
+been measured at `Transfers=1`; repeating the same config at
+`Transfers=8` twenty times over found 1 through 4, since each transfer
+worker independently discovers the cutoff. MaxDuration's fatal cutoff, by
+contrast, held at exactly 0 across 10 repeats at `Transfers=8` — rclone's
+fatal path never increments the error counter, unlike the graceful path.
+Verified offline (218/218, `php tests/run.php`, stable across 11 repeat
+runs) against real local-backend rcd fixtures for all three cutoff paths,
+including a regression test reproducing the exact directory-skip shape
+from the live incident and proving it now classifies `budget`, not
+`error`. godwitd's own glue code that picks which baseline to pass
+(`$outcome === 'window' ? 0 : $aj['transfers']`) is untested by
+construction, matching godwitd's existing convention of testing only its
+pure building blocks in lib.php — confirmed by deliberately reverting it
+to a hardcoded value and finding the full suite stayed green. **Not
+verified this release**: none of the above
 against the live Google Drive remote or a real budget/window cutoff on
 the host — the fix is offline/local-backend only pending the user's
 install. The skipped-delete-phase side effect seen in the same host log
