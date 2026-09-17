@@ -52,6 +52,11 @@ account's drive_id/drive_type itself via rclone's own config flow; see CHANGELOG
     <label>Token JSON<br><textarea id="onedrive-token" rows="4" cols="70"></textarea></label><br>
     <button id="onedrive-add" type="button">Add OneDrive remote</button>
 </div>
+<div id="onedrive-picker" style="display:none">
+    <p>Multiple OneDrive drives were found on this account. Choose one:</p>
+    <div id="onedrive-picker-choices"></div>
+    <button id="onedrive-picker-use" type="button">Use this drive</button>
+</div>
 
 <script>
 function esc(s) {
@@ -251,7 +256,30 @@ function godwitDelete(btn) {
     });
 }
 
-function godwitAdd(type, label, fieldIds) {
+function godwitHideDrivePicker() {
+    document.getElementById('onedrive-picker').style.display = 'none';
+}
+
+function godwitShowDrivePicker(type, label, fieldIds, choices, suggested) {
+    var picker = document.getElementById('onedrive-picker');
+    var choicesEl = document.getElementById('onedrive-picker-choices');
+    choicesEl.innerHTML = choices.map(function (c) {
+        var checked = c.id === suggested ? ' checked' : '';
+        return '<label><input type="radio" name="onedrive-picker-choice" value="' + esc(c.id) + '"' + checked + '> ' +
+            esc(c.label) + '</label><br>';
+    }).join('');
+    picker.dataset.type = type;
+    picker.dataset.label = label;
+    picker.dataset.fieldIds = JSON.stringify(fieldIds);
+    picker.style.display = '';
+    godwitShowMessage(godwitErrorHtml('Multiple OneDrive drives found — pick one below and click "Use this drive".'));
+}
+
+// $driveId, when set, is a choice made via the drive picker below and is
+// sent as an extra field alongside the same form values (which are kept on
+// any failure, including "multiple drives found", so a resubmit doesn't
+// need the user to re-paste the token).
+function godwitAdd(type, label, fieldIds, driveId) {
     var fields = {};
     Object.keys(fieldIds).forEach(function (key) { fields[key] = document.getElementById(fieldIds[key]); });
     var params = {
@@ -261,8 +289,23 @@ function godwitAdd(type, label, fieldIds) {
         token: fields.token.value,
     };
     var controls = Object.values(fields);
+    if (driveId) {
+        params.drive_id = driveId;
+        // The button the user actually clicked ("Use this drive") — put it
+        // first so godwitRunAction picks it, not the original (still
+        // visible) Add button also present in `controls` via fields.add.
+        controls.unshift(document.getElementById('onedrive-picker-use'));
+    } else {
+        // A fresh Add attempt: any drive choices offered by a previous
+        // attempt no longer apply.
+        godwitHideDrivePicker();
+    }
     var name = params.name || '(unnamed)';
     godwitRunAction('remotes_add_' + type, params, controls, 'Adding ' + name + '…', function (data) {
+        if (data.choose_drive) {
+            godwitShowDrivePicker(type, label, fieldIds, data.choose_drive, data.suggested);
+            return;
+        }
         if (data.error) {
             // Keep the fields on failure so the user can correct them.
             godwitShowMessage(godwitErrorHtml(data.error));
@@ -270,6 +313,7 @@ function godwitAdd(type, label, fieldIds) {
         }
         fields.client_secret.value = '';
         fields.token.value = '';
+        godwitHideDrivePicker();
         var driveNote = data.drive ? ' — drive: ' + esc(data.drive) : '';
         godwitShowMessage('<p style="color:green">Added ' + esc(data.name) + ' (' + esc(label) + ')' + driveNote + ' — checking connection…</p>');
     });
@@ -290,6 +334,13 @@ document.getElementById('onedrive-add').addEventListener('click', function () {
         name: 'onedrive-name', client_id: 'onedrive-client-id', client_secret: 'onedrive-client-secret',
         token: 'onedrive-token', add: 'onedrive-add',
     });
+});
+
+document.getElementById('onedrive-picker-use').addEventListener('click', function () {
+    var picker = document.getElementById('onedrive-picker');
+    var checked = document.querySelector('input[name="onedrive-picker-choice"]:checked');
+    if (!checked) { window.alert('Choose a drive first.'); return; }
+    godwitAdd(picker.dataset.type, picker.dataset.label, JSON.parse(picker.dataset.fieldIds), checked.value);
 });
 
 godwitPoll();

@@ -405,6 +405,72 @@ function godwit_validate_token_json(string $json): ?string
     return null;
 }
 
+/** Provider name for the `rclone authorize "<provider>"` command a user re-runs, per remote type. */
+function godwit_authorize_provider(string $type): string
+{
+    return $type === 'drive' ? 'drive' : 'onedrive';
+}
+
+/**
+ * Friendly message for a token whose access part is dead or about to be —
+ * upstream rclone bug (verified against v1.75.1 and current master
+ * backend/onedrive/onedrive.go): every non-interactive config-wizard state
+ * after the first calls oauthutil.NewClient() with the package-global
+ * oauthConfig, whose TokenURL/AuthURL are only filled in by makeOauthConfig()
+ * for state "" — so a mid-walk refresh attempt posts to "" and fails with
+ * "unsupported protocol scheme \"\"" instead of refreshing. $expiryTs is the
+ * parsed expiry Unix timestamp when known (omits "at HH:MM" otherwise, e.g.
+ * when classifying a backend error where the token had no expiry field).
+ */
+function godwit_expired_token_message(string $type, ?int $expiryTs): string
+{
+    $provider = godwit_authorize_provider($type);
+    $when = $expiryTs !== null ? ' at ' . date('H:i', $expiryTs) . ' (local time)' : '';
+    return "This token's access part expired{$when}. Run `rclone authorize \"$provider\"` again and add it within the hour — rclone can't refresh it during setup (upstream rclone bug).";
+}
+
+/**
+ * Pre-checks a pasted token's `expiry` field (RFC3339, as `rclone authorize`
+ * emits) before Godwit ever calls rcd, so an already-dead token is refused
+ * with a clear message instead of failing opaquely inside the config walk
+ * (see godwit_expired_token_message()'s doc for the upstream bug it's
+ * working around). A missing or unparseable expiry is not blocked — only a
+ * token this can positively prove is dead (or about to be, <5min) is
+ * refused. Returns null if the token is fine, or we can't tell.
+ */
+function godwit_token_expiry_error(string $tokenJson, string $type): ?string
+{
+    $decoded = json_decode($tokenJson, true);
+    $expiry = is_array($decoded) ? ($decoded['expiry'] ?? null) : null;
+    if (!is_string($expiry) || $expiry === '') {
+        return null;
+    }
+    $ts = strtotime($expiry);
+    if ($ts === false || $ts - time() >= 300) {
+        return null;
+    }
+    return godwit_expired_token_message($type, $ts);
+}
+
+/**
+ * Classifies rclone's own "couldn't fetch token: Post \"\": unsupported
+ * protocol scheme \"\"" error — the same upstream bug godwit_token_expiry_error()
+ * pre-checks for — into the friendly expiry message, in case the token
+ * expired mid-walk rather than before it started. Re-reads $tokenJson's
+ * expiry (if any) so the message can still show a time. Any other message
+ * passes through unchanged.
+ */
+function godwit_classify_walk_error(string $message, string $tokenJson, string $type): string
+{
+    if (stripos($message, 'unsupported protocol scheme') === false) {
+        return $message;
+    }
+    $decoded = json_decode($tokenJson, true);
+    $expiry = is_array($decoded) ? ($decoded['expiry'] ?? null) : null;
+    $ts = is_string($expiry) ? strtotime($expiry) : false;
+    return godwit_expired_token_message($type, $ts !== false ? $ts : null);
+}
+
 /**
  * Like godwit_rc_call() but posts arbitrary rc parameters and returns the
  * decoded body even on a non-200 response, since rc error bodies (e.g. an
@@ -522,31 +588,67 @@ function godwit_config_continue_params(string $name, string $state, string $resu
 }
 
 /**
+ * Thrown by godwit_choose_onedrive_drive() when OneDrive's "config_driveid"
+ * Examples list has more than one entry and no drive_id was supplied to pick
+ * from it. Carries the offered choices (id/label pairs) and a suggested id
+ * (the one named exactly "OneDrive", if any) so the caller can roll back the
+ * half-created remote and hand the choice back to the page — see
+ * CHANGELOG 0.2.4. Replaces 0.2.3's "uniquely personal" auto-pick heuristic,
+ * which fails on any account (like Kieren's) with more than one
+ * personal-labelled drive.
+ */
+final class GodwitDriveChoiceNeeded extends \RuntimeException
+{
+    /** @var array<int, array{id: string, label: string}> */
+    public array $choices;
+    public ?string $suggested;
+
+    public function __construct(array $choices, ?string $suggested)
+    {
+        parent::__construct('multiple OneDrive drives found — choose one');
+        $this->choices = $choices;
+        $this->suggested = $suggested;
+    }
+}
+
+/**
  * Picks a drive ID from OneDrive's "config_driveid" Examples. Each example's
  * Value is a real drive ID and its Help is "DriveName (driveType)" (rclone
  * v1.75.1 backend/onedrive/onedrive.go chooseDrive(), fmt.Sprintf("%s (%s)",
- * DriveName, DriveType)) — a personal OneDrive's Help contains "(personal)".
- * One drive: use it. Several with exactly one personal: use that one.
- * Otherwise fail with a clear, ID-free error rather than guessing — the bug
- * this whole rewrite exists to fix was guessing "false" here.
+ * DriveName, DriveType)).
+ * A single drive is used automatically. With more than one, $driveId (from a
+ * page-side picker choice) is used when it matches one of the Examples;
+ * otherwise this throws GodwitDriveChoiceNeeded so the caller can roll back
+ * and offer a picker instead of guessing.
  */
-function godwit_choose_onedrive_drive(?array $opt, ?string &$driveChosen): string
+function godwit_choose_onedrive_drive(?array $opt, ?string &$driveChosen, ?string $driveId = null): string
 {
     $examples = is_array($opt) ? ($opt['Examples'] ?? []) : [];
     if (!is_array($examples) || count($examples) === 0) {
         throw new \RuntimeException('OneDrive returned no drives to choose from');
     }
+    if ($driveId !== null) {
+        foreach ($examples as $ex) {
+            if ((string) ($ex['Value'] ?? '') === $driveId) {
+                $driveChosen = (string) ($ex['Help'] ?? '');
+                return $driveId;
+            }
+        }
+        throw new \RuntimeException('drive_id is not one of the offered drives');
+    }
     if (count($examples) === 1) {
         $driveChosen = (string) ($examples[0]['Help'] ?? '');
         return (string) $examples[0]['Value'];
     }
-    $personal = array_values(array_filter($examples, fn ($ex) => stripos((string) ($ex['Help'] ?? ''), '(personal)') !== false));
-    if (count($personal) === 1) {
-        $driveChosen = (string) ($personal[0]['Help'] ?? '');
-        return (string) $personal[0]['Value'];
+    $choices = array_map(fn ($ex) => ['id' => (string) ($ex['Value'] ?? ''), 'label' => (string) ($ex['Help'] ?? '')], $examples);
+    $suggested = null;
+    foreach ($choices as $c) {
+        if (preg_match('/^OneDrive \(/', $c['label']) === 1) {
+            $suggested = $c['id'];
+            break;
+        }
     }
-    $names = array_map(fn ($ex) => (string) ($ex['Help'] ?? ''), $examples);
-    throw new \RuntimeException('multiple OneDrive drives found and none is uniquely personal — cannot choose automatically: ' . implode(', ', $names));
+    throw new GodwitDriveChoiceNeeded($choices, $suggested);
 }
 
 /**
@@ -587,12 +689,16 @@ function godwit_config_default_answer(?array $opt, ?string $optName): string
  *   answered "true", since anything else loops back to "choose_type".
  * $call is injected so tests can drive this against a fixture sequence
  * instead of a real rcd. Throws on a backend-reported Error (e.g. the token
- * doesn't work) or a question this walker can't answer — callers classify
- * the message with godwit_classify_error() before showing it to the user.
- * $driveChosen is set to the chosen drive's label when OneDrive's drive
- * question was answered, so the caller can report it on success.
+ * doesn't work), a question this walker can't answer, or (OneDrive, multiple
+ * drives, no $driveId) GodwitDriveChoiceNeeded — callers classify a plain
+ * exception's message with godwit_classify_error() before showing it to the
+ * user, and handle GodwitDriveChoiceNeeded separately. $driveChosen is set
+ * to the chosen drive's label when OneDrive's drive question was answered,
+ * so the caller can report it on success. $driveId, OneDrive only, answers
+ * "config_driveid" with that value when the Examples list has more than one
+ * entry — see godwit_choose_onedrive_drive().
  */
-function godwit_walk_config_state(callable $call, string $name, array $response, string $type, ?string &$driveChosen = null): array
+function godwit_walk_config_state(callable $call, string $name, array $response, string $type, ?string &$driveChosen = null, ?string $driveId = null): array
 {
     $driveChosen = null;
     $steps = 0;
@@ -608,7 +714,7 @@ function godwit_walk_config_state(callable $call, string $name, array $response,
         } elseif ($optName === 'config_type' && $type === 'onedrive') {
             $result = 'onedrive';
         } elseif ($optName === 'config_driveid' && $type === 'onedrive') {
-            $result = godwit_choose_onedrive_drive($opt, $driveChosen);
+            $result = godwit_choose_onedrive_drive($opt, $driveChosen, $driveId);
         } elseif ($optName === 'config_drive_ok') {
             $result = 'true';
         } else {
@@ -894,9 +1000,10 @@ function godwit_remote_in_use(string $name, string $cfgDir): bool
  * failure, reason redacted) are logged to $logFile — remotes_list isn't,
  * since the page polls it every 30s and that would just be noise.
  */
-function godwit_handle_remote_action(string $action, array $post, string $dbPath, string $runDir, ?string $logFile = null): array
+function godwit_handle_remote_action(string $action, array $post, string $dbPath, string $runDir, ?string $logFile = null, ?callable $rcCall = null): array
 {
     $logFile = $logFile ?? (getenv('GODWIT_LOG') ?: '/var/log/godwit.log');
+    $rcCall = $rcCall ?? 'godwit_rc_call_params';
     $log = function (string $message) use ($logFile): void {
         godwit_log($logFile, $message);
     };
@@ -993,6 +1100,11 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             $log("remote add $type $name: failed validation: $tokenError");
             return ['error' => $tokenError];
         }
+        $expiryError = godwit_token_expiry_error($tokenJson, $type);
+        if ($expiryError !== null) {
+            $log("remote add $type $name: failed validation: $expiryError");
+            return ['error' => $expiryError];
+        }
 
         if ($type === 'drive') {
             $clientId = (string) ($post['client_id'] ?? '');
@@ -1008,7 +1120,7 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             $params = godwit_onedrive_create_params($name, $tokenJson, $clientId, $clientSecret);
         }
 
-        $initial = godwit_rc_call_params($listener, 'config/create', $params, 60);
+        $initial = $rcCall($listener, 'config/create', $params, 60);
         if ($initial === null) {
             $log("remote add $type $name: failed — rcd did not answer");
             return ['error' => 'rcd did not answer'];
@@ -1018,17 +1130,25 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             $log("remote add $type $name: failed: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
-        $updateCall = function (array $p) use ($listener) {
-            return godwit_rc_call_params($listener, 'config/update', $p, 60);
+        $updateCall = function (array $p) use ($listener, $rcCall) {
+            return $rcCall($listener, 'config/update', $p, 60);
         };
+        $driveId = $type === 'onedrive' && ($post['drive_id'] ?? '') !== '' ? (string) $post['drive_id'] : null;
         $driveChosen = null;
         try {
-            godwit_walk_config_state($updateCall, $name, $initial, $type, $driveChosen);
+            godwit_walk_config_state($updateCall, $name, $initial, $type, $driveChosen, $driveId);
+        } catch (GodwitDriveChoiceNeeded $e) {
+            // Roll back the half-created remote — same as any other walk
+            // failure below — and hand the choice back to the page instead
+            // of guessing.
+            $rcCall($listener, 'config/delete', ['name' => $name]);
+            $log("remote add $type $name: multiple drives found, awaiting choice");
+            return ['choose_drive' => $e->choices, 'suggested' => $e->suggested];
         } catch (\Throwable $e) {
             // Roll back the half-created remote rather than leaving a broken
             // entry the page can't fix except by hand.
-            godwit_rc_call_params($listener, 'config/delete', ['name' => $name]);
-            $message = godwit_redact($e->getMessage());
+            $rcCall($listener, 'config/delete', ['name' => $name]);
+            $message = godwit_redact(godwit_classify_walk_error($e->getMessage(), $tokenJson, $type));
             $log("remote add $type $name: failed: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
@@ -1069,8 +1189,13 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             $log("remote reauth $name: failed — no such remote");
             return ['error' => "no remote named \"$name\""];
         }
-        $updateCall = function (array $p) use ($listener) {
-            return godwit_rc_call_params($listener, 'config/update', $p, 60);
+        $expiryError = godwit_token_expiry_error($tokenJson, $current['type']);
+        if ($expiryError !== null) {
+            $log("remote reauth $name: failed validation: $expiryError");
+            return ['error' => $expiryError];
+        }
+        $updateCall = function (array $p) use ($listener, $rcCall) {
+            return $rcCall($listener, 'config/update', $p, 60);
         };
         $initial = $updateCall(godwit_reauth_params($name, $tokenJson));
         if ($initial === null) {
@@ -1080,7 +1205,7 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
         try {
             godwit_walk_config_state($updateCall, $name, $initial, $current['type']);
         } catch (\Throwable $e) {
-            $message = godwit_redact($e->getMessage());
+            $message = godwit_redact(godwit_classify_walk_error($e->getMessage(), $tokenJson, $current['type']));
             $log("remote reauth $name: failed: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }

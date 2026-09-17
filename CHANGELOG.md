@@ -10,36 +10,78 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
-### Plan — OneDrive drive picker + token-expiry pre-check (2026-09-17)
+## [0.2.4] - 2026-09-17
 
-Kieren's live 0.2.3 run hit two issues on a real OneDrive personal account:
-an expired-token config-walk failure (`couldn't fetch token: Post "":
-unsupported protocol scheme ""` — an upstream rclone bug: `Config()` in
-`backend/onedrive/onedrive.go` uses the package-global `oauthConfig`, whose
-TokenURL/AuthURL are only filled in by `makeOauthConfig()` for state `""`,
-so a refresh attempt after that posts to `""`), and the "cannot choose
-automatically" ambiguity error 0.2.3 added when his account has six
-personal-labelled drives.
+### Fixed
 
-Plan:
-1. Replace the ambiguity error with a stateless drive picker: multiple
-   `config_driveid` Examples → roll back the half-created remote (same
-   `config/delete` pattern already used for other walk failures) and return
-   `{choose_drive: [...], suggested}`. `Godwit.page` renders a radio list
-   pre-selecting `suggested` (the entry named exactly "OneDrive", if any)
-   with a "Use this drive" button that resubmits the same add plus
-   `drive_id`. The walker accepts `drive_id`, matches it against the
-   offered Examples, and drops the old "uniquely personal" heuristic (no
-   longer needed with a picker). A single-drive account still auto-selects.
-2. Pre-check the pasted token's `expiry` field before ever calling rcd for
-   an add or reauth; refuse an already-expired (or <5min-left) token with a
-   friendly, provider-appropriate message instead of letting the walk fail
-   opaquely. Classify rclone's `unsupported protocol scheme ""` text into
-   the same friendly message in case the token expires mid-walk instead.
-3. Files: `plugin/scripts/lib.php` (`godwit_choose_onedrive_drive`,
-   `godwit_walk_config_state`, `godwit_handle_remote_action`, new
-   `godwit_token_expiry_error`/`godwit_classify_walk_error` helpers),
-   `plugin/Godwit.page` (picker UI/JS), `tests/run.php`.
+Kieren's live 0.2.3 run against a real OneDrive personal account hit two
+issues:
+
+1. An expired-token config-walk failure: `Failed to query available
+   drives: /me/drives: Get "https://graph.microsoft.com/v1.0/me/drives":
+   couldn't fetch token: Post "": unsupported protocol scheme ""`.
+   **Root cause is an upstream rclone bug**, verified against rclone
+   v1.75.1 `backend/onedrive/onedrive.go`: `Config()` (starting line 629)
+   calls `makeOauthConfig(ctx, opt)` only for the initial `conf.State ==
+   ""` case (line 639); every subsequent config-wizard state instead calls
+   `oauthutil.NewClient(ctx, name, m, oauthConfig)` (line 648) against the
+   package-global `oauthConfig`, whose `TokenURL`/`AuthURL` are never
+   populated outside `makeOauthConfig()`. If the pasted token's access part
+   has already expired, this call's own attempt to refresh it posts to `""`
+   and fails with exactly the error above, instead of refreshing. A token
+   pasted within its lifetime (about an hour after `rclone authorize`)
+   never needs a refresh and is unaffected.
+2. 0.2.3's "cannot choose automatically" ambiguity error, hit because his
+   account has six personal-labelled OneDrive drives (`AEEE102E-…`,
+   `Bundles_b896e2bb…`, `ODCMetadataArchive`, `OneDrive`, `2974e5ed-…`,
+   `C022FB8E-…`) — the "uniquely personal" heuristic added in 0.2.3 can
+   never disambiguate more than one.
+
+Fix:
+1. **Drive picker.** When OneDrive's `config_driveid` Examples list has
+   more than one entry and no `drive_id` was supplied, the walker now
+   throws `GodwitDriveChoiceNeeded` (carrying the offered `{id, label}`
+   choices and a `suggested` id — the drive named exactly `OneDrive`, if
+   any) instead of guessing. `godwit_handle_remote_action()` catches it,
+   rolls back the half-created remote via the same `config/delete` pattern
+   already used for other walk failures, and returns
+   `{choose_drive: [...], suggested}`. `Godwit.page` renders those as a
+   radio list under the OneDrive form (pre-selecting `suggested`) with a
+   "Use this drive" button that resubmits the same add (keeping the
+   name/token/client fields, same as any other failed add) plus
+   `drive_id`. The walker answers `config_driveid` with that value only if
+   it matches one of the offered Examples, otherwise it fails with a clear
+   error. The 0.2.3 "uniquely personal" heuristic is gone — a picker makes
+   it unnecessary, and it could never have resolved Kieren's account
+   anyway. A single-drive account still auto-selects, unchanged.
+2. **Token expiry pre-check.** Before calling rcd for an add or reauth,
+   `godwit_token_expiry_error()` parses the pasted token's `expiry` field
+   (RFC3339Nano, as `rclone authorize` emits — e.g.
+   `2026-09-17T21:43:12.6543211+10:00`, not just a bare `...Z`) and refuses
+   an already-expired (or <5min-from-expiry) token with a friendly,
+   provider-appropriate message ("Run `rclone authorize \"onedrive\"`
+   again…") before ever reaching `config/create`/`config/update`. A
+   missing or unparseable `expiry` is not blocked. `godwit_classify_walk_error()`
+   classifies rclone's `unsupported protocol scheme` text (case 1 above)
+   into the same friendly message, in case the token expires mid-walk
+   instead of before it starts. Both are logged as `failed validation:`.
+
+`godwit_handle_remote_action()` now takes an optional injected `$rcCall`
+(defaulting to `godwit_rc_call_params`, same DI pattern as
+`godwit_walk_config_state()`'s `$call` and `godwit_check_remote_about()`'s
+`$call`) so the add branch's `config/create`/`config/update`/`config/delete`
+calls can be driven by a fixture in tests without a real rcd or network.
+
+Tests (`tests/run.php`): the two-drives-one-personal fixture now proves the
+picker is offered instead of an auto-pick; a walker-level and a full-stack
+`godwit_handle_remote_action()` test for the picker response and its
+rollback; resubmission with a valid and an unknown `drive_id`; single-drive
+auto-select unchanged; `godwit_token_expiry_error()` for expired,
+soon-to-expire, plenty-of-time, missing, and unparseable `expiry`, including
+one using rclone's real RFC3339Nano-with-offset shape (not just the bare
+`...Z` shape used elsewhere in this file); `godwit_classify_walk_error()`
+for the `unsupported protocol scheme` text and an unrelated message passed
+through unchanged; a page-source regression guard for the picker markup.
 
 ## [0.2.3] - 2026-09-17
 

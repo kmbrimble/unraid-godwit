@@ -906,7 +906,25 @@ t('godwit_walk_config_state: onedrive — real sequence, single drive, succeeds 
     assert_eq('KM OneDrive (personal)', $driveChosen, 'the single drive must be reported chosen');
 });
 
-t('godwit_walk_config_state: onedrive — two drives, one personal, picks the personal one', function () {
+t('godwit_walk_config_state: onedrive — two drives, no auto-pick anymore, requires a choice (0.2.4 drops the heuristic)', function () {
+    $drives = [
+        ['Value' => 'b!sharepointId', 'Help' => 'Team Library (business)'],
+        ['Value' => 'b!personalId', 'Help' => 'KM OneDrive (personal)'],
+    ];
+    $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
+    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $threw = false;
+    try {
+        godwit_walk_config_state($call, 'od', $initial, 'onedrive');
+    } catch (GodwitDriveChoiceNeeded $e) {
+        $threw = true;
+        assert_eq(2, count($e->choices), 'both drives must be offered');
+        assert_true($e->suggested === null, 'neither drive is named exactly "OneDrive", so nothing should be suggested');
+    }
+    assert_true($threw, 'two drives — even with one personal — must now require an explicit choice, not an auto-pick');
+});
+
+t('godwit_walk_config_state: onedrive — with drive_id supplied, answers config_driveid with that value and reports its label', function () {
     $drives = [
         ['Value' => 'b!sharepointId', 'Help' => 'Team Library (business)'],
         ['Value' => 'b!personalId', 'Help' => 'KM OneDrive (personal)'],
@@ -914,45 +932,78 @@ t('godwit_walk_config_state: onedrive — two drives, one personal, picks the pe
     $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
     $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
     $driveChosen = null;
-    $final = godwit_walk_config_state($call, 'od', $initial, 'onedrive', $driveChosen);
-    assert_eq('', $final['State'], 'onedrive walk with two drives (one personal) must reach a terminal state');
-    assert_eq('KM OneDrive (personal)', $driveChosen, 'the personal drive must be picked over the business one');
+    // Deliberately picks the business drive, which the pre-0.2.4 "uniquely
+    // personal" heuristic could never have chosen — this proves drive_id
+    // itself drives the choice, not a coincidental match with the old
+    // auto-pick behaviour.
+    $final = godwit_walk_config_state($call, 'od', $initial, 'onedrive', $driveChosen, 'b!sharepointId');
+    assert_eq('', $final['State'], 'a valid drive_id must let the walk reach a terminal state');
+    assert_eq('Team Library (business)', $driveChosen, 'the chosen (non-personal) drive label must be reported, proving drive_id — not the old heuristic — picked it');
 });
 
-t('godwit_walk_config_state: onedrive — two drives, neither/both ambiguous, fails with a clear no-ID error', function () {
+t('godwit_walk_config_state: onedrive — an unknown drive_id fails with a clear error instead of guessing', function () {
     $drives = [
-        ['Value' => 'b!oneId', 'Help' => 'Site A (documentLibrary)'],
-        ['Value' => 'b!twoId', 'Help' => 'Site B (documentLibrary)'],
+        ['Value' => 'b!sharepointId', 'Help' => 'Team Library (business)'],
+        ['Value' => 'b!personalId', 'Help' => 'KM OneDrive (personal)'],
     ];
     $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
     $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
     $threw = false;
     try {
-        godwit_walk_config_state($call, 'od', $initial, 'onedrive');
+        godwit_walk_config_state($call, 'od', $initial, 'onedrive', $driveChosen, 'not-one-of-the-offered-drives');
     } catch (\RuntimeException $e) {
         $threw = true;
-        assert_true(str_contains($e->getMessage(), 'Site A'), 'ambiguous error must name the drives, not IDs: ' . $e->getMessage());
-        assert_true(!str_contains($e->getMessage(), 'b!oneId'), 'ambiguous error must not leak drive IDs: ' . $e->getMessage());
+        assert_true(!($e instanceof GodwitDriveChoiceNeeded), 'an unknown drive_id is a plain error, not a re-offer of the choice');
+        assert_true(str_contains($e->getMessage(), 'not one of the offered drives'), 'error must be clear: ' . $e->getMessage());
     }
-    assert_true($threw, 'an ambiguous drive choice (no personal drive) must fail rather than guess');
+    assert_true($threw, 'an unrecognised drive_id must fail rather than silently pick something');
 });
 
-t('godwit_walk_config_state: onedrive — two personal-labelled drives is still ambiguous, fails with a clear no-ID error', function () {
-    $drives = [
-        ['Value' => 'b!firstId', 'Help' => 'Work OneDrive (personal)'],
-        ['Value' => 'b!secondId', 'Help' => 'Old OneDrive (personal)'],
-    ];
-    $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
-    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+// --- godwit_choose_onedrive_drive(): picker choices/suggestion, in isolation ---
+
+t('godwit_choose_onedrive_drive: multiple examples with an entry named exactly "OneDrive" suggests it', function () {
+    $opt = ['Examples' => [
+        ['Value' => 'a', 'Help' => 'Bundles_b896e2bb (personal)'],
+        ['Value' => 'b', 'Help' => 'OneDrive (personal)'],
+        ['Value' => 'c', 'Help' => 'ODCMetadataArchive (personal)'],
+    ]];
+    $chosen = null;
     $threw = false;
     try {
-        godwit_walk_config_state($call, 'od', $initial, 'onedrive');
-    } catch (\RuntimeException $e) {
+        godwit_choose_onedrive_drive($opt, $chosen);
+    } catch (GodwitDriveChoiceNeeded $e) {
         $threw = true;
-        assert_true(str_contains($e->getMessage(), 'Work OneDrive'), 'ambiguous error must name the drives, not IDs: ' . $e->getMessage());
-        assert_true(!str_contains($e->getMessage(), 'b!firstId'), 'ambiguous error must not leak drive IDs: ' . $e->getMessage());
+        assert_eq(3, count($e->choices), 'all three drives must be offered');
+        assert_eq('b', $e->suggested, 'the drive named exactly "OneDrive" must be suggested');
     }
-    assert_true($threw, 'two drives both labelled (personal) must still fail rather than silently pick the first');
+    assert_true($threw, 'multiple drives with no drive_id must require a choice');
+});
+
+t('godwit_choose_onedrive_drive: multiple examples with no drive named exactly "OneDrive" suggests nothing', function () {
+    $opt = ['Examples' => [
+        ['Value' => 'a', 'Help' => 'Team Library (business)'],
+        ['Value' => 'b', 'Help' => 'KM OneDrive (personal)'],
+    ]];
+    $chosen = null;
+    $threw = false;
+    try {
+        godwit_choose_onedrive_drive($opt, $chosen);
+    } catch (GodwitDriveChoiceNeeded $e) {
+        $threw = true;
+        assert_true($e->suggested === null, '"KM OneDrive" is not exactly "OneDrive" so nothing should be suggested: ' . json_encode($e->suggested));
+    }
+    assert_true($threw, 'expected a choice to be required');
+});
+
+t('godwit_choose_onedrive_drive: a matching drive_id is used directly, no exception', function () {
+    $opt = ['Examples' => [
+        ['Value' => 'a', 'Help' => 'Team Library (business)'],
+        ['Value' => 'b', 'Help' => 'KM OneDrive (personal)'],
+    ]];
+    $chosen = null;
+    $result = godwit_choose_onedrive_drive($opt, $chosen, 'b');
+    assert_eq('b', $result, 'the supplied drive_id must be returned as-is');
+    assert_eq('KM OneDrive (personal)', $chosen, 'the matching label must be reported');
 });
 
 t('godwit_walk_config_state: unknown question with a Default answers it instead of failing', function () {
@@ -1256,7 +1307,10 @@ t('godwit_handle_remote_action: add drive -> list (no secrets in response) -> de
         godwit_write_rc_credentials($runDir, $listener);
 
         $logFile = $tmp . '/godwit.log';
-        $tokenJson = json_encode(['access_token' => 'fake-access', 'refresh_token' => 'fake-refresh', 'expiry' => '2026-01-01T00:00:00Z']);
+        // Expiry deliberately far in the future: this test proves a real add
+        // succeeds end-to-end, not the new expiry pre-check (see the
+        // godwit_token_expiry_error tests for that).
+        $tokenJson = json_encode(['access_token' => 'fake-access', 'refresh_token' => 'fake-refresh', 'expiry' => '2099-01-01T00:00:00Z']);
         $addResult = godwit_handle_remote_action('remotes_add_drive', [
             'name' => 'gdrive-test',
             'client_id' => 'fake-client-id.apps.googleusercontent.com',
@@ -1301,6 +1355,14 @@ t('Godwit.page: the background remotes-list refresh never touches #godwit-remote
     assert_true($end !== false, 'expected another top-level function after godwitRemotesRefresh()');
     $body = substr($page, $start, $end - $start);
     assert_true(!str_contains($body, 'godwit-remotes-message'), 'godwitRemotesRefresh() must never reference the action-message div: ' . $body);
+});
+
+t('Godwit.page: the OneDrive drive picker markup and wiring are present', function () use ($repoRoot) {
+    $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
+    foreach (['id="onedrive-picker"', 'id="onedrive-picker-choices"', 'id="onedrive-picker-use"',
+        'function godwitShowDrivePicker', 'data.choose_drive', "getElementById('onedrive-picker-use')"] as $needle) {
+        assert_true(str_contains($page, $needle), "expected to find \"$needle\" in Godwit.page");
+    }
 });
 
 t('Godwit.page: the message div sits right under the remotes table, before the Add forms', function () use ($repoRoot) {
@@ -1486,6 +1548,217 @@ t('godwit_handle_remote_action: remotes_test logs the outcome even when rcd is u
     assert_eq('error', $result['result']['status'] ?? null, 'an unreachable rcd must classify as error, not unchecked: ' . json_encode($result));
     $logged = file_get_contents($env['logFile']);
     assert_true(str_contains($logged, 'remote test gdrive: error'), "expected the test outcome logged: $logged");
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+// --- godwit_handle_remote_action(): drive picker, rollback, resubmit ------
+//
+// $rcCall is injected (default godwit_rc_call_params) the same way
+// godwit_walk_config_state()'s $call and godwit_check_remote_about()'s $call
+// are — so the full add flow, including config/create → config/update →
+// config/delete, can be driven by a fixture with no real rcd or network.
+
+function godwit_test_multi_drive_rc_call(array $drives, array &$deleteCalls)
+{
+    return function (array $listener, string $rcPath, array $params, int $timeout = 15, ?array &$meta = null) use ($drives, &$deleteCalls) {
+        $meta = ['timed_out' => false];
+        if ($rcPath === 'config/create') {
+            return ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+        }
+        if ($rcPath === 'config/update') {
+            return godwit_test_onedrive_sequence_call($params, $drives);
+        }
+        if ($rcPath === 'config/delete') {
+            $deleteCalls[] = $params;
+            return ['ok' => true];
+        }
+        return null;
+    };
+}
+
+t('godwit_handle_remote_action: remotes_add_onedrive with multiple drives returns a picker and rolls back the half-created remote', function () {
+    $env = godwit_test_action_env('multi-drive');
+    $drives = [
+        ['Value' => 'a', 'Help' => 'Bundles_b896e2bb (personal)'],
+        ['Value' => 'b', 'Help' => 'OneDrive (personal)'],
+        ['Value' => 'c', 'Help' => 'ODCMetadataArchive (personal)'],
+    ];
+    $deleteCalls = [];
+    $rcCall = godwit_test_multi_drive_rc_call($drives, $deleteCalls);
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-multi',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b']),
+    ], $env['dbPath'], $env['runDir'], $env['logFile'], $rcCall);
+
+    assert_true(isset($result['choose_drive']), 'expected a choose_drive response: ' . json_encode($result));
+    assert_eq(3, count($result['choose_drive']), 'all three drives must be offered');
+    assert_eq('b', $result['suggested'], 'the drive named exactly "OneDrive" must be suggested');
+    assert_eq(1, count($deleteCalls), 'the half-created remote must be rolled back exactly once');
+    assert_eq('onedrive-multi', $deleteCalls[0]['name'], 'rollback must delete the same name that was being added');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_add_onedrive resubmitted with a valid drive_id succeeds and answers with that drive', function () {
+    $env = godwit_test_action_env('drive-id-valid');
+    $drives = [
+        ['Value' => 'a', 'Help' => 'Bundles_b896e2bb (personal)'],
+        ['Value' => 'b', 'Help' => 'OneDrive (personal)'],
+    ];
+    $deleteCalls = [];
+    $rcCall = godwit_test_multi_drive_rc_call($drives, $deleteCalls);
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-picked',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b']),
+        'drive_id' => 'b',
+    ], $env['dbPath'], $env['runDir'], $env['logFile'], $rcCall);
+
+    assert_true(($result['ok'] ?? false) === true, 'a valid drive_id must let the add succeed: ' . json_encode($result));
+    assert_eq('OneDrive (personal)', $result['drive'] ?? null, 'the chosen drive label must be reported');
+    assert_eq(0, count($deleteCalls), 'a successful add must never roll back');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_add_onedrive resubmitted with an unknown drive_id fails and still rolls back', function () {
+    $env = godwit_test_action_env('drive-id-unknown');
+    $drives = [
+        ['Value' => 'a', 'Help' => 'Bundles_b896e2bb (personal)'],
+        ['Value' => 'b', 'Help' => 'OneDrive (personal)'],
+    ];
+    $deleteCalls = [];
+    $rcCall = godwit_test_multi_drive_rc_call($drives, $deleteCalls);
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-badpick',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b']),
+        'drive_id' => 'does-not-exist',
+    ], $env['dbPath'], $env['runDir'], $env['logFile'], $rcCall);
+
+    assert_true(str_contains($result['error'] ?? '', 'not one of the offered drives'), 'expected a clear error: ' . json_encode($result));
+    assert_eq(1, count($deleteCalls), 'the half-created remote must still be rolled back');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_add_onedrive with a single drive still auto-selects, no picker', function () {
+    $env = godwit_test_action_env('single-drive');
+    $drives = [['Value' => 'a', 'Help' => 'KM OneDrive (personal)']];
+    $deleteCalls = [];
+    $rcCall = godwit_test_multi_drive_rc_call($drives, $deleteCalls);
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-single',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b']),
+    ], $env['dbPath'], $env['runDir'], $env['logFile'], $rcCall);
+
+    assert_true(($result['ok'] ?? false) === true, 'a single drive must auto-select: ' . json_encode($result));
+    assert_eq('KM OneDrive (personal)', $result['drive'] ?? null, 'the single drive must be reported chosen');
+    assert_true(!isset($result['choose_drive']), 'a single drive must never trigger the picker');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+// --- godwit_token_expiry_error() / godwit_classify_walk_error(): expiry pre-check ---
+
+t('godwit_token_expiry_error: an already-expired token is refused with a friendly, timestamped message', function () {
+    $tokenJson = json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => gmdate('Y-m-d\TH:i:s\Z', time() - 3600)]);
+    $error = godwit_token_expiry_error($tokenJson, 'onedrive');
+    assert_true($error !== null, 'an expired token must be refused');
+    assert_true(str_contains($error, 'expired'), 'message must say "expired": ' . $error);
+    assert_true(str_contains($error, 'rclone authorize "onedrive"'), 'message must name the onedrive provider: ' . $error);
+    assert_true(str_contains($error, 'upstream rclone bug'), 'message must note the upstream bug: ' . $error);
+    assert_true(!str_contains($error, '\\'), 'the backtick command quoting must not leak a literal backslash into the message: ' . $error);
+});
+
+t('godwit_token_expiry_error: rclone\'s real RFC3339Nano-with-offset expiry shape (e.g. "2026-09-17T21:43:12.6543211+10:00") is parsed correctly', function () {
+    // Ground truth: rclone marshals Go's time.Time as RFC3339Nano with a zone
+    // offset, not the bare gmdate('...\Z') shape used by the other fixtures
+    // in this file — a real pasted token looks like this, not like "...Z".
+    $expiredReal = json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => '2020-01-01T21:43:12.6543211+10:00']);
+    $error = godwit_token_expiry_error($expiredReal, 'onedrive');
+    assert_true($error !== null, 'a real-shaped, long-expired token must still be recognised as expired: ' . json_encode($error));
+
+    $freshReal = gmdate('Y-m-d\TH:i:s.0000000\+00:00', time() + 3600);
+    $freshTokenJson = json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => $freshReal]);
+    assert_true(godwit_token_expiry_error($freshTokenJson, 'onedrive') === null, 'a real-shaped token with an hour left must not be blocked: ' . $freshReal);
+});
+
+t('godwit_token_expiry_error: a token expiring in under 5 minutes is also refused', function () {
+    $tokenJson = json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => gmdate('Y-m-d\TH:i:s\Z', time() + 120)]);
+    $error = godwit_token_expiry_error($tokenJson, 'drive');
+    assert_true($error !== null, 'a token expiring in 2 minutes must be refused');
+    assert_true(str_contains($error, 'rclone authorize "drive"'), 'message must be provider-appropriate for Google Drive: ' . $error);
+});
+
+t('godwit_token_expiry_error: a token with plenty of time left is not blocked', function () {
+    $tokenJson = json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => gmdate('Y-m-d\TH:i:s\Z', time() + 3600)]);
+    assert_true(godwit_token_expiry_error($tokenJson, 'onedrive') === null, 'a token with an hour left must not be blocked');
+});
+
+t('godwit_token_expiry_error: a missing expiry field carries on (not blocked)', function () {
+    $tokenJson = json_encode(['access_token' => 'a', 'refresh_token' => 'b']);
+    assert_true(godwit_token_expiry_error($tokenJson, 'onedrive') === null, 'no expiry field at all must not block');
+});
+
+t('godwit_token_expiry_error: an unparseable expiry carries on (not blocked)', function () {
+    $tokenJson = json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => 'not-a-real-timestamp']);
+    assert_true(godwit_token_expiry_error($tokenJson, 'onedrive') === null, 'an unparseable expiry must not block — we can\'t prove it\'s dead');
+});
+
+t('godwit_classify_walk_error: classifies rclone\'s "unsupported protocol scheme" into the friendly expiry message', function () {
+    $tokenJson = json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => gmdate('Y-m-d\TH:i:s\Z', time() - 10)]);
+    $raw = 'Failed to query available drives: /me/drives: Get "https://graph.microsoft.com/v1.0/me/drives": couldn\'t fetch token: Post "": unsupported protocol scheme ""';
+    $msg = godwit_classify_walk_error($raw, $tokenJson, 'onedrive');
+    assert_true(str_contains($msg, 'expired'), 'classified message must be the friendly expiry text: ' . $msg);
+    assert_true(str_contains($msg, 'rclone authorize "onedrive"'), 'classified message must name onedrive: ' . $msg);
+});
+
+t('godwit_classify_walk_error: leaves an unrelated backend error untouched', function () {
+    $msg = godwit_classify_walk_error('some other rclone backend error', '{"access_token":"a","refresh_token":"b"}', 'onedrive');
+    assert_eq('some other rclone backend error', $msg, 'an unrelated message must pass through unchanged');
+});
+
+t('godwit_handle_remote_action: remotes_add_onedrive with an already-expired token is refused before any config/create or config/update call', function () {
+    // Note: this only proves config/create/config/update are never reached —
+    // the existing-name check ahead of it still does its own real
+    // config/dump call (against a nonexistent socket here, so it just
+    // returns null quickly), same as every other validation path in this
+    // function.
+    $env = godwit_test_action_env('expired-token');
+    $rcCall = function (...$args) {
+        throw new \RuntimeException('config/create or config/update must not be called for an already-expired token');
+    };
+    $expiredIso = gmdate('Y-m-d\TH:i:s\Z', time() - 3600);
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-expired',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => $expiredIso]),
+    ], $env['dbPath'], $env['runDir'], $env['logFile'], $rcCall);
+
+    assert_true(str_contains($result['error'] ?? '', 'expired'), 'expected the friendly expiry error: ' . json_encode($result));
+    $logged = file_get_contents($env['logFile']);
+    assert_true(str_contains($logged, 'failed validation:'), "expiry rejection must log as failed validation: $logged");
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_add_drive with an already-expired token is refused with the drive-provider message', function () {
+    $env = godwit_test_action_env('expired-drive-token');
+    $rcCall = function (...$args) {
+        throw new \RuntimeException('rcd must not be called for an already-expired token');
+    };
+    $expiredIso = gmdate('Y-m-d\TH:i:s\Z', time() - 3600);
+    $result = godwit_handle_remote_action('remotes_add_drive', [
+        'name' => 'gdrive-expired',
+        'client_id' => 'cid',
+        'client_secret' => 'csecret',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b', 'expiry' => $expiredIso]),
+    ], $env['dbPath'], $env['runDir'], $env['logFile'], $rcCall);
+
+    assert_true(str_contains($result['error'] ?? '', 'rclone authorize "drive"'), 'expected the drive-provider message: ' . json_encode($result));
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_add_onedrive with a missing expiry field is not blocked and still reaches rcd', function () {
+    $env = godwit_test_action_env('no-expiry');
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-noexpiry',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b']),
+    ], $env['dbPath'], $env['runDir'], $env['logFile']);
+    assert_eq('rcd did not answer', $result['error'] ?? null, 'a token with no expiry field must pass the pre-check and only fail at the real rc call: ' . json_encode($result));
     exec('rm -rf ' . escapeshellarg($env['tmp']));
 });
 
