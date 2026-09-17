@@ -10,7 +10,9 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
-### Plan: 2026-09-17 — Remotes page swallows every result and error
+## [0.2.2] - 2026-09-17
+
+### Fixed
 
 Kieren reported Test/Add doing "nothing". Root cause: `godwitRemoteAction()`
 always calls `godwitRemotesRefresh()`, whose success handler unconditionally

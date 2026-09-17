@@ -1138,6 +1138,183 @@ t('godwit_handle_remote_action: add drive -> list (no secrets in response) -> de
     }
 });
 
+// --- godwit_extract_token_json(): tolerates the rclone authorize paste wrapper ---
+
+t('godwit_extract_token_json: extracts JSON from the exact rclone authorize paste wrapper', function () {
+    $raw = "Paste the following into your remote machine --->\n" .
+        '{"access_token":"a","refresh_token":"b","expiry":"2026-01-01T00:00:00Z"}' .
+        "\n<---End paste";
+    $json = godwit_extract_token_json($raw);
+    assert_true($json !== null, 'must extract a JSON blob from the wrapped paste');
+    $decoded = json_decode($json, true);
+    assert_eq('a', $decoded['access_token'] ?? null, 'extracted JSON must round-trip access_token');
+});
+
+t('godwit_extract_token_json: tolerates leading/trailing whitespace with no wrapper at all', function () {
+    $raw = "\n\n  {\"access_token\":\"a\",\"refresh_token\":\"b\"}  \n\n";
+    $json = godwit_extract_token_json($raw);
+    assert_true($json !== null, 'must find the object despite surrounding whitespace');
+    assert_eq('a', json_decode($json, true)['access_token'] ?? null, 'must round-trip correctly');
+});
+
+t('godwit_extract_token_json: a brace inside a string value does not break the scan', function () {
+    $raw = '{"access_token":"a}b","refresh_token":"c"}';
+    $json = godwit_extract_token_json($raw);
+    assert_eq($raw, $json, 'the whole object, including the in-string brace, must be extracted intact');
+});
+
+t('godwit_extract_token_json: returns null when there is no JSON object at all', function () {
+    assert_true(godwit_extract_token_json('nothing here, just garbage') === null, 'plain text with no { must return null');
+});
+
+// --- godwit_check_remote_about(): timeout vs generic transport failure ------
+//
+// $call is injected the same way godwit_walk_config_state() injects its rc
+// call, so a curl-level timeout can be simulated without an actual slow
+// network call.
+
+t('godwit_check_remote_about: a curl timeout classifies as error with a "timed out" message, never unchecked', function () {
+    $fakeCall = function ($listener, $path, $params, $timeoutSeconds, &$meta) {
+        $meta = ['timed_out' => true];
+        return null;
+    };
+    $result = godwit_check_remote_about(['type' => 'unix', 'path' => '/x'], 'gdrive', 60, $fakeCall);
+    assert_eq('error', $result['status'], 'a timeout must classify as error, not unchecked');
+    assert_true(str_contains($result['error'], 'timed out after 60s'), 'error message must say how long: ' . $result['error']);
+});
+
+t('godwit_check_remote_about: a non-timeout transport failure is also "error", never "unchecked"', function () {
+    $fakeCall = function ($listener, $path, $params, $timeoutSeconds, &$meta) {
+        $meta = ['timed_out' => false];
+        return null;
+    };
+    $result = godwit_check_remote_about(['type' => 'unix', 'path' => '/x'], 'gdrive', 60, $fakeCall);
+    assert_eq('error', $result['status'], '"unchecked" must only ever mean "never checked" (set by remotes_list), never returned from here');
+    assert_eq('rcd did not answer', $result['error'], 'generic transport failure message');
+});
+
+t('godwit_check_remote_about: still classifies a real backend error and a genuine OK response correctly', function () {
+    $fakeCallError = function ($listener, $path, $params, $timeoutSeconds, &$meta) {
+        $meta = ['timed_out' => false];
+        return ['error' => 'invalid_grant: token expired'];
+    };
+    $r1 = godwit_check_remote_about(['type' => 'unix', 'path' => '/x'], 'gdrive', 60, $fakeCallError);
+    assert_eq('auth-expired', $r1['status'], 'a real backend error must still classify normally');
+
+    $fakeCallOk = function ($listener, $path, $params, $timeoutSeconds, &$meta) {
+        $meta = ['timed_out' => false];
+        return ['total' => 100, 'used' => 50, 'free' => 50];
+    };
+    $r2 = godwit_check_remote_about(['type' => 'unix', 'path' => '/x'], 'gdrive', 60, $fakeCallOk);
+    assert_eq('ok', $r2['status'], 'a genuine successful response must still classify as ok');
+});
+
+// --- godwit_health_notifications(): consecutive-failure notify rule --------
+
+t('godwit_health_notifications: a transient error notifies only on the 2nd consecutive failure, not the 1st or 3rd', function () {
+    $ok = ['status' => 'ok', 'quota_alerted' => 0, 'fail_count' => 0];
+    $d1 = godwit_health_notifications('gdrive', $ok, ['status' => 'error', 'pct' => null, 'error' => 'connection refused']);
+    assert_eq([], $d1['notifications'], 'a single transient failure must not notify');
+    assert_eq(1, $d1['fail_count'], 'fail_count must be 1 after the first consecutive failure');
+
+    $afterFirst = ['status' => 'error', 'quota_alerted' => 0, 'fail_count' => $d1['fail_count']];
+    $d2 = godwit_health_notifications('gdrive', $afterFirst, ['status' => 'error', 'pct' => null, 'error' => 'connection refused']);
+    assert_eq(1, count($d2['notifications']), 'the 2nd consecutive failure must notify');
+    assert_eq(2, $d2['fail_count'], 'fail_count must be 2');
+
+    $afterSecond = ['status' => 'error', 'quota_alerted' => 0, 'fail_count' => $d2['fail_count']];
+    $d3 = godwit_health_notifications('gdrive', $afterSecond, ['status' => 'error', 'pct' => null, 'error' => 'connection refused']);
+    assert_eq([], $d3['notifications'], 'a 3rd consecutive failure must not re-notify');
+    assert_eq(3, $d3['fail_count'], 'fail_count keeps counting past the notify point');
+});
+
+t('godwit_health_notifications: auth-expired notifies immediately, unlike a transient error', function () {
+    $ok = ['status' => 'ok', 'quota_alerted' => 0, 'fail_count' => 0];
+    $d = godwit_health_notifications('gdrive', $ok, ['status' => 'auth-expired', 'pct' => null, 'error' => 'invalid_grant']);
+    assert_eq(1, count($d['notifications']), 'auth-expired must notify on its very first occurrence');
+});
+
+t('godwit_health_notifications: recovery only fires if a failure was actually notified', function () {
+    $afterOneUnnotifiedFailure = ['status' => 'error', 'quota_alerted' => 0, 'fail_count' => 1];
+    $d1 = godwit_health_notifications('gdrive', $afterOneUnnotifiedFailure, ['status' => 'ok', 'pct' => null, 'error' => null]);
+    assert_eq([], $d1['notifications'], 'recovering from a single un-notified blip must not send a "recovered" notification');
+
+    $afterNotifiedFailure = ['status' => 'error', 'quota_alerted' => 0, 'fail_count' => 2];
+    $d2 = godwit_health_notifications('gdrive', $afterNotifiedFailure, ['status' => 'ok', 'pct' => null, 'error' => null]);
+    assert_eq(1, count($d2['notifications']), 'recovering after a notified failure must send a "recovered" notification');
+});
+
+// --- godwit_handle_remote_action(): validation errors are logged -----------
+//
+// These exercise only the validation paths, which return before any rc call
+// to config/create ever happens — no real rcd is needed (config/dump against
+// a nonexistent socket just returns null, and the existing-names check falls
+// back to an empty list), matching how the release checklist's CLI-PHP
+// "empty name" / "garbage token" checks are meant to work.
+
+function godwit_test_action_env(string $prefix): array
+{
+    $tmp = sys_get_temp_dir() . "/godwit-$prefix-" . bin2hex(random_bytes(4));
+    $runDir = $tmp . '/run';
+    mkdir($runDir, 0700, true);
+    $dbPath = $tmp . '/godwit.db';
+    godwit_open_db($dbPath);
+    godwit_write_rc_credentials($runDir, ['type' => 'unix', 'path' => $tmp . '/no-such.sock', 'user' => 'u', 'pass' => 'p']);
+    return ['tmp' => $tmp, 'runDir' => $runDir, 'dbPath' => $dbPath, 'logFile' => $tmp . '/godwit.log'];
+}
+
+t('godwit_handle_remote_action: remotes_add_onedrive with an empty name logs and returns a clear error', function () {
+    $env = godwit_test_action_env('empty-name');
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => '',
+        'token' => json_encode(['access_token' => 'a', 'refresh_token' => 'b']),
+    ], $env['dbPath'], $env['runDir'], $env['logFile']);
+
+    assert_eq('name is required', $result['error'] ?? null, 'empty name must return a clear validation error: ' . json_encode($result));
+    $logged = file_get_contents($env['logFile']);
+    assert_true(str_contains($logged, 'failed validation: name is required'), "expected the validation failure logged: $logged");
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_add_onedrive with a garbage (non-JSON) token logs and returns a clear error', function () {
+    $env = godwit_test_action_env('garbage-token');
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-garbage',
+        'token' => 'this is not json at all',
+    ], $env['dbPath'], $env['runDir'], $env['logFile']);
+
+    assert_true(($result['error'] ?? null) !== null, 'a garbage token must return an error, not succeed');
+    assert_true(str_contains($result['error'], 'JSON object'), 'error must clearly say no JSON object was found: ' . $result['error']);
+    $logged = file_get_contents($env['logFile']);
+    assert_true(str_contains($logged, 'failed validation: no JSON object found'), "expected the validation failure logged: $logged");
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_add_onedrive tolerates the rclone authorize paste wrapper', function () {
+    $env = godwit_test_action_env('wrapper-token');
+    $wrapped = "Paste the following into your remote machine --->\n" .
+        json_encode(['access_token' => 'a', 'refresh_token' => 'b']) .
+        "\n<---End paste";
+    // No real rcd is running, so this still fails — but past validation, at
+    // the config/create rc call ("rcd did not answer"), proving the wrapper
+    // itself was accepted rather than rejected as invalid JSON.
+    $result = godwit_handle_remote_action('remotes_add_onedrive', [
+        'name' => 'onedrive-wrapped',
+        'token' => $wrapped,
+    ], $env['dbPath'], $env['runDir'], $env['logFile']);
+    assert_eq('rcd did not answer', $result['error'] ?? null, 'the wrapped paste must pass validation and only fail at the rc call: ' . json_encode($result));
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_remote_action: remotes_test logs the outcome even when rcd is unreachable', function () {
+    $env = godwit_test_action_env('test-log');
+    $result = godwit_handle_remote_action('remotes_test', ['name' => 'gdrive'], $env['dbPath'], $env['runDir'], $env['logFile']);
+    assert_eq('error', $result['result']['status'] ?? null, 'an unreachable rcd must classify as error, not unchecked: ' . json_encode($result));
+    $logged = file_get_contents($env['logFile']);
+    assert_true(str_contains($logged, 'remote test gdrive: error'), "expected the test outcome logged: $logged");
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
 // --- report ---------------------------------------------------------------
 
 printf("\n%d passed, %d failed\n", $passed, $failed);

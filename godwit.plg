@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.2.1">
+<!ENTITY version   "0.2.2">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,24 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.2.2
+- Fixed the Remotes page swallowing every Test/Add/Reauth/Delete result:
+  the background remotes-list refresh was wiping the message div meant for
+  the user's own action milliseconds after it appeared. Messages now
+  persist until the next action, buttons show a pending label and disable
+  while running, and every request has a failure handler.
+- Add now tolerates pasting rclone authorize's whole output (including its
+  "Paste the following..."/"End paste" wrapper lines), not just the bare
+  JSON. Name fields are pre-filled with real default values instead of
+  placeholders that silently submitted as blank.
+- A health check that times out is now recorded as an error ("timed out
+  after Ns"), not "unchecked" — unchecked is reserved for "never checked".
+  operations/about and the OneDrive/Drive config walk get a 60s timeout.
+  A transient error now only notifies after 2 consecutive failed checks;
+  auth-expired still notifies immediately.
+- On-demand checks and add/reauth/delete actions are now logged to
+  /var/log/godwit.log, success or failure, so a "nothing happens" report
+  leaves a trace.
 ###0.2.1
 - Found live on the host during 0.2.0's own verification (not caught by
   code review, which doesn't run `ps aux`): rcd's generated `--rc-user`/

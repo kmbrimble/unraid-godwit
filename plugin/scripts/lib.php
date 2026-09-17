@@ -334,6 +334,49 @@ function godwit_validate_remote_name(string $name, array $existingNames = []): ?
     return null;
 }
 
+/**
+ * Extracts the first top-level `{...}` JSON object from a pasted blob,
+ * tolerating `rclone authorize`'s own surrounding lines ("Paste the following
+ * into your remote machine --->" / "<---End paste") and extra whitespace.
+ * Returns null if no balanced `{...}` is found — braces inside a JSON string
+ * value are skipped correctly, so a token value containing "{" doesn't
+ * confuse the scan. Never logs $raw.
+ */
+function godwit_extract_token_json(string $raw): ?string
+{
+    $start = strpos($raw, '{');
+    if ($start === false) {
+        return null;
+    }
+    $depth = 0;
+    $inString = false;
+    $escaped = false;
+    for ($i = $start; $i < strlen($raw); $i++) {
+        $c = $raw[$i];
+        if ($inString) {
+            if ($escaped) {
+                $escaped = false;
+            } elseif ($c === '\\') {
+                $escaped = true;
+            } elseif ($c === '"') {
+                $inString = false;
+            }
+            continue;
+        }
+        if ($c === '"') {
+            $inString = true;
+        } elseif ($c === '{') {
+            $depth++;
+        } elseif ($c === '}') {
+            $depth--;
+            if ($depth === 0) {
+                return substr($raw, $start, $i - $start + 1);
+            }
+        }
+    }
+    return null;
+}
+
 /** Validates a pasted `rclone authorize` token blob without ever logging it. */
 function godwit_validate_token_json(string $json): ?string
 {
@@ -350,9 +393,19 @@ function godwit_validate_token_json(string $json): ?string
     return null;
 }
 
-/** Like godwit_rc_call() but posts arbitrary rc parameters and returns the decoded body even on a non-200 response, since rc error bodies (e.g. an expired-token failure from operations/about) carry the "error" field callers need to classify — a plain null there would be indistinguishable from rcd not answering at all. Returns null only on a transport failure or a non-JSON body. */
-function godwit_rc_call_params(array $listener, string $rcPath, array $params): ?array
+/**
+ * Like godwit_rc_call() but posts arbitrary rc parameters and returns the
+ * decoded body even on a non-200 response, since rc error bodies (e.g. an
+ * expired-token failure from operations/about) carry the "error" field
+ * callers need to classify — a plain null there would be indistinguishable
+ * from rcd not answering at all. Returns null only on a transport failure or
+ * a non-JSON body. $meta, if passed, is populated with ['timed_out' => bool]
+ * so a caller can tell a curl timeout apart from any other transport failure
+ * (e.g. rcd not running) — both otherwise collapse to the same null.
+ */
+function godwit_rc_call_params(array $listener, string $rcPath, array $params, int $timeoutSeconds = 15, ?array &$meta = null): ?array
 {
+    $meta = ['timed_out' => false];
     if (!function_exists('curl_init')) {
         return null;
     }
@@ -360,7 +413,7 @@ function godwit_rc_call_params(array $listener, string $rcPath, array $params): 
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($params));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+    curl_setopt($ch, CURLOPT_TIMEOUT, $timeoutSeconds);
 
     if ($listener['type'] === 'unix') {
         curl_setopt($ch, CURLOPT_UNIX_SOCKET_PATH, $listener['path']);
@@ -373,6 +426,9 @@ function godwit_rc_call_params(array $listener, string $rcPath, array $params): 
     }
 
     $body = curl_exec($ch);
+    if ($body === false && curl_errno($ch) === CURLE_OPERATION_TIMEDOUT) {
+        $meta = ['timed_out' => true];
+    }
     curl_close($ch);
     if ($body === false) {
         return null;
@@ -539,12 +595,25 @@ function godwit_parse_about(array $about): array
     return ['total' => $total, 'used' => $used, 'free' => $free, 'pct' => $pct];
 }
 
-/** One read-only health check for $remoteName: OK, or a classified failure. Never mutates anything, safe to call on demand from the page as well as from godwitd's hourly tick. */
-function godwit_check_remote_about(array $listener, string $remoteName): array
+/**
+ * One read-only health check for $remoteName: OK, or a classified failure.
+ * Never mutates anything, safe to call on demand from the page as well as
+ * from godwitd's hourly tick. A failed check is always "error" (with a
+ * distinct "timed out after Ns" message when that's what happened) —
+ * "unchecked" means "never checked" and is only ever set by remotes_list for
+ * a remote with no health row yet, never returned from here.
+ * $call is injected (default: godwit_rc_call_params) so tests can simulate a
+ * timeout without a real slow network call, same pattern as
+ * godwit_walk_config_state()'s $call parameter.
+ */
+function godwit_check_remote_about(array $listener, string $remoteName, int $timeoutSeconds = 60, ?callable $call = null): array
 {
-    $resp = godwit_rc_call_params($listener, 'operations/about', ['fs' => $remoteName . ':']);
+    $call = $call ?? 'godwit_rc_call_params';
+    $meta = null;
+    $resp = $call($listener, 'operations/about', ['fs' => $remoteName . ':'], $timeoutSeconds, $meta);
     if ($resp === null) {
-        return ['status' => 'unchecked', 'total' => null, 'used' => null, 'free' => null, 'pct' => null, 'error' => 'rcd did not answer'];
+        $error = ($meta['timed_out'] ?? false) ? "timed out after {$timeoutSeconds}s" : 'rcd did not answer';
+        return ['status' => 'error', 'total' => null, 'used' => null, 'free' => null, 'pct' => null, 'error' => $error];
     }
     if (isset($resp['error'])) {
         // Redacted defensively: an rclone backend error can in principle echo
@@ -559,32 +628,48 @@ function godwit_check_remote_about(array $listener, string $remoteName): array
 /**
  * Decides which Unraid notifications to send for a remote's new health
  * result, given its previously stored row (null if never checked before).
- * Notifies once per OK <-> auth-expired/error transition, never on every
- * tick, and once when pct crosses 90%, resetting that flag once pct drops
- * back below 90 so a genuine later crossing notifies again. A first-ever
- * check (no previous row) never itself fires a status-transition
- * notification — there is nothing to transition from.
+ * "error" is treated as possibly transient (nginx's fastcgi_read_timeout is
+ * 640s but a single rcd hiccup shouldn't page anyone): it notifies only on
+ * the 2nd *consecutive* error, tracked via the returned 'fail_count', and
+ * recovery only notifies if a failure was actually reported (fail_count
+ * reached 2, or the status was auth-expired). "auth-expired" is treated as
+ * decisive and notifies on the very first occurrence. Never notifies on
+ * every tick while a status holds steady, and once when pct crosses 90%,
+ * resetting that flag once pct drops back below 90 so a genuine later
+ * crossing notifies again. A first-ever check (no previous row) never itself
+ * fires a status-transition notification — there is nothing to transition
+ * from.
  */
 function godwit_health_notifications(string $remoteName, ?array $prevRow, array $newResult): array
 {
     $notifications = [];
     $prevStatus = $prevRow['status'] ?? null;
     $newStatus = $newResult['status'];
+    $prevFailCount = (int) ($prevRow['fail_count'] ?? 0);
+    $failCount = ($newStatus === 'error') ? ($prevStatus === 'error' ? $prevFailCount + 1 : 1) : 0;
+    $prevFailureWasNotified = $prevStatus === 'auth-expired' || ($prevStatus === 'error' && $prevFailCount >= 2);
 
     if ($prevStatus !== null && $prevStatus !== $newStatus) {
-        if ($newStatus !== 'ok' && $prevStatus === 'ok') {
+        if ($newStatus === 'auth-expired' && $prevStatus !== 'auth-expired') {
             $notifications[] = [
                 'subject' => "Godwit: $remoteName is $newStatus",
                 'description' => $newResult['error'] ?? "$remoteName health check reports $newStatus",
                 'importance' => 'alert',
             ];
-        } elseif ($newStatus === 'ok' && $prevStatus !== 'ok') {
+        } elseif ($newStatus === 'ok' && $prevFailureWasNotified) {
             $notifications[] = [
                 'subject' => "Godwit: $remoteName recovered",
                 'description' => "$remoteName is OK again",
                 'importance' => 'normal',
             ];
         }
+    }
+    if ($newStatus === 'error' && $failCount === 2) {
+        $notifications[] = [
+            'subject' => "Godwit: $remoteName is $newStatus",
+            'description' => $newResult['error'] ?? "$remoteName health check reports $newStatus",
+            'importance' => 'alert',
+        ];
     }
 
     $prevQuotaAlerted = (bool) ($prevRow['quota_alerted'] ?? false);
@@ -601,7 +686,7 @@ function godwit_health_notifications(string $remoteName, ?array $prevRow, array 
         $quotaAlerted = false;
     }
 
-    return ['notifications' => $notifications, 'quota_alerted' => $quotaAlerted];
+    return ['notifications' => $notifications, 'quota_alerted' => $quotaAlerted, 'fail_count' => $failCount];
 }
 
 /** Invokes Unraid's own notify script (confirmed on the live host at this path, used the same way by appdata.backup's ABHelper.php: -e event/source, -s subject, -d description, -i importance). Overridable via GODWIT_NOTIFY so tests stub it and assert args instead of touching the real webGui. Callers must only ever pass status/quota prose here, never remote credentials. */
@@ -630,8 +715,14 @@ function godwit_open_remotes_health_table(SQLite3 $db): void
         free INTEGER,
         pct REAL,
         error TEXT,
-        quota_alerted INTEGER NOT NULL DEFAULT 0
+        quota_alerted INTEGER NOT NULL DEFAULT 0,
+        fail_count INTEGER NOT NULL DEFAULT 0
     )');
+    // Migrates a table created by 0.2.1 or earlier, before fail_count
+    // existed. exec() returns false (not an exception, exceptions mode is
+    // never enabled here) once the column already exists — safe to run on
+    // every open.
+    @$db->exec('ALTER TABLE remotes_health ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0');
 }
 
 function godwit_remote_health_row(SQLite3 $db, string $name): ?array
@@ -642,13 +733,13 @@ function godwit_remote_health_row(SQLite3 $db, string $name): ?array
     return $row === false ? null : $row;
 }
 
-function godwit_store_remote_health(SQLite3 $db, string $name, int $ts, array $result, bool $quotaAlerted): void
+function godwit_store_remote_health(SQLite3 $db, string $name, int $ts, array $result, bool $quotaAlerted, int $failCount): void
 {
-    $stmt = $db->prepare('INSERT INTO remotes_health (name, status, checked_ts, total, used, free, pct, error, quota_alerted)
-        VALUES (:name, :status, :ts, :total, :used, :free, :pct, :error, :quota_alerted)
+    $stmt = $db->prepare('INSERT INTO remotes_health (name, status, checked_ts, total, used, free, pct, error, quota_alerted, fail_count)
+        VALUES (:name, :status, :ts, :total, :used, :free, :pct, :error, :quota_alerted, :fail_count)
         ON CONFLICT(name) DO UPDATE SET status=excluded.status, checked_ts=excluded.checked_ts,
             total=excluded.total, used=excluded.used, free=excluded.free, pct=excluded.pct,
-            error=excluded.error, quota_alerted=excluded.quota_alerted');
+            error=excluded.error, quota_alerted=excluded.quota_alerted, fail_count=excluded.fail_count');
     $stmt->bindValue(':name', $name, SQLITE3_TEXT);
     $stmt->bindValue(':status', $result['status'], SQLITE3_TEXT);
     $stmt->bindValue(':ts', $ts, SQLITE3_INTEGER);
@@ -658,6 +749,7 @@ function godwit_store_remote_health(SQLite3 $db, string $name, int $ts, array $r
     $stmt->bindValue(':pct', $result['pct'], SQLITE3_FLOAT);
     $stmt->bindValue(':error', $result['error'], SQLITE3_TEXT);
     $stmt->bindValue(':quota_alerted', $quotaAlerted ? 1 : 0, SQLITE3_INTEGER);
+    $stmt->bindValue(':fail_count', $failCount, SQLITE3_INTEGER);
     $stmt->execute();
 }
 
@@ -671,8 +763,9 @@ function godwit_run_health_check(SQLite3 $db, array $listener, string $remoteNam
     foreach ($decision['notifications'] as $n) {
         godwit_notify($n['subject'], $n['description'], $n['importance']);
     }
-    godwit_store_remote_health($db, $remoteName, time(), $result, $decision['quota_alerted']);
-    return $result;
+    $ts = time();
+    godwit_store_remote_health($db, $remoteName, $ts, $result, $decision['quota_alerted'], $decision['fail_count']);
+    return $result + ['checked_ts' => $ts];
 }
 
 /** Params for a `config/update` call that replaces an existing remote's token only (re-authorise). Other fields (client_id, scope, drive_type, ...) are left exactly as they are — config/update only touches keys it's given. */
@@ -711,10 +804,17 @@ function godwit_remote_in_use(string $name, string $cfgDir): bool
  * generates or stores rcd credentials of its own, only reads the current
  * ones back (godwit_read_rc_credentials()). Returns an array ready for
  * json_encode() straight back to the browser; no branch ever returns a
- * secret value.
+ * secret value. On-demand test/add/reauth/delete outcomes (success or
+ * failure, reason redacted) are logged to $logFile — remotes_list isn't,
+ * since the page polls it every 30s and that would just be noise.
  */
-function godwit_handle_remote_action(string $action, array $post, string $dbPath, string $runDir): array
+function godwit_handle_remote_action(string $action, array $post, string $dbPath, string $runDir, ?string $logFile = null): array
 {
+    $logFile = $logFile ?? (getenv('GODWIT_LOG') ?: '/var/log/godwit.log');
+    $log = function (string $message) use ($logFile): void {
+        godwit_log($logFile, $message);
+    };
+
     if (!is_file($dbPath)) {
         return ['error' => 'heartbeat database not found yet — is godwitd running?'];
     }
@@ -753,7 +853,9 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
         if ($name === '') {
             return ['error' => 'name is required'];
         }
-        return ['result' => godwit_run_health_check($db, $listener, $name)];
+        $result = godwit_run_health_check($db, $listener, $name);
+        $log("remote test $name: {$result['status']}" . ($result['error'] !== null ? " ({$result['error']})" : ''));
+        return ['result' => $result];
     }
 
     if ($action === 'remotes_delete') {
@@ -766,55 +868,68 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
         }
         $cfgDir = getenv('GODWIT_CFGDIR') ?: '/boot/config/plugins/godwit';
         if (godwit_remote_in_use($name, $cfgDir)) {
+            $log("remote delete $name: failed — referenced by a job");
             return ['error' => "\"$name\" is referenced by a job and cannot be deleted"];
         }
         $resp = godwit_rc_call_params($listener, 'config/delete', ['name' => $name]);
         if ($resp === null) {
+            $log("remote delete $name: failed — rcd did not answer");
             return ['error' => 'rcd did not answer'];
         }
+        $log("remote delete $name: ok");
         return ['ok' => true];
     }
 
     if ($action === 'remotes_add_drive' || $action === 'remotes_add_onedrive') {
+        $type = $action === 'remotes_add_drive' ? 'drive' : 'onedrive';
         $name = (string) ($post['name'] ?? '');
-        $tokenJson = (string) ($post['token'] ?? '');
+        $rawToken = (string) ($post['token'] ?? '');
+        $extracted = godwit_extract_token_json($rawToken);
+        if ($extracted === null) {
+            $log("remote add $type: failed validation: no JSON object found in the pasted token");
+            return ['error' => 'no JSON object found in the pasted text — paste the whole blob rclone authorize printed'];
+        }
+        $tokenJson = $extracted;
         $existing = godwit_list_remotes($listener) ?? [];
         $existingNames = array_map(fn ($r) => $r['name'], $existing);
 
         $nameError = godwit_validate_remote_name($name, $existingNames);
         if ($nameError !== null) {
+            $log("remote add $type" . ($name !== '' ? " $name" : '') . ": failed validation: $nameError");
             return ['error' => $nameError];
         }
         $tokenError = godwit_validate_token_json($tokenJson);
         if ($tokenError !== null) {
+            $log("remote add $type $name: failed validation: $tokenError");
             return ['error' => $tokenError];
         }
 
-        if ($action === 'remotes_add_drive') {
+        if ($type === 'drive') {
             $clientId = (string) ($post['client_id'] ?? '');
             $clientSecret = (string) ($post['client_secret'] ?? '');
             if ($clientId === '' || $clientSecret === '') {
+                $log("remote add $type $name: failed validation: client_id and client_secret are required");
                 return ['error' => 'client_id and client_secret are required for Google Drive'];
             }
             $params = godwit_drive_create_params($name, $clientId, $clientSecret, $tokenJson);
-            $type = 'drive';
         } else {
             $clientId = ((string) ($post['client_id'] ?? '')) ?: null;
             $clientSecret = ((string) ($post['client_secret'] ?? '')) ?: null;
             $params = godwit_onedrive_create_params($name, $tokenJson, $clientId, $clientSecret);
-            $type = 'onedrive';
         }
 
-        $initial = godwit_rc_call_params($listener, 'config/create', $params);
+        $initial = godwit_rc_call_params($listener, 'config/create', $params, 60);
         if ($initial === null) {
+            $log("remote add $type $name: failed — rcd did not answer");
             return ['error' => 'rcd did not answer'];
         }
         if (!empty($initial['Error'])) {
             $message = godwit_redact((string) $initial['Error']);
+            $log("remote add $type $name: failed validation: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
         $updateCall = function (array $p) use ($listener) {
-            return godwit_rc_call_params($listener, 'config/update', $p);
+            return godwit_rc_call_params($listener, 'config/update', $p, 60);
         };
         try {
             godwit_walk_config_state($updateCall, $name, $initial, $type);
@@ -823,16 +938,29 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             // entry the page can't fix except by hand.
             godwit_rc_call_params($listener, 'config/delete', ['name' => $name]);
             $message = godwit_redact($e->getMessage());
+            $log("remote add $type $name: failed validation: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
-        return ['ok' => true, 'name' => $name];
+        $log("remote add $type $name: ok");
+        // Wakes godwitd's loop (polls this marker every second) so the new
+        // remote gets its first health check within a second or two instead
+        // of waiting up to an hour — see godwitd's docblock for the marker.
+        @touch($runDir . '/check-now');
+        return ['ok' => true, 'name' => $name, 'type' => $type];
     }
 
     if ($action === 'remotes_reauth') {
         $name = (string) ($post['name'] ?? '');
-        $tokenJson = (string) ($post['token'] ?? '');
+        $rawToken = (string) ($post['token'] ?? '');
+        $extracted = godwit_extract_token_json($rawToken);
+        if ($extracted === null) {
+            $log("remote reauth $name: failed validation: no JSON object found in the pasted token");
+            return ['error' => 'no JSON object found in the pasted text — paste the whole blob rclone authorize printed'];
+        }
+        $tokenJson = $extracted;
         $tokenError = godwit_validate_token_json($tokenJson);
         if ($tokenError !== null) {
+            $log("remote reauth $name: failed validation: $tokenError");
             return ['error' => $tokenError];
         }
         $existing = godwit_list_remotes($listener) ?? [];
@@ -843,21 +971,26 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             }
         }
         if ($current === null) {
+            $log("remote reauth $name: failed — no such remote");
             return ['error' => "no remote named \"$name\""];
         }
         $updateCall = function (array $p) use ($listener) {
-            return godwit_rc_call_params($listener, 'config/update', $p);
+            return godwit_rc_call_params($listener, 'config/update', $p, 60);
         };
         $initial = $updateCall(godwit_reauth_params($name, $tokenJson));
         if ($initial === null) {
+            $log("remote reauth $name: failed — rcd did not answer");
             return ['error' => 'rcd did not answer'];
         }
         try {
             godwit_walk_config_state($updateCall, $name, $initial, $current['type']);
         } catch (\Throwable $e) {
             $message = godwit_redact($e->getMessage());
+            $log("remote reauth $name: failed validation: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
+        $log("remote reauth $name: ok");
+        @touch($runDir . '/check-now');
         return ['ok' => true];
     }
 
