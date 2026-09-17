@@ -2771,7 +2771,7 @@ t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --
     }
 });
 
-t('rc sync/copy: rclone\'s OWN graceful MaxTransfer cutoff (not godwitd\'s job/stop) also costs more than 1 error at Transfers>1 — this is the exact assumption a pre-merge self-review caught wrong (an earlier version of this fix assumed rclone\'s own cutoff was always exactly 1, measured only at Transfers=1)', function () use ($repoRoot) {
+t('rc sync/copy: rclone\'s OWN graceful MaxTransfer cutoff (not godwitd\'s job/stop) costs up to Transfers errors, not a fixed 1 (a separate 20-run bash repro at Transfers=8 measured 1-4; this single run just proves the count stays in [1, Transfers] and that the notification baseline must be Transfers, not a fixed 1) — an earlier version of this fix assumed rclone\'s own cutoff was always exactly 1, measured only at Transfers=1', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
         return;
