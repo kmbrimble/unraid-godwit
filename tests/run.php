@@ -716,6 +716,22 @@ t('godwit_redact: strips ini-style secret lines from a config dump', function ()
     assert_true(str_contains($redacted, 'scope = drive'), 'non-secret lines must survive redaction');
 });
 
+// Regression test (code-diff-reviewer, 1/3 agreement): godwit_redact() used
+// to be dead code — defined and unit-tested, but never called from any
+// production path, contradicting the CHANGELOG's "applied to every log line
+// this feature writes" claim. Now lives in godwit_log() itself so every
+// call site gets it for free.
+t('godwit_log: redacts secret-shaped content before it ever reaches the log file', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-log-redact-' . bin2hex(random_bytes(4)) . '.log';
+    godwit_log($tmp, 'health check failed: client_secret=GOCSPX-realvalue token={"access_token":"ya29.real"}');
+    $logged = file_get_contents($tmp);
+    foreach (['GOCSPX-realvalue', 'ya29.real'] as $secret) {
+        assert_true(!str_contains($logged, $secret), "godwit_log() must never write $secret to disk: $logged");
+    }
+    assert_true(str_contains($logged, 'health check failed'), 'non-secret text must still be logged');
+    unlink($tmp);
+});
+
 // --- godwit_validate_remote_name() -----------------------------------------
 
 t('godwit_validate_remote_name: accepts a normal name', function () {
@@ -857,6 +873,32 @@ t('godwit_walk_config_state: onedrive — a bad/expired token fails at the drive
         assert_eq('auth-expired', godwit_classify_error($e->getMessage()), 'this exact fixture message must classify as auth-expired');
     }
     assert_true($threw, 'a token that Graph rejects must surface as an exception, never a silently-half-created remote');
+});
+
+// Regression test (code-diff-reviewer, 2/3 agreement): the step cap used to
+// be exhausted silently — if the state machine never reached "" or an Error
+// within 10 continue calls, godwit_walk_config_state() returned normally
+// with State still non-empty, and both callers (remotes_add_*,
+// remotes_reauth) only check for a thrown exception before reporting
+// {"ok": true}, so a remote could be reported as successfully added while
+// still stuck mid-configuration in rcd.
+t('godwit_walk_config_state: exhausting the step cap without an Error must still throw, never silently succeed', function () {
+    $step = 0;
+    $call = function (array $params) use (&$step) {
+        $step++;
+        // Always comes back with a fresh non-empty State and no Error —
+        // simulates a real prompt this walker doesn't know how to answer
+        // (e.g. OneDrive's manual "driveid" entry with no Error attached).
+        return ['State' => 'some_unhandled_state_' . $step, 'Option' => ['Name' => 'x'], 'Error' => '', 'Result' => ''];
+    };
+    $initial = ['State' => 'some_unhandled_state_0', 'Option' => ['Name' => 'x'], 'Error' => '', 'Result' => ''];
+    $threw = false;
+    try {
+        godwit_walk_config_state($call, 't', $initial, 'drive');
+    } catch (\RuntimeException $e) {
+        $threw = true;
+    }
+    assert_true($threw, 'exhausting the step cap while still non-terminal must throw, not return {"ok": true}-shaped success');
 });
 
 // --- godwit_list_remotes(): never returns secret values --------------------

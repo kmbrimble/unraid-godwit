@@ -24,12 +24,6 @@ $cfgDir = getenv('GODWIT_CFGDIR') ?: '/boot/config/plugins/godwit';
 $rcloneBin = getenv('GODWIT_RCLONE') ?: dirname(__DIR__) . '/bin/rclone';
 $cacheMountDir = getenv('GODWIT_CACHE_MOUNT_DIR') ?: '/mnt/cache';
 
-function godwit_log(string $logFile, string $message): void
-{
-    $line = sprintf('[%s] %s%s', date('Y-m-d H:i:s'), $message, PHP_EOL);
-    file_put_contents($logFile, $line, FILE_APPEND);
-}
-
 /**
  * Tries a unix socket listener first; if rcd exits or the socket never
  * appears within ~2s, falls back to 127.0.0.1 on a free port with generated

@@ -7,6 +7,18 @@
 declare(strict_types=1);
 
 /**
+ * Appends a timestamped line to godwitd's log file, redacted unconditionally
+ * — not just at call sites that happen to carry secret-shaped data today. A
+ * future call site that logs an rc response verbatim (e.g. a health-check
+ * error message) must not have to remember to redact first.
+ */
+function godwit_log(string $logFile, string $message): void
+{
+    $line = sprintf('[%s] %s%s', date('Y-m-d H:i:s'), godwit_redact($message), PHP_EOL);
+    file_put_contents($logFile, $line, FILE_APPEND);
+}
+
+/**
  * Whether $dir is a real mountpoint (a separate filesystem from its
  * parent), via the `mountpoint` CLI. Used to refuse creating godwit's
  * state dir under /mnt/cache before the cache pool is actually mounted —
@@ -274,7 +286,12 @@ function godwit_redact(string $text): string
     foreach (['refresh_token', 'access_token', 'client_secret', 'client_id', 'token'] as $key) {
         $q = preg_quote($key, '/');
         $text = preg_replace('/"' . $q . '"\s*:\s*"(?:\\\\.|[^"\\\\])*"/i', '"' . $key . '":"<redacted>"', $text);
+        // ini shape: the key starts a line, value runs to end of line (a
+        // token value is itself a JSON blob that can contain spaces).
         $text = preg_replace('/(^|[\r\n])(\s*' . $q . '\s*=\s*).*/i', '$1$2<redacted>', $text);
+        // inline shape: key=value embedded mid-string (e.g. a log message
+        // built from rc params), value runs to the next whitespace/quote.
+        $text = preg_replace('/\b' . $q . '=[^\s"\']*/i', $key . '=<redacted>', $text);
     }
     return $text;
 }
@@ -445,6 +462,16 @@ function godwit_walk_config_state(callable $call, string $name, array $response,
     if (!empty($response['Error'])) {
         throw new \RuntimeException((string) $response['Error']);
     }
+    if (!empty($response['State'])) {
+        // The step cap was hit with the state machine still non-terminal
+        // (no Error, but not State "" either) — e.g. a real OneDrive
+        // "driveid" manual-entry prompt with no attached Error text. Both
+        // callers (remotes_add_*, remotes_reauth) only check for a thrown
+        // exception before reporting success, so silently returning here
+        // would report {"ok": true} for a remote rcd never finished
+        // configuring. Treat it the same as an Error.
+        throw new \RuntimeException('config did not reach a terminal state after ' . $steps . ' steps (stuck at "' . $response['State'] . '")');
+    }
     return $response;
 }
 
@@ -501,7 +528,10 @@ function godwit_check_remote_about(array $listener, string $remoteName): array
         return ['status' => 'unchecked', 'total' => null, 'used' => null, 'free' => null, 'pct' => null, 'error' => 'rcd did not answer'];
     }
     if (isset($resp['error'])) {
-        $message = (string) $resp['error'];
+        // Redacted defensively: an rclone backend error can in principle echo
+        // back part of what it was given (e.g. an invalid client_id), and this
+        // message is stored, shown on the page and passed to godwit_notify().
+        $message = godwit_redact((string) $resp['error']);
         return ['status' => godwit_classify_error($message), 'total' => null, 'used' => null, 'free' => null, 'pct' => null, 'error' => $message];
     }
     return array_merge(['status' => 'ok', 'error' => null], godwit_parse_about($resp));
@@ -761,7 +791,8 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             return ['error' => 'rcd did not answer'];
         }
         if (!empty($initial['Error'])) {
-            return ['error' => $initial['Error'], 'classification' => godwit_classify_error((string) $initial['Error'])];
+            $message = godwit_redact((string) $initial['Error']);
+            return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
         $updateCall = function (array $p) use ($listener) {
             return godwit_rc_call_params($listener, 'config/update', $p);
@@ -772,7 +803,8 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             // Roll back the half-created remote rather than leaving a broken
             // entry the page can't fix except by hand.
             godwit_rc_call_params($listener, 'config/delete', ['name' => $name]);
-            return ['error' => $e->getMessage(), 'classification' => godwit_classify_error($e->getMessage())];
+            $message = godwit_redact($e->getMessage());
+            return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
         return ['ok' => true, 'name' => $name];
     }
@@ -804,7 +836,8 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
         try {
             godwit_walk_config_state($updateCall, $name, $initial, $current['type']);
         } catch (\Throwable $e) {
-            return ['error' => $e->getMessage(), 'classification' => godwit_classify_error($e->getMessage())];
+            $message = godwit_redact($e->getMessage());
+            return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
         return ['ok' => true];
     }

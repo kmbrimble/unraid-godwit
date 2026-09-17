@@ -92,7 +92,7 @@ Godwit makes no write calls to Google Drive or OneDrive in this phase.
   the existing install-block harness) proved the pre-fix block deleted a
   fixture `rclone.conf` (red baseline), then that the fix preserves it
   alongside a stale `.txz` cleanup.
-- 31 new tests (67 total, up from 36): redaction, name/token validation,
+- 33 new tests (69 total, up from 36): redaction, name/token validation,
   rc param builders, the drive/onedrive config-state walk (including the
   auth-expired fixture), `config/dump` secret-stripping, error
   classification, quota parsing (including the "unlimited" null-pct
@@ -101,6 +101,27 @@ Godwit makes no write calls to Google Drive or OneDrive in this phase.
   credentials file round-trip, and one end-to-end test against a real
   bundled rcd instance (add → list → delete) confirming no secret value
   ever appears in a `remotes_list` response.
+- Reviewed via `code-diff-reviewer`'s three-pass pipeline against
+  `origin/main..HEAD`. Two findings survived, both fixed with a regression
+  test each:
+  - **[A] agreement 2/3:** `godwit_walk_config_state()`'s 10-step cap could
+    be exhausted while rclone's state machine was still non-terminal (no
+    `Error`, `State` still set) and the function returned normally — both
+    `remotes_add_*` and `remotes_reauth` only check for a thrown exception
+    before reporting `{"ok": true}`, so a remote stuck mid-configuration
+    could be reported as successfully added. Fixed: a non-empty `State`
+    after the loop now throws, same as an `Error` already did.
+  - **[B] agreement 1/3:** `godwit_redact()` was dead code — defined and
+    unit-tested, but never called from any production log line, despite
+    this changelog and its own docblock claiming otherwise. Fixed by
+    moving `godwit_log()` into `lib.php` and redacting unconditionally
+    inside it (so every future call site gets it for free, not just
+    today's), and by redacting every rclone-sourced error string before
+    it reaches a `remotes_*` JSON response or a notification description.
+  - Both fixes also caught a real gap while testing: the inline
+    `key=value` shape (a secret embedded mid-message, not on its own ini
+    line) wasn't matched by the original regex — added a third redaction
+    pattern for it.
 
 ## [0.1.3] - 2026-09-16
 
