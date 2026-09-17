@@ -88,7 +88,13 @@ function godwit_spawn_rcd(string $rcloneBin, string $configPath, array $listener
 {
     $argv = godwit_rcd_argv($rcloneBin, $configPath, $listener, $rcdLogFile);
     $descriptors = [0 => ['pipe', 'r'], 1 => ['file', $rcdLogFile, 'a'], 2 => ['file', $rcdLogFile, 'a']];
-    $proc = proc_open($argv, $descriptors, $pipes);
+    // Credentials go in via env, never argv — see godwit_rcd_env()'s
+    // docblock (a bare --rc-user=/--rc-pass= would be visible to any local
+    // process via `ps aux` / /proc/<pid>/cmdline). proc_open() replaces the
+    // whole environment when one is supplied, so this merges onto the
+    // current process's env rather than handing the child a stripped one.
+    $env = array_merge(getenv(), godwit_rcd_env($listener));
+    $proc = proc_open($argv, $descriptors, $pipes, null, $env);
     if ($proc === false) {
         throw new \RuntimeException('failed to spawn rclone rcd');
     }

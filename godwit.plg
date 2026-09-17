@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.2.0">
+<!ENTITY version   "0.2.1">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,14 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.2.1
+- Found live on the host during 0.2.0's own verification (not caught by
+  code review, which doesn't run `ps aux`): rcd's generated `--rc-user`/
+  `--rc-pass` were on the spawned process's command line, visible to any
+  other local process via `ps aux` or its /proc/PID/cmdline. Fixed by
+  passing them as `RCLONE_RC_USER`/`RCLONE_RC_PASS` environment variables
+  instead — confirmed locally that the bundled rclone v1.75.1 honours
+  these identically to the flags. No functional change otherwise.
 ###0.2.0
 - Phase 2: a Remotes section on the Godwit page lists configured rclone
   remotes (name, type, health status, quota) and can add a Google Drive or

@@ -54,9 +54,9 @@ function godwit_resolve_cache_mounted($override, string $cacheDir): bool
 
 /**
  * Builds the argv for `rclone rcd`, given a listener spec. Never emits
- * --rc-no-auth (non-negotiable) and always emits --config and
- * --rc-user/--rc-pass, on *both* listener types. Ground-truthed locally
- * (Phase 2): rclone's rc auth gate is not exempted by unix-socket
+ * --rc-no-auth (non-negotiable) and always emits --config. Credentials are
+ * deliberately NOT included here — see godwit_rcd_env(). Ground-truthed
+ * locally (Phase 2): rclone's rc auth gate is not exempted by unix-socket
  * transport — only commands rclone itself marks NoAuth (rc/noop,
  * core/version, the ones Phase 1's heartbeat already used) skip it; the
  * config/* and operations/about calls Phase 2 needs are not NoAuth and
@@ -78,14 +78,33 @@ function godwit_rcd_argv(string $rcloneBin, string $configPath, array $listener,
     } else {
         throw new \InvalidArgumentException('unknown listener type: ' . $listener['type']);
     }
-    $argv[] = '--rc-user=' . $listener['user'];
-    $argv[] = '--rc-pass=' . $listener['pass'];
 
     $argv[] = '--config=' . $configPath;
     $argv[] = '--log-file=' . $rcdLogFile;
     $argv[] = '--log-level=INFO';
 
     return $argv;
+}
+
+/**
+ * Environment variables carrying rcd's credentials, kept OUT of argv on
+ * purpose. Found live on the host during Phase 2 verification (not caught
+ * by review, which doesn't run `ps aux`): a subprocess's command line is
+ * visible to any other local process via `ps aux` / `/proc/<pid>/cmdline`,
+ * so `--rc-user=`/`--rc-pass=` on argv would print the credentials godwitd
+ * just generated to any process on the host that can run `ps`. Confirmed
+ * locally that the bundled rclone v1.75.1 honours RCLONE_RC_USER /
+ * RCLONE_RC_PASS identically to the flags (rclone's standard
+ * RCLONE_<FLAG> environment-variable convention) — same rc/noop
+ * behaviour, same 401 without them, and `ps aux` on the spawned process
+ * shows no credentials at all.
+ */
+function godwit_rcd_env(array $listener): array
+{
+    return [
+        'RCLONE_RC_USER' => $listener['user'],
+        'RCLONE_RC_PASS' => $listener['pass'],
+    ];
 }
 
 /**

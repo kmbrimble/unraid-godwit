@@ -182,29 +182,33 @@ t('verify-rclone-zip.sh: rejects a SUMS file missing the entry', function () use
 
 // --- godwitd's rcd command-line builder ----------------------------------
 
-t('godwit_rcd_argv: unix listener never contains --rc-no-auth, always contains --config and credentials', function () {
+t('godwit_rcd_argv: unix listener never contains --rc-no-auth or credentials, always contains --config', function () {
     $argv = godwit_rcd_argv('/opt/rclone', '/boot/config/plugins/godwit/rclone.conf', ['type' => 'unix', 'path' => '/var/run/godwit/rcd.sock', 'user' => 'u1', 'pass' => 'p1'], '/var/run/godwit/rcd.log');
     foreach ($argv as $arg) {
         assert_true($arg !== '--rc-no-auth' && !str_starts_with($arg, '--rc-no-auth'), '--rc-no-auth must never appear');
+        // Credentials must never be on argv (visible to any local process
+        // via `ps aux`/`/proc/<pid>/cmdline`, found live on the host during
+        // Phase 2 verification) — they go in via godwit_rcd_env() instead.
+        assert_true(!str_contains($arg, 'u1') && !str_contains($arg, 'p1'), "credentials must never appear in argv, found in: $arg");
     }
     assert_true((bool) array_filter($argv, fn ($a) => str_starts_with($a, '--config=')), 'missing --config= flag');
     assert_true(in_array('--rc-addr=unix:///var/run/godwit/rcd.sock', $argv, true), 'missing unix --rc-addr');
-    // Ground-truthed (Phase 2): config/* and operations/about 403 on a unix
-    // listener with no credentials — only NoAuth-marked commands (rc/noop,
-    // core/version) are exempt from rc auth regardless of transport.
-    assert_true(in_array('--rc-user=u1', $argv, true), 'missing --rc-user on the unix listener');
-    assert_true(in_array('--rc-pass=p1', $argv, true), 'missing --rc-pass on the unix listener');
 });
 
-t('godwit_rcd_argv: tcp listener never contains --rc-no-auth, always contains --config and credentials', function () {
+t('godwit_rcd_argv: tcp listener never contains --rc-no-auth or credentials, always contains --config', function () {
     $argv = godwit_rcd_argv('/opt/rclone', '/boot/config/plugins/godwit/rclone.conf', ['type' => 'tcp', 'host' => '127.0.0.1', 'port' => 54321, 'user' => 'u1', 'pass' => 'p1'], '/var/run/godwit/rcd.log');
     foreach ($argv as $arg) {
         assert_true(!str_starts_with($arg, '--rc-no-auth'), '--rc-no-auth must never appear');
+        assert_true(!str_contains($arg, 'u1') && !str_contains($arg, 'p1'), "credentials must never appear in argv, found in: $arg");
     }
     assert_true((bool) array_filter($argv, fn ($a) => str_starts_with($a, '--config=')), 'missing --config= flag');
     assert_true(in_array('--rc-addr=127.0.0.1:54321', $argv, true), 'missing tcp --rc-addr');
-    assert_true(in_array('--rc-user=u1', $argv, true), 'missing --rc-user');
-    assert_true(in_array('--rc-pass=p1', $argv, true), 'missing --rc-pass');
+});
+
+t('godwit_rcd_env: carries credentials as RCLONE_RC_USER/RCLONE_RC_PASS, ground-truthed against the bundled rclone binary honouring them identically to the flags', function () {
+    $env = godwit_rcd_env(['type' => 'unix', 'path' => '/x', 'user' => 'u1', 'pass' => 'p1']);
+    assert_eq('u1', $env['RCLONE_RC_USER'], 'RCLONE_RC_USER must carry the listener user');
+    assert_eq('p1', $env['RCLONE_RC_PASS'], 'RCLONE_RC_PASS must carry the listener pass');
 });
 
 t('godwit_rcd_argv: rejects an unknown listener type', function () {
@@ -1086,12 +1090,14 @@ t('godwit_handle_remote_action: add drive -> list (no secrets in response) -> de
     // Ground-truthed (Phase 2): config/* and operations/about 403 on a unix
     // listener with no rc-user/rc-pass configured, so this fixture rcd (like
     // godwitd's real one) must be started with credentials, never
-    // --rc-no-auth.
+    // --rc-no-auth — and via env, never argv (see godwit_rcd_env()).
     $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
     $proc = proc_open(
-        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--rc-user=testuser', '--rc-pass=testpass', '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
         [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
-        $pipes
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
     );
     fclose($pipes[0]);
     for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {

@@ -10,6 +10,32 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+### Fixed
+
+Found live on the host during 0.2.0's own verification (host verification
+catches things review can't — this one wasn't in any of the three review
+passes, since none of them run `ps aux`): `godwit_rcd_argv()` put the
+generated `--rc-user`/`--rc-pass` on rcd's command line. A process's argv
+is visible to any other local process via `ps aux` or
+`/proc/<pid>/cmdline`, so this printed the exact credentials godwitd just
+generated to gate remote management to anyone on the host who could run
+`ps`.
+
+- Credentials now go in via `RCLONE_RC_USER`/`RCLONE_RC_PASS` environment
+  variables instead (`godwit_rcd_env()`), passed to `proc_open()`'s `$env`
+  argument merged onto the current process's environment (passing an
+  `$env` array to `proc_open()` replaces the whole environment, not just
+  adds to it, so this merges rather than stripping `PATH` etc. from the
+  spawned rcd). Confirmed locally that the bundled rclone v1.75.1 honours
+  these identically to the flags — same `rc/noop` behaviour, same 401
+  without them — and that `ps aux` on the spawned process shows no
+  credentials at all.
+- `godwit_rcd_argv()`'s tests now assert the opposite of what they asserted
+  in 0.2.0: that credentials never appear anywhere in argv. A new
+  `godwit_rcd_env()` test covers the replacement.
+
+## [0.2.0] - 2026-09-17
+
 ### Added — Phase 2: Remotes (PLAN.md §5 item 2)
 
 A Remotes section on Settings → Godwit lists configured rclone remotes
