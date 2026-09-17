@@ -1732,19 +1732,21 @@ function godwit_open_job_runs_table(SQLite3 $db): void
         files INTEGER NOT NULL DEFAULT 0,
         errors INTEGER NOT NULL DEFAULT 0,
         outcome TEXT,
-        eta_seconds INTEGER
+        eta_seconds INTEGER,
+        speed_bps INTEGER
     )');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_job_runs_job_started ON job_runs(job_name, started_ts)');
 }
 
-/** Updates a still-running run row's live progress (bytes/files/errors/eta) — called every daemon tick while a job is active, so the status page reflects the run in progress rather than only its final result. */
-function godwit_update_job_run_progress(SQLite3 $db, int $runId, int $bytes, int $files, int $errors, ?int $etaSeconds): void
+/** Updates a still-running run row's live progress (bytes/files/errors/eta/speed) — called every daemon tick while a job is active, so the status page reflects the run in progress rather than only its final result. */
+function godwit_update_job_run_progress(SQLite3 $db, int $runId, int $bytes, int $files, int $errors, ?int $etaSeconds, ?int $speedBps = null): void
 {
-    $stmt = $db->prepare('UPDATE job_runs SET bytes = :bytes, files = :files, errors = :errors, eta_seconds = :eta WHERE id = :id');
+    $stmt = $db->prepare('UPDATE job_runs SET bytes = :bytes, files = :files, errors = :errors, eta_seconds = :eta, speed_bps = :speed WHERE id = :id');
     $stmt->bindValue(':bytes', $bytes, SQLITE3_INTEGER);
     $stmt->bindValue(':files', $files, SQLITE3_INTEGER);
     $stmt->bindValue(':errors', $errors, SQLITE3_INTEGER);
     $stmt->bindValue(':eta', $etaSeconds, SQLITE3_INTEGER);
+    $stmt->bindValue(':speed', $speedBps, SQLITE3_INTEGER);
     $stmt->bindValue(':id', $runId, SQLITE3_INTEGER);
     $stmt->execute();
 }
@@ -1805,6 +1807,7 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
                 'files' => (int) $active['files'],
                 'errors' => (int) $active['errors'],
                 'eta_seconds' => $active['eta_seconds'] !== null ? (int) $active['eta_seconds'] : null,
+                'speed_bps' => $active['speed_bps'] !== null ? (int) $active['speed_bps'] : null,
                 'started_ts' => (int) $active['started_ts'],
             ] : null,
             'last_run' => $last !== null ? [

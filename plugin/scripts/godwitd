@@ -395,9 +395,25 @@ while ($running) {
             }
             $activeJobs[$name]['last_bytes'] = $bytes;
             $etaSeconds = isset($stats['eta']) && is_numeric($stats['eta']) ? (int) $stats['eta'] : null;
-            godwit_update_job_run_progress($db, $aj['run_id'], $bytes, (int) ($stats['transfers'] ?? 0), (int) ($stats['errors'] ?? 0), $etaSeconds);
+            $speedBps = isset($stats['speed']) && is_numeric($stats['speed']) ? (int) $stats['speed'] : null;
+            godwit_update_job_run_progress($db, $aj['run_id'], $bytes, (int) ($stats['transfers'] ?? 0), (int) ($stats['errors'] ?? 0), $etaSeconds, $speedBps);
 
             if ($status === null || empty($status['finished'])) {
+                // §4.3's second line of defence: MaxTransfer was set to the
+                // remaining budget at job start, but Phase 1's spike found it
+                // can overshoot by up to transfers × average file size — so
+                // the daemon actively stops a still-running job the moment
+                // its remote's rolling-24h ledger reaches the cap, rather
+                // than trusting rclone's own cutoff alone. job/stop is
+                // cooperative (not a kill), so an in-flight chunk still
+                // finishes; issued every tick until the job actually reports
+                // finished, which is harmless — rclone treats a repeat
+                // job/stop on an already-stopping job as a no-op.
+                $cap = (int) ($settings['budget_caps'][$aj['remote']] ?? godwit_default_budget_cap_bytes());
+                if (godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $aj['remote'], $now)) <= 0) {
+                    godwit_rc_call_params($rcd['listener'], 'job/stop', ['jobid' => $aj['jobid']], 15);
+                    godwit_log($logFile, "job \"$name\" stopped mid-run — {$aj['remote']}'s daily budget was reached");
+                }
                 continue;
             }
             $errorMsg = trim((string) ($status['error'] ?? ''));

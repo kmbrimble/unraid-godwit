@@ -396,7 +396,9 @@ function godwitJobsRefresh() {
 
             var rows = (data.jobs || []).map(function (j) {
                 var state = j.running
-                    ? 'running — ' + fmtBytes(j.progress.bytes) + ', ' + j.progress.files + ' files, ETA ' + fmtDuration(j.progress.eta_seconds)
+                    ? 'running — ' + fmtBytes(j.progress.bytes) + ', ' + j.progress.files + ' files, ' +
+                      (j.progress.speed_bps !== null ? fmtBytes(j.progress.speed_bps) + '/s' : 'speed unknown') +
+                      ', ETA ' + fmtDuration(j.progress.eta_seconds)
                     : (j.last_run
                         ? j.last_run.outcome + ' (' + fmtBytes(j.last_run.bytes) + ') at ' + new Date((j.last_run.ended_ts || j.last_run.started_ts) * 1000).toLocaleString()
                         : 'never run');
@@ -473,7 +475,23 @@ function godwitSettingsSave() {
 
 document.getElementById('godwit-jobs-save').addEventListener('click', godwitJobsSave);
 document.getElementById('godwit-settings-save').addEventListener('click', godwitSettingsSave);
-document.getElementById('godwit-profile').addEventListener('change', godwitUpdateProfileWarning);
+// Switching to a named profile sets a sensible default window ceiling —
+// ponytail: 70% of the profile's upstream, comfortably under the 80%
+// warning threshold rather than landing exactly on it. Kieren can still
+// type any number by hand afterwards; this only fires on an actual
+// dropdown change, never on page load, so it can't clobber a saved value.
+// "custom" leaves whatever is already in the windows field untouched.
+document.getElementById('godwit-profile').addEventListener('change', function () {
+    var upstream = godwitProfileUpstream[this.value];
+    if (upstream) {
+        try {
+            var windows = JSON.parse(document.getElementById('godwit-windows').value);
+            windows.forEach(function (w) { w.limit_mbit = Math.round(upstream * 0.7); });
+            document.getElementById('godwit-windows').value = JSON.stringify(windows);
+        } catch (e) { /* leave the windows field as-is if it isn't valid JSON right now */ }
+    }
+    godwitUpdateProfileWarning();
+});
 document.getElementById('godwit-windows').addEventListener('input', godwitUpdateProfileWarning);
 document.getElementById('godwit-run-now').addEventListener('click', function () {
     godwitRunAction('run_now', {}, document.getElementById('godwit-run-now'), 'Starting…', function (data) {

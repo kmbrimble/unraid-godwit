@@ -2291,6 +2291,18 @@ t('godwit_build_jobs_status: a job with an open run row shows as running with li
     assert_eq(0, $kieren['queue_position'], 'Kieren is next in the gdrive queue');
 });
 
+t('godwit_update_job_run_progress: speed_bps is stored and surfaced in jobs status', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    $runId = godwit_start_job_run($db, 'Teegan', 'gdrive', 1000);
+    godwit_update_job_run_progress($db, $runId, 1_000_000, 1, 0, 300, 5_000_000);
+    $jobs = [['name' => 'Teegan', 'share' => 'Teegan', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true]];
+    $status = godwit_build_jobs_status($db, $jobs, godwit_default_settings(), 2000);
+    assert_eq(5_000_000, $status['jobs'][0]['progress']['speed_bps'], 'speed should round-trip through the status builder');
+});
+
 t('godwit_build_jobs_status: reports per-remote budget usage and throttle state', function () {
     $db = new SQLite3(':memory:');
     godwit_open_job_runs_table($db);
