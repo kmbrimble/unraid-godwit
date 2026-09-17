@@ -1,7 +1,11 @@
 #!/bin/bash
 # Remove godwit from the live Unraid host over ssh and assert the revert was
-# clean. Pre-release, nothing is preserved on uninstall — any leftover here
-# is a packaging bug, not intended state, and this fails loudly on one.
+# clean. As of 0.2.0, /boot/config/plugins/godwit/ (rclone.conf and any
+# future godwit.cfg/jobs.json) is deliberately preserved — it can hold live
+# OAuth credentials — so this checks the directory survives with rclone.conf
+# still in it, while everything else godwit installed is gone. Any other
+# leftover here is a packaging bug, not intended state, and this fails
+# loudly on one.
 set -euo pipefail
 
 HOST="192.168.0.10"
@@ -25,9 +29,16 @@ check_absent() {
 }
 
 check_absent "/boot/config/plugins/godwit.plg" "[[ -f /boot/config/plugins/godwit.plg ]]"
-check_absent "/boot/config/plugins/godwit/ (incl. rclone.conf — nothing to preserve yet, see godwit.plg's remove block)" \
-    "[[ -d /boot/config/plugins/godwit ]]"
+check_absent "/boot/config/plugins/godwit/*.txz (installed package files)" \
+    "ls /boot/config/plugins/godwit/godwit-*.txz >/dev/null 2>&1"
 check_absent "/usr/local/emhttp/plugins/godwit/" "[[ -d /usr/local/emhttp/plugins/godwit ]]"
+
+if "${SSH[@]}" "[[ -f /boot/config/plugins/godwit/rclone.conf ]]"; then
+    echo "  OK: /boot/config/plugins/godwit/rclone.conf preserved (0.2.0 onward — holds live OAuth credentials)"
+else
+    echo "  FAIL: /boot/config/plugins/godwit/rclone.conf missing — uninstall must preserve it as of 0.2.0" >&2
+    FAIL=1
+fi
 check_absent "/var/log/plugins/godwit.plg" "[[ -f /var/log/plugins/godwit.plg ]]"
 
 # Match the installed daemon's full absolute path, not the bare word
