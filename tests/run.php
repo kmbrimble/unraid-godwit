@@ -2062,6 +2062,20 @@ t('godwit_seconds_to_window_end: mid-window returns seconds to the boundary, wra
     assert_eq(7 * 3600, $secs, '23:00 to 06:00 next day is 7 hours');
 });
 
+t('godwit_window_start_ts: mid-window (no wrap) returns today\'s start boundary', function () {
+    $w = ['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '22:00', 'end' => '23:59', 'limit_mbit' => 100.0];
+    $now = godwit_test_dt('2026-09-17 22:30:00');
+    $expected = godwit_test_dt('2026-09-17 22:00:00')->getTimestamp();
+    assert_eq($expected, godwit_window_start_ts($w, $now), 'start boundary same day');
+});
+
+t('godwit_window_start_ts: the D12 default at 05:00 (spillover) resolves to YESTERDAY 22:00, not today 22:00', function () {
+    $w = godwit_default_windows()[0];
+    $now = godwit_test_dt('2026-09-18 05:00:00');
+    $expected = godwit_test_dt('2026-09-17 22:00:00')->getTimestamp();
+    assert_eq($expected, godwit_window_start_ts($w, $now), 'must resolve to the previous day\'s start');
+});
+
 t('godwit_mbit_to_bytes_per_sec: 250 Mbit/s converts to the exact byte rate (not the M/MiB suffix)', function () {
     assert_eq(31250000, godwit_mbit_to_bytes_per_sec(250.0), '250 Mbit/s = 31,250,000 B/s');
 });

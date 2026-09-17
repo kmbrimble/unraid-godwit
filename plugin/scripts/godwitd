@@ -207,8 +207,27 @@ $activeJobs = []; // jobName => ['jobid','remote','run_id','started_ts','group',
 // $activeJobs looks identical to one that never started, and the queue would
 // loop on whichever job sorts first for its remote (Filing Cabinet, always)
 // instead of ever advancing to the next one.
-$sessionStartTs = 0;
-$startGateWasOpen = false;
+// If godwitd is (re)starting into an already-open window (or a "Run now"
+// left running across the restart), seed the session clock from the
+// window's real start rather than "now" — otherwise a restart mid-window
+// would make every job that already completed earlier that same window
+// look like it had never run this session (see godwit_window_start_ts()).
+$startupWindow = godwit_active_window($settings['windows'], new \DateTimeImmutable('now'));
+$startupRunNow = file_exists($runDir . '/run-now');
+if ($startupWindow !== null) {
+    $sessionStartTs = godwit_window_start_ts($startupWindow, new \DateTimeImmutable('now'));
+    $startGateWasOpen = true;
+} elseif ($startupRunNow) {
+    // No way to recover when the override itself started — start of day is
+    // a safe, conservative floor (never older than "today"), which is far
+    // better than 0 (which would treat every completed run, ever, as part
+    // of this session and refuse to restart any of them).
+    $sessionStartTs = (new \DateTimeImmutable('today'))->getTimestamp();
+    $startGateWasOpen = true;
+} else {
+    $sessionStartTs = 0;
+    $startGateWasOpen = false;
+}
 
 while ($running) {
     sleep(1);
@@ -481,7 +500,17 @@ while ($running) {
         // active and nothing left eligible to start) — scheduled runs
         // thereafter follow the normal window (D15).
         if ($runNow && count($activeJobs) === 0) {
-            $stillEligible = godwit_select_next_jobs($jobs, []);
+            // Rebuilt fresh (not reused from the start-new-jobs block above,
+            // which only runs when !$paused) and passed through the same
+            // $lastRuns/$sessionStartTs session-awareness as the real
+            // selection — without this the drained check saw every
+            // completed job as "never run" and could never observe an empty
+            // queue, so the run-now marker was never removed.
+            $lastRunsForDrainCheck = [];
+            foreach ($jobs as $job) {
+                $lastRunsForDrainCheck[$job['name']] = godwit_last_job_run($db, $job['name']);
+            }
+            $stillEligible = godwit_select_next_jobs($jobs, [], $lastRunsForDrainCheck, $sessionStartTs);
             if (count($stillEligible) === 0) {
                 @unlink($runNowMarker);
                 godwit_log($logFile, '"Run now" queue drained — reverting to the normal window schedule');

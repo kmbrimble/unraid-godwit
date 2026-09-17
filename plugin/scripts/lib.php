@@ -1672,6 +1672,28 @@ function godwit_time_in_window(array $window, \DateTimeImmutable $now): bool
         || (in_array($prevDay, $days, true) && $nowMin < $endMin);
 }
 
+/**
+ * The real start timestamp of $window's current occurrence, given it's
+ * active at $now — handles the midnight-wrap case the same way
+ * godwit_time_in_window()/godwit_seconds_to_window_end() do: if today's
+ * start-of-day boundary is still in the future relative to $now, this
+ * occurrence actually began yesterday. Used to seed godwitd's
+ * $sessionStartTs correctly on a daemon restart that happens mid-window —
+ * without this, a restart would reset the session clock to "now", making
+ * every job that already completed earlier in the still-open window look
+ * like it had never run this session, and become eligible to re-run ahead
+ * of jobs that genuinely haven't started yet.
+ */
+function godwit_window_start_ts(array $window, \DateTimeImmutable $now): int
+{
+    [$sh, $sm] = array_map('intval', explode(':', $window['start']));
+    $start = $now->setTime($sh, $sm, 0);
+    if ($start > $now) {
+        $start = $start->modify('-1 day');
+    }
+    return $start->getTimestamp();
+}
+
 /** First window (in list order) active at $now, or null if none is. */
 function godwit_active_window(array $windows, \DateTimeImmutable $now): ?array
 {
