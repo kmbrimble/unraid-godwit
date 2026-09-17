@@ -48,6 +48,39 @@ fixtures ground-truthed against the bundled rclone binary locally, see
 CHANGELOG 0.2.0) and sending a real Unraid notification (not required by
 this phase's scope). The real reboot/array-stop test from Phase 1 is still
 outstanding — unchanged by this phase.
+
+**0.2.2 (verified 2026-09-17)** fixed the Remotes page swallowing every
+Test/Add/Reauth/Delete result (the background 30s remotes-list refresh was
+clearing the action-message div milliseconds after a result appeared) and a
+timed-out health check being recorded as `unchecked` instead of `error`.
+Verified live via `scripts/install-on-host.sh 0.2.2`: upgrade 0.2.1 → 0.2.2
+clean, exactly one `godwitd` and one bundled `rcd`, socket present,
+heartbeat advancing. CLI-PHP `remotes_test` against the real `gdrive`
+remote returned `{"result":{"status":"ok",...}}` and wrote `remote test
+gdrive: ok` to `/var/log/godwit.log`. `remotes_add_onedrive` with an empty
+name (plus a syntactically-valid token, so the name failure — not a
+token failure — was the thing under test) returned `{"error":"name is
+required"}`; with a non-clashing name and a garbage (non-JSON) token
+returned `{"error":"no JSON object found in the pasted text — paste the
+whole blob rclone authorize printed"}` — both logged, neither reached
+`config/create`: `[gdrive]`'s non-token lines were byte-identical before
+and after (`grep -v '^token' | sha256sum` match) and `rclone.conf` still
+has only `[gdrive]`. The installed `Godwit.page` was grepped for
+`godwitRunAction`/`godwitShowMessage`/`godwitActionPending` (21 matches).
+`PRAGMA table_info(remotes_health)` on the live db shows the new
+`fail_count` column, confirming the ALTER-TABLE migration ran against an
+existing 0.2.1 table. **Not verified this phase:** a real Add against a
+real OneDrive/Drive token reaching rcd (no live token available this
+session, same gap as 0.2.0/0.2.1 — the extraction/validation/config-create
+paths are otherwise covered by `tests/run.php` and by the CLI-PHP checks
+above), and the notify rule's 2-consecutive-failure behavior against a
+real transient rcd outage (covered by unit tests with an injected `$call`,
+not exercised live). The 60s `operations/about` timeout (raised from 15s)
+means godwitd's health-check loop can now block up to 60s per remote on a
+genuinely wedged rcd — a known ceiling of this fix, not a regression, since
+the loop already serializes remotes one at a time. The real reboot/
+array-stop test from Phase 1 remains outstanding — unchanged by this
+phase.
 See PLAN.md §5 for the remaining phases.
 
 ## Test command
