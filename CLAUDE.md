@@ -230,6 +230,43 @@ not a real click-through. The user should confirm this in a real browser
 before/while installing. The real reboot/array-stop test from Phase 1
 remains outstanding.
 
+**0.4.1 (built and offline-verified 2026-09-18, host verification
+pending — the user installs)** fixes spurious "run failed" alerts seen
+live on Kieren/Teegan the night of 2026-09-17→18: a MaxTransfer/daily-cap
+cutoff always leaves some destination directories unreached, and rclone's
+own directory-modtime pass then fails on every one with "directory not
+found" — `job/status`'s returned error is rclone's own `currentError()`
+precedence (fatal, then plain, then no-retry), and the graceful budget
+cutoff is the lowest of the three, so that masking error, not the real
+cutoff, was what got classified and notified as a failure.
+`godwit_build_sync_params()` now sets `NoUpdateDirModTime` (the rc
+`_config` field name, ground-truthed against the bundled v1.75.1 binary's
+`options/info` call, not guessed from the flag spelling) on every
+sync/copy job. A `budget`/`window` outcome now sends a `normal`-importance
+"stopped at the cap/window, resumes next window" notification instead of
+an alert, via a new `godwit_cap_stop_notification()`; genuine transfer
+errors riding along with a cutoff still surface, via a per-path error-
+count baseline (1 for MaxTransfer's own cutoff, 0 for MaxDuration's, up
+to the job's configured `Transfers` for godwitd's own ledger-triggered
+`job/stop`) rather than one hardcoded number — an early draft used a flat
+">1 error" threshold, which a pre-merge self-review caught as wrong
+(ground-truthed live: a clean ledger-triggered stop at `Transfers=4`
+costs exactly 4 errors, which would have reintroduced a reshaped version
+of the same false-alarm bug). Verified offline (217/217, `php
+tests/run.php`) against real local-backend rcd fixtures for all three
+cutoff paths, including a regression test reproducing the exact
+directory-skip shape from the live incident and proving it now classifies
+`budget`, not `error`. **Not verified this release**: none of the above
+against the live Google Drive remote or a real budget/window cutoff on
+the host — the fix is offline/local-backend only pending the user's
+install. The skipped-delete-phase side effect seen in the same host log
+("not deleting files/directories as there were IO errors") was
+investigated and found to be correct, unrelated rclone behaviour (the
+delete phase is gated on any `currentError()`, including a clean cutoff
+itself, not only the directory-modtime bug) — confirmed live with a
+local-backend fixture that a truncated run still skips deletion even with
+`NoUpdateDirModTime` set, and needs no fix.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

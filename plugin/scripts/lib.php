@@ -2195,23 +2195,33 @@ function godwit_job_error_notification(string $jobName, ?string $errorMessage): 
  * failed". Notifies every run, same as godwit_job_error_notification(),
  * since these are already infrequent, discrete events.
  *
- * $errorCount > 1 is the signal that something beyond the cutoff itself
- * also went wrong: rclone accounts the cutoff itself as exactly 1 error in
- * core/stats even on an otherwise-clean run (ground-truthed locally against
- * the bundled binary — a bare MaxTransfer cutoff with zero real per-file
- * failures still reports `"errors": 1`), so anything above that count is a
- * real error riding along with the cutoff. See godwit_classify_job_outcome()
- * for why a genuine error usually pre-empts the 'budget'/'window' outcome
- * entirely rather than reaching here at all — this is the residual case
- * where it didn't.
+ * $errorCount > $baselineErrors is the signal that something beyond the
+ * cutoff itself also went wrong. $baselineErrors is NOT a constant — three
+ * ground-truthed local-backend measurements against the bundled binary
+ * found three different clean-cutoff counts, one per way a run can stop:
+ *   - MaxTransfer's own graceful cutoff (rclone stops itself, matched via
+ *     text): exactly 1 (rclone accounts the cutoff itself as an error even
+ *     with zero real per-file failures).
+ *   - MaxDuration's cutoff (fatal, matched via text): exactly 0.
+ *   - godwitd's own mid-run job/stop ($stoppedForBudget — the ledger
+ *     guard firing before rclone's own MaxTransfer): one per transfer
+ *     slot in flight when stopped ("Removing partially written file on
+ *     error: context canceled" per worker), up to the job's configured
+ *     Transfers.
+ * Passing a single hardcoded baseline (an earlier version used 1
+ * unconditionally) would have made every $stoppedForBudget stop with
+ * Transfers=4 report "4 errors were also logged" on a perfectly clean
+ * run — the exact false-alarm class this notification exists to end.
+ * The caller (godwitd) knows which of the three paths produced this
+ * outcome and passes the matching baseline.
  */
-function godwit_cap_stop_notification(string $jobName, string $outcome, int $bytes, int $errorCount): array
+function godwit_cap_stop_notification(string $jobName, string $outcome, int $bytes, int $errorCount, int $baselineErrors): array
 {
     $gib = $bytes / (1024 ** 3);
     $reason = $outcome === 'window' ? "tonight's backup window" : 'its daily upload cap';
     $subject = $outcome === 'window' ? "Godwit: $jobName stopped for tonight's window" : "Godwit: $jobName stopped at the daily cap";
     $description = sprintf('%s transferred %.2f GiB before hitting %s — it will resume at the next window.', $jobName, $gib, $reason);
-    if ($errorCount > 1) {
+    if ($errorCount > $baselineErrors) {
         $description .= " $errorCount errors were also logged this run — check /var/log/godwit.log.";
     }
     return [

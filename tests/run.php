@@ -2253,9 +2253,9 @@ t('godwit_classify_job_outcome: an unrecognised error is a plain error', functio
     assert_eq('error', godwit_classify_job_outcome('connection reset by peer', false), 'generic error');
 });
 
-t('godwit_classify_job_outcome: the real directory-modtime error recorded on the live host (2026-09-18) masks a budget cutoff and must classify as error, not budget — this documents why NoUpdateDirModTime must stay on in godwit_build_sync_params(), not be worked around here', function () {
-    $realHostError = 'failed to set directory modtime: 2 errors: last error: chtimes /dst/subdirA: no such file or directory';
-    assert_eq('error', godwit_classify_job_outcome($realHostError, false), 'a masked cutoff message is indistinguishable from a real error once the cutoff text itself is gone — the fix belongs in never producing this error, not in special-casing its text here');
+t('godwit_classify_job_outcome: a directory-modtime failure — the exact rcd.log error line recorded on the live host on 2026-09-18 ("Failed to update directory timestamp or metadata: directory not found"; job/status\'s own wrapped wording was not captured live, only this log line was) — masks a budget cutoff and must classify as error, not budget: documents why NoUpdateDirModTime must stay on in godwit_build_sync_params(), not be worked around here', function () {
+    $realHostLogLine = 'Failed to update directory timestamp or metadata: directory not found';
+    assert_eq('error', godwit_classify_job_outcome($realHostLogLine, false), 'a masked cutoff message is indistinguishable from a real error once the cutoff text itself is gone — the fix belongs in never producing this error, not in special-casing its text here');
 });
 
 // --- Requeue after restart --------------------------------------------------
@@ -2420,8 +2420,8 @@ t('godwit_job_error_notification: always builds an alert-level notification', fu
     assert_true(str_contains($n['description'], 'connection reset'), $n['description']);
 });
 
-t('godwit_cap_stop_notification: a clean budget stop reads as a normal stop, not a failure — this is the notification Kieren/Teegan should have gotten instead of "run failed" on 2026-09-18', function () {
-    $n = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 1);
+t('godwit_cap_stop_notification: a clean budget stop (rclone\'s own cutoff, baseline 1) reads as a normal stop, not a failure — this is the notification Kieren/Teegan should have gotten instead of "run failed" on 2026-09-18', function () {
+    $n = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 1, 1);
     assert_eq('normal', $n['importance'], 'a cap stop is not an alert');
     assert_true(!str_contains(strtolower($n['subject']), 'failed'), 'subject: ' . $n['subject']);
     assert_true(str_contains($n['description'], '669.20 GiB'), 'should report how much went: ' . $n['description']);
@@ -2430,15 +2430,23 @@ t('godwit_cap_stop_notification: a clean budget stop reads as a normal stop, not
     assert_true(!str_contains($n['description'], 'errors were also logged'), 'a single accounted cutoff error must not read as a real failure: ' . $n['description']);
 });
 
-t('godwit_cap_stop_notification: a window stop is worded as a window stop, not a budget cap', function () {
-    $n = godwit_cap_stop_notification('Photos', 'window', 1024 * 1024 * 1024, 1);
+t('godwit_cap_stop_notification: a window stop (MaxDuration\'s fatal cutoff, baseline 0 — ground-truthed: a clean --max-duration cutoff reports zero errors, unlike MaxTransfer\'s one) is worded as a window stop and stays quiet at baseline', function () {
+    $n = godwit_cap_stop_notification('Photos', 'window', 1024 * 1024 * 1024, 0, 0);
     assert_true(str_contains($n['subject'], "window"), 'subject: ' . $n['subject']);
     assert_true(str_contains($n['description'], 'backup window'), $n['description']);
+    assert_true(!str_contains($n['description'], 'errors were also logged'), 'zero errors at a zero baseline must not alarm: ' . $n['description']);
 });
 
-t('godwit_cap_stop_notification: more than the cutoff\'s own accounted error surfaces as a real problem the user needs to know about', function () {
-    $n = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 6);
+t('godwit_cap_stop_notification: godwitd\'s own mid-run job/stop (stoppedForBudget) costs one error per in-flight transfer slot — a Transfers=4 job clean-stopping at 4 errors must not read as 4 real failures', function () {
+    $n = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 4, 4);
+    assert_true(!str_contains($n['description'], 'errors were also logged'), 'must not alarm at exactly the expected in-flight-cancellation baseline: ' . $n['description']);
+});
+
+t('godwit_cap_stop_notification: more than the cutoff\'s own accounted error surfaces as a real problem the user needs to know about, regardless of which baseline applies', function () {
+    $n = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 6, 1);
     assert_true(str_contains($n['description'], '6 errors were also logged'), $n['description']);
+    $n2 = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 6, 4);
+    assert_true(str_contains($n2['description'], '6 errors were also logged'), 'still above the Transfers=4 baseline: ' . $n2['description']);
 });
 
 t('godwit_purge_call_params: builds fs/remote params only after the safety assertion passes', function () {
@@ -2630,7 +2638,6 @@ t('godwit_build_sync_params + rc sync/copy: a MaxTransfer cutoff that skips an e
         // forces the exact "one dir transferred, one dir cut off entirely"
         // split seen on the real host.
         $params = godwit_build_sync_params($job, $fs, $filterFile, 2000, null, null, false, $shareRoot);
-        assert_true(str_contains($params['_config'], '"NoUpdateDirModTime":true'), 'the fix must actually be present in the built params: ' . $params['_config']);
 
         $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
         assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));
@@ -2646,9 +2653,14 @@ t('godwit_build_sync_params + rc sync/copy: a MaxTransfer cutoff that skips an e
         assert_true($status !== null && !empty($status['finished']), 'job should finish within 5s: ' . json_encode($status));
         $errorMsg = trim((string) ($status['error'] ?? ''));
 
+        // The behavioural proof — this is what must actually go red/green,
+        // not the config string below (a real rc call ignoring an unknown
+        // _config key silently would pass a string-presence check while
+        // still reproducing the original bug).
         assert_true(!str_contains($errorMsg, 'directory modtime'), 'NoUpdateDirModTime must stop rclone from ever trying to set a directory timestamp: ' . var_export($errorMsg, true));
         assert_true(str_contains($errorMsg, 'as set by --max-transfer'), 'the real cutoff message must survive uncontaminated: ' . var_export($errorMsg, true));
         assert_eq('budget', godwit_classify_job_outcome($errorMsg, false), 'a cutoff that skipped a whole directory must still classify as budget, not error: ' . var_export($errorMsg, true));
+        assert_true(str_contains($params['_config'], '"NoUpdateDirModTime":true'), 'the built params should show why: the fix should be present: ' . $params['_config']);
 
         // Checker concurrency makes it non-deterministic *which* of the two
         // dirs the cutoff lands on, but the 2000-byte cap can only ever fit
@@ -2731,6 +2743,14 @@ t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --
         $errorMsg = trim((string) ($status['error'] ?? ''));
         assert_true($errorMsg !== '', 'a 0-second MaxDuration should cut the job off: ' . json_encode($status));
         assert_eq('window', godwit_classify_job_outcome($errorMsg, false), 'the real --max-duration cutoff message must classify as window: ' . var_export($errorMsg, true));
+        // Unlike MaxTransfer's graceful cutoff (which costs itself exactly 1
+        // in core/stats' error count — see the dedicated dir-modtime test
+        // above), MaxDuration's cutoff is a *fatal* error and is never
+        // counted via fs.CountError — a clean duration cutoff must report
+        // zero errors. godwit_cap_stop_notification()'s baseline for
+        // 'window' depends on this being 0, not 1.
+        $durationStats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $resp['jobid']], 15);
+        assert_eq(0, (int) ($durationStats['errors'] ?? -1), 'a clean --max-duration cutoff must account for zero errors, not the MaxTransfer cutoff\'s 1: ' . json_encode($durationStats));
         // No file should be left half-written (truncated) by the cutoff —
         // rclone's cutoff lets an in-flight file finish rather than
         // truncating it mid-transfer; every file present at the destination
@@ -2738,6 +2758,84 @@ t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --
         foreach (glob($dst . '/*.bin') as $f) {
             assert_eq(200000, filesize($f), "no partial/truncated file should be left at $f");
         }
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
+});
+
+t('rc job/stop (godwitd\'s own mid-run ledger stop, $stoppedForBudget) costs one "context canceled" error per in-flight transfer slot, not the MaxTransfer/MaxDuration cutoffs\' own baselines — proves godwit_cap_stop_notification()\'s per-path baseline is real, not assumed', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-jobstop-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/Kieren';
+    mkdir($src, 0755, true);
+    $transfers = 4;
+    for ($i = 0; $i < 20; $i++) {
+        file_put_contents($src . "/f$i.bin", random_bytes(200000));
+    }
+    $dst = $tmp . '/dst';
+    mkdir($dst, 0755, true);
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+
+    try {
+        // Throttle bandwidth so the transfer is still running when job/stop
+        // arrives (mirrors godwitd's own core/bwlimit call per window).
+        godwit_rc_call_params($listener, 'core/bwlimit', ['rate' => '100000B'], 15);
+        $job = ['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'localdst', 'mode' => 'copy', 'transfers' => $transfers, 'excludes' => []];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        $params = godwit_build_sync_params($job, $fs, $filterFile, 10_000_000, null, null, false, $shareRoot);
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));
+        $jobid = $resp['jobid'];
+
+        usleep(500000);
+        godwit_rc_call_params($listener, 'job/stop', ['jobid' => $jobid], 15);
+
+        $status = null;
+        for ($i = 0; $i < 100; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $jobid], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish after job/stop within 10s: ' . json_encode($status));
+        $errorMsg = trim((string) ($status['error'] ?? ''));
+        assert_eq('budget', godwit_classify_job_outcome($errorMsg, true), 'godwitd\'s own job/stop must classify as budget via the $stoppedForBudget flag, not the generic "context canceled" text');
+
+        $stats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $jobid], 15);
+        $errorCount = (int) ($stats['errors'] ?? -1);
+        assert_true($errorCount >= 1 && $errorCount <= $transfers, "a clean job/stop must cost at most Transfers ($transfers) errors, one per in-flight slot, not zero and not more: " . json_encode($stats));
+
+        // The exact case godwit_cap_stop_notification() must not alarm on:
+        // this run's own error count, used as its own baseline.
+        $n = godwit_cap_stop_notification('Kieren', 'budget', (int) ($stats['bytes'] ?? 0), $errorCount, $transfers);
+        assert_true(!str_contains($n['description'], 'errors were also logged'), 'a clean job/stop within the Transfers baseline must not read as a real failure: ' . $n['description']);
     } finally {
         proc_terminate($proc);
         proc_close($proc);

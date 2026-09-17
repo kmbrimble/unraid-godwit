@@ -54,13 +54,24 @@ sort *before* `1.0.9`.
   no separate error-count check was needed for that case. MaxDuration's
   window cutoff is the *opposite* precedence (fatal, the highest), so it
   cannot be masked by a directory-modtime-style error, but in principle
-  could itself mask a genuine co-occurring failure's text. Accepted, and
-  covered defensively: rclone accounts a bare cutoff as exactly one error
-  in `core/stats` even on an otherwise-clean run (ground-truthed locally);
-  `godwit_cap_stop_notification()` treats any `errorCount` above 1 as
-  something beyond the cutoff itself and appends "N errors were also
-  logged this run — check /var/log/godwit.log" to the notification, so a
-  real failure riding along with either cutoff is never silently dropped.
+  could itself mask a genuine co-occurring failure's text.
+  Accepted, and covered defensively, but **not with a single hardcoded
+  threshold** — an early draft of this fix used "more than 1 error", which
+  a pre-merge self-review caught as wrong: ground-truthing all three ways
+  a run can stop against the bundled binary found three different
+  clean-stop baselines, not one — MaxTransfer's own graceful cutoff costs
+  exactly 1, MaxDuration's fatal cutoff costs exactly 0, and godwitd's own
+  mid-run `job/stop` (the ledger guard firing before rclone's own
+  MaxTransfer, §4.3) costs up to one "context canceled" per in-flight
+  transfer slot — proven live at `Transfers=4` costing exactly 4 on an
+  otherwise clean stop. A hardcoded ">1" would have made every ledger-
+  triggered stop (the common path in practice) report "4 errors were also
+  logged" on a perfectly clean run — reintroducing the same false-alarm
+  class this release exists to fix, just reshaped. `godwit_cap_stop_
+  notification()` now takes an explicit `$baselineErrors` the caller
+  selects per path, and only a count *above* that path's own baseline
+  reads as "something beyond the cutoff itself also failed — check
+  /var/log/godwit.log."
 - **Skipped delete phase on a truncated run — investigated, not a bug.**
   The same host log showed `"not deleting files/directories as there were
   IO errors"` on both truncated jobs. Ground-truthed against rclone's
