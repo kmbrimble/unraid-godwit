@@ -131,18 +131,49 @@ normally thereafter; every finding was independently re-verified by
 direct code reading (and, for the two cutoff strings, against the real
 binary) before being fixed, not applied on trust.
 
-**Not yet verified on host (in progress):** the daemon's effective
-timezone (PHP defaults to UTC unless `date.timezone`/`/etc/timezone` says
-otherwise — a UTC daemon would run the 22:00–06:00 window at 08:00–16:00
-AEST); the Filing Cabinet smoke test (upload, re-run transferring ~0
-bytes, ledger recording); the Kieren exclusion dry-run against the real
-share tree; the live seed's first-5-minutes numbers (bytes flowing,
-bwlimit ≤ ~31 MiB/s, ledger increasing); and — now that the queue-
-advancement bug above is fixed — that the queue genuinely advances
-Filing Cabinet → Kieren → Teegan → Photos on the real host, not just in
-the fixture-driven tests. See the handback for results once this
-verification pass completes; this paragraph should be replaced with
-real evidence at that point, not left as a standing gap.
+**Host-verified 2026-09-17 22:28–22:42 AEST**, via
+`scripts/install-on-host.sh 0.3.0` plus direct CLI-PHP calls through
+`godwit_handle_job_action()`/`godwit_rc_call_params()` (the exact
+functions the web page and daemon use, not a bypass):
+- rclone.conf's non-token lines hashed to `c26f0adb…` before and after
+  the upgrade — unchanged, and still only `[gdrive]`.
+- The daemon's effective timezone logged as `Australia/Brisbane` on
+  startup (`grep 'effective timezone' /var/log/godwit.log`) — the host's
+  PHP defaults to UTC and has no `/etc/timezone`, so this is
+  `godwit_resolve_timezone()`'s hardcoded fallback landing correctly, not
+  an ini setting; confirmed the host's real clock (`date`) is AEST.
+- Filing Cabinet ran automatically the moment the daemon started (the
+  22:00–06:00 window was already open): completed in ~3m16s, 135,775,764
+  bytes, 237 files, 0 errors. `operations/size` on
+  `gdrive:godwit/Filing Cabinet` read back the identical
+  `{"bytes":135775764,"count":237}`; a recursive `operations/list`
+  (247 entries incl. directories) contained zero `.DS_Store`/`._*` names.
+  A second sync of the same job transferred **0 bytes, 0 files** in 2.1s
+  — confirmed idempotent.
+- Kieren's exclusion filter, applied read-only via `operations/list`
+  with `_filter.FilterFrom` against the real `/mnt/user/Kieren` tree (no
+  upload, no `dry_run` job even started), returned zero entries under
+  `TimeMachine/` or `Backup/BombVault/` — the filter file's actual
+  content (`- /TimeMachine/**`, `- /Backup/BombVault/**`, plus the global
+  Mac-junk excludes) was printed and matches `godwit_compile_filter_rules()`
+  exactly.
+- Kieren/Teegan/Photos enabled via the real `jobs_save` action, then
+  `run_now` triggered via the real `run_now` action (both exactly as the
+  page would post them). godwitd picked up the change within 30s and
+  **the queue advanced correctly: Filing Cabinet → Kieren**, confirming
+  the blocking queue-advancement bug is fixed live, not just in tests.
+  Observed for ~5 minutes across three polls: bytes climbed
+  535MB → 3.35GB → 7.33GB, `core/stats` speed held at 29.4–29.8 MiB/s
+  (the 250 Mbit/s bwlimit, never exceeding it), and the gdrive ledger's
+  `used_24h_bytes` tracked the same growth (671MB → 3.49GB → 7.46GB).
+  **Left running** per D15 — Teegan and Photos will follow once Kieren's
+  remote frees up, still inside tonight's session.
+- `/var/run/godwit/rcd.log` is `-rw-r--r--` (0644, world-readable) and
+  contains zero matches for `client_secret`/`refresh_token`/`access_token`.
+- Exactly one `godwitd` and one bundled `rcd` process throughout.
+- rclone.conf's non-token hash re-confirmed unchanged after the full
+  sequence above (upgrade, two smoke-test syncs, the exclusion read, and
+  ~7.5 GB of real Kieren upload): still `c26f0adb…`, still only `[gdrive]`.
 
 See PLAN.md §5 for the remaining phases.
 
