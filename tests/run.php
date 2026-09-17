@@ -2960,30 +2960,45 @@ t('v0.4.3 end-to-end against a real rcd: a genuine per-file error masking the Ma
 
     $shareRoot = $tmp . '/mnt-user';
     $src = $shareRoot . '/Photos';
-    mkdir($src . '/subdirA', 0755, true);
-    mkdir($src . '/subdirB', 0755, true);
-    // Many small files (like a real photo share), all individually well
-    // within budget, so the cutoff lands close to MaxTransfer rather than
-    // being bounded by one huge file's size — the same shape that produced
-    // the real host's 0.003%-scale shortfall.
-    $subdirATotal = 0;
+    mkdir($src, 0755, true);
+    // Many small files in a SINGLE flat directory (like a real photo
+    // share), all individually well within budget, so the cutoff lands
+    // close to MaxTransfer rather than being bounded by one huge file's
+    // size — the same shape that produced the real host's 0.003%-scale
+    // shortfall. Deliberately NOT split across subdirectories with one
+    // oversized file in a second directory: an earlier version of this
+    // test did that, and rclone's march can discover the oversized file
+    // BEFORE any file in the other directory (directory traversal order
+    // is not guaranteed) — when that race lands that way, the cutoff
+    // trips on the very first candidate and cancels the whole job with
+    // zero bytes transferred and errorMsg "context canceled", which
+    // reproduced nothing about the masking bug and was flaky in CI
+    // (deterministic-but-different per machine/load, not "rare"). A flat
+    // directory of uniform-sized files has no such race: ground-truthed
+    // locally at 4/4 runs landing within ~0.15% of MaxTransfer.
+    $total = 0;
     for ($i = 0; $i < 400; $i++) {
         $sz = 900 + random_int(0, 200);
-        file_put_contents($src . "/subdirA/f$i.bin", random_bytes($sz));
-        $subdirATotal += $sz;
+        file_put_contents($src . "/f$i.bin", random_bytes($sz));
+        $total += $sz;
     }
     // A real, deterministic per-file error unrelated to the budget cutoff:
     // the destination path is pre-created as a DIRECTORY, so rclone's own
-    // attempt to write this file there fails with a genuine plain error —
-    // exactly the kind of error that outranks the cutoff's own NoRetryError
-    // in currentError()'s precedence and masks it in job/status's text.
-    file_put_contents($src . '/subdirA/badfile', random_bytes(500));
-    // subdirB is far too large to fit in what's left of the budget after
-    // subdirA — this is what actually triggers the MaxTransfer cutoff.
-    file_put_contents($src . '/subdirB/big.bin', random_bytes($subdirATotal * 5));
+    // attempt to write this file there fails with a genuine plain error
+    // ("can't move object - incompatible remotes", ground-truthed locally
+    // — not the cutoff's own NoRetryError text) — exactly the kind of
+    // error that outranks the cutoff's own NoRetryError in
+    // currentError()'s precedence and masks it in job/status's text.
+    file_put_contents($src . '/badfile', random_bytes(500));
+    // MaxTransfer at 60% of the real transferable total (ground-truthed
+    // locally, matching the measurements behind the 2% tolerance in
+    // godwit_bytes_near_max_transfer()'s docblock) — comfortably below
+    // the total so the cutoff genuinely fires partway through, not right
+    // at the end where a race could let everything finish first.
+    $maxTransfer = (int) ($total * 0.6);
 
     $dst = $tmp . '/dst';
-    mkdir($dst . '/subdirA/badfile', 0755, true); // the collision itself
+    mkdir($dst . '/badfile', 0755, true); // the collision itself
     $confPath = $tmp . '/rclone.conf';
     file_put_contents($confPath, "[localdst]\ntype = local\n");
     $sockPath = $tmp . '/rcd.sock';
@@ -3005,10 +3020,6 @@ t('v0.4.3 end-to-end against a real rcd: a genuine per-file error masking the Ma
         $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
         $filterFile = $tmp . '/filter.txt';
         godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
-        // Budget set to subdirA's real transferable total — everything that
-        // CAN transfer (subdirA minus the doomed badfile) should just about
-        // fit; subdirB (5x larger) cannot, so the cutoff genuinely fires.
-        $maxTransfer = $subdirATotal;
         $params = godwit_build_sync_params($job, $fs, $filterFile, $maxTransfer, null, null, false, $shareRoot);
         $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
         assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));

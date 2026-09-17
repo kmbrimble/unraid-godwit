@@ -516,6 +516,45 @@ explicit instruction (they installed and are verifying v0.4.2 live; no
 install, no daemon/rcd restart, no mutating rc call was made this
 session). The user installs v0.4.3 by hand once released.
 
+**v0.4.4 (2026-09-18) fixes v0.4.3's own new end-to-end test being flaky
+on main — found by the user, not by CI or this session's own review.**
+The user ran `php tests/run.php` from `/projects/unraid-godwit` at the
+released v0.4.3 tag 5 times: all 5 failed, always the same test, always
+the same shape (`bytes (0)`, `errorMsg = 'context canceled'`). Reproduced
+by hand against the bundled v1.75.1 binary directly (`rclone rcd` + raw
+`curl` rc calls, not the PHP harness) before touching any code, per the
+user's explicit instruction to find the cause rather than guess: the
+test's source tree split many small files into one subdirectory and a
+single oversized file (5x the transferable total) into a second, to force
+the MaxTransfer cutoff. rclone's directory march has no guaranteed
+traversal order between the two — when it happens to discover the
+oversized file first, that one candidate alone already exceeds
+MaxTransfer, so CAUTIOUS's cutoff trips before the other directory is
+even listed, cancelling the whole sync context with zero bytes
+transferred and `errorMsg = "context canceled"`. This is not "rare
+flakiness" in the usual sense (intermittent pass/fail) — it is decided
+once, deterministically, by whatever order that machine's/that session's
+directory walk happens to use, which is why it passed 15/15 times in the
+worktree that wrote it and failed 5/5 times on a fresh checkout. Fixed by
+moving every file into a single flat directory of uniform sizes (no
+oversized outlier, no second directory to race against), with
+`MaxTransfer` set to 60% of the real transferable total — ground-truthed
+locally at 15/15 repeat runs landing within ~0.15% of `MaxTransfer`, the
+expected masking error text
+(`can't move object - incompatible remotes`, a genuine rclone error from
+the pre-created destination-directory collision — not the cutoff's own
+text) and exactly 2 errors, every time. No production code changed —
+`godwit_bytes_near_max_transfer()`, `godwit_classify_job_outcome()` and
+`godwit_job_status_label()` are byte-identical to v0.4.3; only the test
+harness that exercises them against a real rcd was rewritten.
+
+Verified offline: 260/260 (`php tests/run.php`), stable across 15 repeat
+runs (this release's own bug was exactly the kind of thing 3 repeats
+missed — 15 is deliberately generous). **Not verified this release**:
+nothing against the live Google Drive remote or the host — the user is
+still verifying v0.4.2/v0.4.3 live and explicitly asked for build+release
+only, no install, no daemon/rcd restart, no mutating rc call.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

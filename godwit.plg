@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.4.3">
+<!ENTITY version   "0.4.4">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,13 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.4.4
+- No functional change. Fixed v0.4.3's own new end-to-end test being
+  flaky on a fresh checkout (found by the user running it 5 times after
+  installing the release): its scenario relied on directory traversal
+  order that isn't guaranteed, so the test sometimes failed to reproduce
+  the masking behaviour it exists to prove. Rewritten as a single-directory
+  scenario that reproduces reliably (15/15 local repeats).
 ###0.4.3
 - Fixed v0.4.2's budget threshold and calm status wording never actually
   engaging: a run that hit the daily upload cap AND had ordinary file
