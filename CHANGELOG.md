@@ -10,6 +10,8 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-17
+
 ### Fixed
 
 Found live on the host during 0.2.0's own verification (host verification

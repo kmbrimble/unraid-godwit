@@ -17,6 +17,37 @@ leaving exactly `godwit-0.1.3.txz` and an untouched `rclone.conf` (sha256
 unchanged, still the empty-file hash), one `godwitd` and one bundled `rcd`
 running, socket present, heartbeat advancing across the restart. A real
 reboot/array-stop test is still outstanding — see "Deploy and verify" below.
+
+**Phase 2 (Remotes) is built and verified on the host** (v0.2.1, verified
+2026-09-17). The live `[gdrive]` remote (real Google Drive credentials,
+created by hand before this phase) was backed up to a root-only `/tmp` file
+and hashed before any host action. Verified: upgrading 0.1.3 → 0.2.0 → 0.2.1
+via `scripts/install-on-host.sh`; the health check ran automatically on
+daemon startup against the real `gdrive` remote and stored `status=ok,
+total=5497558138880 (5 TiB), used=780484589 (~744 MiB)` in
+`/mnt/cache/appdata/godwit/godwit.db`'s new `remotes_health` table; the
+`remotes_list` web action (exercised via CLI-PHP, matching earlier phases)
+returned that remote with no client_id/client_secret/token value present —
+confirmed by grepping the JSON response for both secrets' prefixes (0
+matches); uninstalling preserved `rclone.conf` with the exact same non-token
+line content (`grep -v '^token' | sha256sum` matched before/after — a
+mid-verification token refresh legitimately changed the full-file hash, not
+a fault, see CHANGELOG 0.2.0/0.2.1) and `gdrive` still reported `ok` after
+reinstalling; exactly one `godwitd` and one bundled `rcd` throughout, socket
+present, heartbeat advancing. **0.2.1 exists because host verification
+itself caught a bug 0.2.0's review passes missed**: rcd's generated
+`--rc-user`/`--rc-pass` were visible on the process's command line via
+`ps aux`/`/proc/PID/cmdline` to any other local process — fixed by moving
+them to `RCLONE_RC_USER`/`RCLONE_RC_PASS` environment variables, and
+reverified live (`ps aux` shows no credentials, `/proc/PID/environ` shows
+`RCLONE_RC_USER` instead, health check against `gdrive` still succeeds).
+The `/tmp` backup was deleted once the live file was confirmed intact.
+**Not verified this phase:** live OneDrive remote creation (no OneDrive
+token was available this session — the creation path is tested against
+fixtures ground-truthed against the bundled rclone binary locally, see
+CHANGELOG 0.2.0) and sending a real Unraid notification (not required by
+this phase's scope). The real reboot/array-stop test from Phase 1 is still
+outstanding — unchanged by this phase.
 See PLAN.md §5 for the remaining phases.
 
 ## Test command
