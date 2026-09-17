@@ -10,6 +10,37 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+### Plan — OneDrive drive picker + token-expiry pre-check (2026-09-17)
+
+Kieren's live 0.2.3 run hit two issues on a real OneDrive personal account:
+an expired-token config-walk failure (`couldn't fetch token: Post "":
+unsupported protocol scheme ""` — an upstream rclone bug: `Config()` in
+`backend/onedrive/onedrive.go` uses the package-global `oauthConfig`, whose
+TokenURL/AuthURL are only filled in by `makeOauthConfig()` for state `""`,
+so a refresh attempt after that posts to `""`), and the "cannot choose
+automatically" ambiguity error 0.2.3 added when his account has six
+personal-labelled drives.
+
+Plan:
+1. Replace the ambiguity error with a stateless drive picker: multiple
+   `config_driveid` Examples → roll back the half-created remote (same
+   `config/delete` pattern already used for other walk failures) and return
+   `{choose_drive: [...], suggested}`. `Godwit.page` renders a radio list
+   pre-selecting `suggested` (the entry named exactly "OneDrive", if any)
+   with a "Use this drive" button that resubmits the same add plus
+   `drive_id`. The walker accepts `drive_id`, matches it against the
+   offered Examples, and drops the old "uniquely personal" heuristic (no
+   longer needed with a picker). A single-drive account still auto-selects.
+2. Pre-check the pasted token's `expiry` field before ever calling rcd for
+   an add or reauth; refuse an already-expired (or <5min-left) token with a
+   friendly, provider-appropriate message instead of letting the walk fail
+   opaquely. Classify rclone's `unsupported protocol scheme ""` text into
+   the same friendly message in case the token expires mid-walk instead.
+3. Files: `plugin/scripts/lib.php` (`godwit_choose_onedrive_drive`,
+   `godwit_walk_config_state`, `godwit_handle_remote_action`, new
+   `godwit_token_expiry_error`/`godwit_classify_walk_error` helpers),
+   `plugin/Godwit.page` (picker UI/JS), `tests/run.php`.
+
 ## [0.2.3] - 2026-09-17
 
 ### Fixed
