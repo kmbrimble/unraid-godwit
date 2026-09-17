@@ -527,12 +527,13 @@ while ($running) {
                 if (empty($job['enabled'])) {
                     continue;
                 }
-                $listResp = godwit_rc_call_params($rcd['listener'], 'operations/list', [
-                    'fs' => $job['remote'] . ':godwit/_versions/' . $job['share'],
-                    'opt' => json_encode(['dirsOnly' => true]),
-                ], 30);
-                $dirs = is_array($listResp['list'] ?? null) ? array_map(fn ($e) => (string) ($e['Name'] ?? ''), $listResp['list']) : [];
-                $candidates = godwit_versions_purge_candidates($dirs, $retainDays, $nowDt);
+                $versionsFs = $job['remote'] . ':godwit/_versions/' . $job['share'];
+                $listResult = godwit_list_versions_dirs($rcd['listener'], $versionsFs);
+                if (isset($listResult['error'])) {
+                    godwit_log($logFile, "retention purge: operations/list failed for $versionsFs: {$listResult['error']}");
+                    continue;
+                }
+                $candidates = godwit_versions_purge_candidates($listResult['dirs'], $retainDays, $nowDt);
                 foreach ($candidates as $dateDir) {
                     try {
                         $purgeParams = godwit_purge_call_params($job['remote'], $job['share'], $dateDir);

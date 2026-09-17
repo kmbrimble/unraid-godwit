@@ -1374,6 +1374,23 @@ t('Godwit.page: the message div sits right under the remotes table, before the A
     assert_true($listPos < $msgPos && $msgPos < $driveFormPos, 'the message div must appear between the remotes table and the Add forms');
 });
 
+t('Godwit.page: godwitAdd()\'s success path never closes the dialog it just wrote the confirmation message into', function () use ($repoRoot) {
+    // Regression guard for a real bug a 6-pass review caught (4/6 agreement):
+    // closing the dialog immediately after cfg.showMessage(...) hid the
+    // "Added X — checking connection…" confirmation the instant it
+    // appeared — the same swallowed-result failure class 0.2.2 fixed for
+    // the page-wide message div, just reintroduced per-dialog.
+    $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
+    $start = strpos($page, 'function godwitAdd(');
+    assert_true($start !== false, 'expected to find function godwitAdd(');
+    $end = strpos($page, "\nfunction ", $start + 1);
+    assert_true($end !== false, 'expected another top-level function after godwitAdd()');
+    $body = substr($page, $start, $end - $start);
+    $successMsgPos = strpos($body, "cfg.showMessage('<p style=\"color:green\">Added");
+    assert_true($successMsgPos !== false, 'expected the success-path confirmation message in godwitAdd()');
+    assert_true(!str_contains(substr($body, $successMsgPos), "dialog('close')"), 'godwitAdd() must not close the dialog after showing the success message — the user would never see it: ' . $body);
+});
+
 // --- godwit_extract_token_json(): tolerates the rclone authorize paste wrapper ---
 
 t('godwit_extract_token_json: extracts JSON from the exact rclone authorize paste wrapper', function () {
@@ -2052,6 +2069,39 @@ t('godwit_time_in_window: respects the weekday list on a midnight-wrap window', 
     assert_true(!godwit_time_in_window($w, godwit_test_dt('2026-09-15 23:00:00')), 'Tuesday 23:00 is outside — Tuesday is not a window day');
 });
 
+t('godwit_time_in_window: days[] index N matches the Nth day label the settings-page UI shows (0=Sun...6=Sat)', function () use ($repoRoot) {
+    // The UI's day checkboxes are labelled from this literal array in
+    // Godwit.page — this test proves that array's index really is the
+    // weekday godwit_time_in_window() will match, so mislabelling a
+    // checkbox can never silently shift the schedule.
+    $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
+    assert_true(
+        preg_match("/godwitDayLabels\s*=\s*\[\s*'Sun',\s*'Mon',\s*'Tue',\s*'Wed',\s*'Thu',\s*'Fri',\s*'Sat'\s*\]/", $page) === 1,
+        'expected godwitDayLabels = [\'Sun\',\'Mon\',...,\'Sat\'] in Godwit.page'
+    );
+    // 2026-09-13 is a Sunday; the following six dates are Mon..Sat.
+    $datesByIndex = [
+        0 => '2026-09-13', 1 => '2026-09-14', 2 => '2026-09-15', 3 => '2026-09-16',
+        4 => '2026-09-17', 5 => '2026-09-18', 6 => '2026-09-19',
+    ];
+    foreach ($datesByIndex as $index => $date) {
+        $w = ['days' => [$index], 'start' => '00:00', 'end' => '00:00', 'limit_mbit' => 100.0];
+        assert_true(godwit_time_in_window($w, godwit_test_dt($date . ' 12:00:00')), "days=[$index] should be active on $date (all-day window)");
+        foreach ($datesByIndex as $otherIndex => $otherDate) {
+            if ($otherIndex === $index) { continue; }
+            assert_true(!godwit_time_in_window($w, godwit_test_dt($otherDate . ' 12:00:00')), "days=[$index] should NOT be active on $otherDate");
+        }
+    }
+});
+
+t('windows_form_test.mjs (node): windows-form JS round-trip and validation', function () use ($repoRoot) {
+    exec('command -v node', $ignored, $nodeMissing);
+    assert_true($nodeMissing === 0, 'node is required to run tests/windows_form_test.mjs — install Node.js (present on ubuntu-latest CI runners)');
+    $cmd = 'node ' . escapeshellarg($repoRoot . '/tests/windows_form_test.mjs') . ' 2>&1';
+    exec($cmd, $output, $exitCode);
+    assert_true($exitCode === 0, "windows_form_test.mjs failed:\n" . implode("\n", $output));
+});
+
 t('godwit_active_window: returns null outside every window', function () {
     assert_eq(null, godwit_active_window(godwit_default_windows(), godwit_test_dt('2026-09-17 12:00:00')), 'midday should be outside the D12 default');
 });
@@ -2273,6 +2323,61 @@ t('godwit_assert_purge_path: refuses a remote name containing a colon or slash',
             assert_true(true, 'threw as expected');
         }
     }
+});
+
+// --- godwit_list_versions_dirs() (issue #1: retention purge never ran) --
+
+t('godwit_list_versions_dirs: always sends remote alongside fs (the missing param that broke every retention tick)', function () {
+    $sent = null;
+    $call = function (array $listener, string $rcPath, array $params, int $timeout) use (&$sent) {
+        $sent = $params;
+        return ['list' => []];
+    };
+    godwit_list_versions_dirs(['type' => 'unix', 'path' => '/x'], 'gdrive:godwit/_versions/Kieren', $call);
+    assert_true(array_key_exists('remote', $sent), 'operations/list must always be called with a remote key, even if empty — rcd 400s "Didn\'t find key \"remote\" in input" without it');
+    assert_eq('', $sent['remote'], 'remote should be the empty string (the root of fs), not an arbitrary path');
+    assert_eq('gdrive:godwit/_versions/Kieren', $sent['fs'], 'fs should be unchanged');
+});
+
+t('godwit_list_versions_dirs: extracts dir names from a successful list response', function () {
+    $call = fn () => ['list' => [['Name' => '2026-08-01', 'IsDir' => true], ['Name' => '2026-08-02', 'IsDir' => true]]];
+    $result = godwit_list_versions_dirs(['type' => 'unix', 'path' => '/x'], 'gdrive:godwit/_versions/Kieren', $call);
+    assert_eq(['2026-08-01', '2026-08-02'], $result['dirs'], 'expected both dir names extracted');
+    assert_true(!isset($result['error']), 'a clean list must not carry an error');
+});
+
+t('godwit_list_versions_dirs: "directory not found" is absent, not an error — normal before the first versioned overwrite', function () {
+    $call = fn () => ['error' => 'error in ListJSON: directory not found'];
+    $result = godwit_list_versions_dirs(['type' => 'unix', 'path' => '/x'], 'gdrive:godwit/_versions/Kieren', $call);
+    assert_eq([], $result['dirs'], 'absent means no dirs');
+    assert_eq(true, $result['absent'] ?? false, 'a not-yet-existing _versions dir must be flagged absent, not error');
+    assert_true(!isset($result['error']), 'absent must not also carry an error — the caller must stay quiet, not log');
+});
+
+t('godwit_list_versions_dirs: a malformed response (no list, no error) is a loud error, never a silent empty candidate list', function () {
+    $call = fn () => [];
+    $result = godwit_list_versions_dirs(['type' => 'unix', 'path' => '/x'], 'gdrive:godwit/_versions/Kieren', $call);
+    assert_eq([], $result['dirs'], 'a malformed response must not silently become an empty-but-successful candidate list');
+    assert_true(!empty($result['error']), 'a response with neither list nor error must still surface as an error, not silently become "nothing to purge"');
+});
+
+t('godwit_list_versions_dirs: a genuine rc error (not "directory not found") is a loud error', function () {
+    $call = fn () => ['error' => 'authentication must be set up on the rc server'];
+    $result = godwit_list_versions_dirs(['type' => 'unix', 'path' => '/x'], 'gdrive:godwit/_versions/Kieren', $call);
+    assert_eq([], $result['dirs'], 'a real error must not surface as a candidate list');
+    assert_true(!empty($result['error']), 'a real rc error must surface, not be swallowed');
+    assert_true(!isset($result['absent']), 'only "directory not found" is absent — any other error must not be mistaken for it');
+});
+
+t('godwitd: the retention purge logs operations/list errors instead of silently treating them as "nothing to purge"', function () use ($repoRoot) {
+    $src = file_get_contents($repoRoot . '/plugin/scripts/godwitd');
+    $start = strpos($src, 'Version retention purge');
+    assert_true($start !== false, 'expected to find the retention purge block');
+    $end = strpos($src, "\n        }\n\n        // Its own counter", $start);
+    assert_true($end !== false, 'expected the end of the retention purge block');
+    $body = substr($src, $start, $end - $start);
+    assert_true(str_contains($body, 'godwit_list_versions_dirs('), 'retention purge must call godwit_list_versions_dirs(), not a hand-built operations/list call');
+    assert_true(str_contains($body, "isset(\$listResult['error'])") && str_contains($body, 'godwit_log('), 'a failed list must be logged, not silently skipped');
 });
 
 // --- Notifications -----------------------------------------------------
@@ -2527,6 +2632,69 @@ t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --
     }
 });
 
+t('godwit_list_versions_dirs: end-to-end against a real rcd — lists real date dirs, and a not-yet-created share is absent, not an error', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return; // not cached locally — covered by host verification instead.
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-versions-list-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    assert_true(is_file($rclone), 'expected an unzipped rclone binary');
+
+    $root = $tmp . '/dst';
+    mkdir($root . '/godwit/_versions/Kieren/2026-08-01', 0755, true);
+    mkdir($root . '/godwit/_versions/Kieren/2026-08-02', 0755, true);
+    file_put_contents($root . '/godwit/_versions/Kieren/2026-08-01/f.txt', 'x');
+
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+    assert_true(file_exists($sockPath), 'rcd did not create its unix socket in time');
+
+    try {
+        // Red proof of issue #1: the exact pre-fix call (no `remote` key)
+        // is rejected outright by the real bundled binary, not by anything
+        // this suite assumes.
+        $buggyResp = godwit_rc_call_params($listener, 'operations/list', [
+            'fs' => 'localdst:' . $root . '/godwit/_versions/Kieren',
+            'opt' => json_encode(['dirsOnly' => true]),
+        ], 15);
+        assert_true(str_contains((string) ($buggyResp['error'] ?? ''), 'remote'), 'the pre-fix call shape (no remote key) must be rejected by the real rcd: ' . json_encode($buggyResp));
+
+        // Green: godwit_list_versions_dirs() sends `remote` and lists the
+        // real directories.
+        $result = godwit_list_versions_dirs($listener, 'localdst:' . $root . '/godwit/_versions/Kieren');
+        sort($result['dirs']);
+        assert_eq(['2026-08-01', '2026-08-02'], $result['dirs'], 'expected both real date dirs back: ' . json_encode($result));
+        assert_true(!isset($result['error']), 'a successful list must not carry an error: ' . json_encode($result));
+
+        // A share that has never had a versioned overwrite yet has no
+        // _versions dir at all — must be absent, not an error.
+        $absentResult = godwit_list_versions_dirs($listener, 'localdst:' . $root . '/godwit/_versions/NeverRunShare');
+        assert_eq([], $absentResult['dirs'], 'absent means no dirs');
+        assert_eq(true, $absentResult['absent'] ?? false, 'a share with no _versions dir yet must be absent, not an error: ' . json_encode($absentResult));
+        assert_true(!isset($absentResult['error']), 'absent must not also be an error: ' . json_encode($absentResult));
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
+});
+
 // --- godwit_build_jobs_status / godwit_handle_job_action --------------------
 
 t('godwit_build_jobs_status: a job with an open run row shows as running with live progress', function () {
@@ -2634,6 +2802,55 @@ t('godwit_handle_job_action: settings_save merges onto the existing on-disk sett
     $reloaded = godwit_load_settings($env['cfgDir']);
     assert_eq(123, $reloaded['budget_caps']['gdrive'], 'a partial settings_save must not clobber the previously-set budget cap');
     assert_eq('500/50', $reloaded['profile'], 'the field that was sent should still update');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: settings_save rejects a window with no day checked', function () {
+    $env = godwit_test_job_env();
+    $bad = ['windows' => [['days' => [], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => 100.0]]];
+    $result = godwit_handle_job_action('settings_save', ['settings' => json_encode($bad)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(str_contains($result['error'] ?? '', 'day'), var_export($result, true));
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: settings_save rejects a non-positive limit_mbit', function () {
+    $env = godwit_test_job_env();
+    foreach ([0, -5, 'nope'] as $badLimit) {
+        $bad = ['windows' => [['days' => [0], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => $badLimit]]];
+        $result = godwit_handle_job_action('settings_save', ['settings' => json_encode($bad)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+        assert_true(str_contains($result['error'] ?? '', 'limit_mbit'), 'limit_mbit=' . var_export($badLimit, true) . ' should be rejected: ' . var_export($result, true));
+    }
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: settings_save rejects malformed start/end but accepts start==end as "all day"', function () {
+    $env = godwit_test_job_env();
+    $bad = ['windows' => [['days' => [0], 'start' => '25:00', 'end' => '06:00', 'limit_mbit' => 100.0]]];
+    $result = godwit_handle_job_action('settings_save', ['settings' => json_encode($bad)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(str_contains($result['error'] ?? '', 'HH:MM'), var_export($result, true));
+
+    $allDay = ['windows' => [['days' => [0], 'start' => '09:00', 'end' => '09:00', 'limit_mbit' => 100.0]]];
+    $ok = godwit_handle_job_action('settings_save', ['settings' => json_encode($allDay)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(($ok['ok'] ?? false) === true, 'start==end ("all day") must remain a valid, expressible window: ' . var_export($ok, true));
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: settings_save round-trips the default midnight-wrap window byte-identically with no edits', function () {
+    $env = godwit_test_job_env();
+    godwit_save_settings($env['cfgDir'], godwit_default_settings());
+    $before = file_get_contents($env['cfgDir'] . '/settings.json');
+
+    // The exact payload the windows-form JS builds from an untouched default
+    // row: same key order (days, start, end, limit_mbit) the form emits.
+    $formPayload = ['windows' => [['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => 250]], 'profile' => 'custom'];
+    $result = godwit_handle_job_action('settings_save', ['settings' => json_encode($formPayload)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(($result['ok'] ?? false) === true, var_export($result, true));
+
+    // profile differs (default settings start with no profile set), so scope
+    // the byte comparison to the windows the form actually round-tripped.
+    $before = json_decode($before, true);
+    $after = json_decode(file_get_contents($env['cfgDir'] . '/settings.json'), true);
+    assert_eq(json_encode($before['windows']), json_encode($after['windows']), 'an unedited round trip through the form must not change the stored windows bytes');
     exec('rm -rf ' . escapeshellarg($env['tmp']));
 });
 

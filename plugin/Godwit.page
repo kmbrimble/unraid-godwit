@@ -14,51 +14,71 @@ if (file_exists($pidFile)) {
 ?>
 <h1>Godwit</h1>
 <p>Phase 3 — Google full backup. This page manages rclone remotes, Google backup jobs, the daily upload budget and windows, and shows daemon status.</p>
+
+<details id="godwit-section-status" open>
+<summary><h2>Status</h2></summary>
 <p>Service status: <b><?= $running ? 'running' : 'stopped' ?></b></p>
 
 <button id="godwit-start" type="button">Start</button>
 <button id="godwit-stop" type="button">Stop</button>
 
 <div id="godwit-status">Loading status…</div>
+</details>
 
-<h2>Remotes</h2>
+<details id="godwit-section-remotes">
+<summary><h2>Remotes</h2></summary>
 <div id="godwit-remotes-list">Loading remotes…</div>
 <div id="godwit-remotes-message"></div>
 
-<h3>Add Google Drive</h3>
-<p>On another machine with a browser, run:</p>
-<pre>rclone authorize "drive" "&lt;CLIENT_ID&gt;" "&lt;CLIENT_SECRET&gt;"</pre>
-<p>Sign in as the account the Client ID/Secret belong to (see PLAN.md §3 for how to create them), then paste the
-whole block it prints — including the surrounding "Paste the following..." lines is fine — below. The client ID
-and secret are only ever sent to rcd; Godwit never returns them to this page once saved.</p>
-<div>
-    <label>Name <input type="text" id="drive-name" value="gdrive"></label><br>
-    <label>Client ID <input type="text" id="drive-client-id" size="60"></label><br>
-    <label>Client secret <input type="text" id="drive-client-secret" size="60"></label><br>
-    <label>Token JSON<br><textarea id="drive-token" rows="4" cols="70"></textarea></label><br>
-    <button id="drive-add" type="button">Add Google Drive remote</button>
+<p>
+    <button id="drive-add-open" type="button">Add Google Drive remote</button>
+    <button id="onedrive-add-open" type="button">Add OneDrive remote</button>
+</p>
+
+<div id="drive-add-dialog" style="display:none">
+    <h3>Add Google Drive</h3>
+    <p>On another machine with a browser, run:</p>
+    <pre>rclone authorize "drive" "&lt;CLIENT_ID&gt;" "&lt;CLIENT_SECRET&gt;"</pre>
+    <p>Sign in as the account the Client ID/Secret belong to (see PLAN.md §3 for how to create them), then paste the
+    whole block it prints — including the surrounding "Paste the following..." lines is fine — below. The client ID
+    and secret are only ever sent to rcd; Godwit never returns them to this page once saved.</p>
+    <div>
+        <label>Name <input type="text" id="drive-name" value="gdrive"></label><br>
+        <label>Client ID <input type="text" id="drive-client-id" size="60"></label><br>
+        <label>Client secret <input type="text" id="drive-client-secret" size="60"></label><br>
+        <label>Token JSON<br><textarea id="drive-token" rows="4" cols="70"></textarea></label><br>
+        <button id="drive-add" type="button">Add Google Drive remote</button>
+    </div>
+    <div id="drive-add-message"></div>
 </div>
 
-<h3>Add OneDrive (personal)</h3>
-<p>On another machine with a browser, run:</p>
-<pre>rclone authorize "onedrive"</pre>
-<p>A custom client ID/secret is optional — leave blank to use rclone's own default OneDrive app. Paste the whole
-block it prints — including the surrounding "Paste the following..." lines is fine — below. Godwit resolves the
-account's drive_id/drive_type itself via rclone's own config flow; see CHANGELOG 0.2.0 for how this was verified.</p>
-<div>
-    <label>Name <input type="text" id="onedrive-name" value="onedrive"></label><br>
-    <label>Client ID (optional) <input type="text" id="onedrive-client-id" size="60"></label><br>
-    <label>Client secret (optional) <input type="text" id="onedrive-client-secret" size="60"></label><br>
-    <label>Token JSON<br><textarea id="onedrive-token" rows="4" cols="70"></textarea></label><br>
-    <button id="onedrive-add" type="button">Add OneDrive remote</button>
+<div id="onedrive-add-dialog" style="display:none">
+    <h3>Add OneDrive (personal)</h3>
+    <p>On another machine with a browser, run:</p>
+    <pre>rclone authorize "onedrive"</pre>
+    <p>A custom client ID/secret is optional — leave blank to use rclone's own default OneDrive app. Paste the whole
+    block it prints — including the surrounding "Paste the following..." lines is fine — below. Godwit resolves the
+    account's drive_id/drive_type itself via rclone's own config flow; see CHANGELOG 0.2.0 for how this was verified.</p>
+    <div>
+        <label>Name <input type="text" id="onedrive-name" value="onedrive"></label><br>
+        <label>Client ID (optional) <input type="text" id="onedrive-client-id" size="60"></label><br>
+        <label>Client secret (optional) <input type="text" id="onedrive-client-secret" size="60"></label><br>
+        <label>Token JSON<br><textarea id="onedrive-token" rows="4" cols="70"></textarea></label><br>
+        <button id="onedrive-add" type="button">Add OneDrive remote</button>
+    </div>
+    <div id="onedrive-add-message"></div>
 </div>
+
 <div id="onedrive-picker" style="display:none">
     <p>Multiple OneDrive drives were found on this account. Choose one:</p>
     <div id="onedrive-picker-choices"></div>
     <button id="onedrive-picker-use" type="button">Use this drive</button>
+    <button id="onedrive-picker-cancel" type="button">Cancel</button>
 </div>
+</details>
 
-<h2>Jobs</h2>
+<details id="godwit-section-jobs" open>
+<summary><h2>Jobs</h2></summary>
 <div id="godwit-budget-bars">Loading budget…</div>
 <div id="godwit-jobs-table">Loading jobs…</div>
 <p>
@@ -68,8 +88,10 @@ account's drive_id/drive_type itself via rclone's own config flow; see CHANGELOG
     <button id="godwit-resume" type="button">Resume all</button>
 </p>
 <div id="godwit-jobs-message"></div>
+</details>
 
-<h3>Windows &amp; speed</h3>
+<details id="godwit-section-windows">
+<summary><h2>Windows &amp; speed</h2></summary>
 <p>Line profile:
     <select id="godwit-profile">
         <option value="1000/400">1000/400</option>
@@ -77,10 +99,22 @@ account's drive_id/drive_type itself via rclone's own config flow; see CHANGELOG
         <option value="custom">custom</option>
     </select>
 </p>
-<p>Windows — JSON array of <code>{"days":[0-6],"start":"HH:MM","end":"HH:MM","limit_mbit":N}</code> (day 0 = Sunday):<br>
-    <textarea id="godwit-windows" rows="3" cols="80"></textarea></p>
+<div id="godwit-windows-rows">Loading windows…</div>
+<p><button id="godwit-windows-add" type="button">Add window</button></p>
 <div id="godwit-profile-warning"></div>
 <button id="godwit-settings-save" type="button">Save windows/speed</button>
+</details>
+
+<details id="godwit-section-advanced">
+<summary><h2>Advanced</h2></summary>
+<h3>Raw windows JSON</h3>
+<p>Escape hatch: edit the JSON directly, then click "Apply JSON to form" to load it into the Windows &amp; speed
+form above (each window is <code>{"days":[0-6],"start":"HH:MM","end":"HH:MM","limit_mbit":N}</code>, day 0 =
+Sunday). Saving always uses the form's current values, not this textarea directly.</p>
+<textarea id="godwit-windows-json" rows="6" cols="80"></textarea>
+<p><button id="godwit-windows-json-apply" type="button">Apply JSON to form</button>
+<span id="godwit-windows-json-error" style="color:red"></span></p>
+</details>
 
 <script>
 function esc(s) {
@@ -206,6 +240,23 @@ function godwitShowJobsMessage(html) {
     document.getElementById('godwit-jobs-message').innerHTML = html;
 }
 
+function godwitShowDriveAddMessage(html) {
+    document.getElementById('drive-add-message').innerHTML = html;
+}
+
+function godwitShowOnedriveAddMessage(html) {
+    document.getElementById('onedrive-add-message').innerHTML = html;
+}
+
+// Which modal dialog and message div a remotes_add_<type> flow belongs to —
+// looked up by `type` so the OneDrive drive-picker's own "Use this drive"
+// submission (which reaches godwitAdd() the same way a fresh Add click
+// does) reports into the same dialog it was opened from.
+var godwitAddModalConfig = {
+    drive: { dialogId: 'drive-add-dialog', showMessage: godwitShowDriveAddMessage },
+    onedrive: { dialogId: 'onedrive-add-dialog', showMessage: godwitShowOnedriveAddMessage },
+};
+
 function godwitErrorHtml(message) {
     return '<p style="color:red">' + esc(message) + '</p>';
 }
@@ -289,7 +340,7 @@ function godwitDelete(btn) {
 }
 
 function godwitHideDrivePicker() {
-    document.getElementById('onedrive-picker').style.display = 'none';
+    $('#onedrive-picker').dialog('close');
 }
 
 function godwitShowDrivePicker(type, label, fieldIds, choices, suggested) {
@@ -303,8 +354,7 @@ function godwitShowDrivePicker(type, label, fieldIds, choices, suggested) {
     picker.dataset.type = type;
     picker.dataset.label = label;
     picker.dataset.fieldIds = JSON.stringify(fieldIds);
-    picker.style.display = '';
-    godwitShowMessage(godwitErrorHtml('Multiple OneDrive drives found — pick one below and click "Use this drive".'));
+    $(picker).dialog('open');
 }
 
 // $driveId, when set, is a choice made via the drive picker below and is
@@ -312,6 +362,7 @@ function godwitShowDrivePicker(type, label, fieldIds, choices, suggested) {
 // any failure, including "multiple drives found", so a resubmit doesn't
 // need the user to re-paste the token).
 function godwitAdd(type, label, fieldIds, driveId) {
+    var cfg = godwitAddModalConfig[type];
     var fields = {};
     Object.keys(fieldIds).forEach(function (key) { fields[key] = document.getElementById(fieldIds[key]); });
     var params = {
@@ -339,16 +390,21 @@ function godwitAdd(type, label, fieldIds, driveId) {
             return;
         }
         if (data.error) {
-            // Keep the fields on failure so the user can correct them.
-            godwitShowMessage(godwitErrorHtml(data.error));
+            // Keep the fields and the dialog open on failure so the user can
+            // correct them.
+            cfg.showMessage(godwitErrorHtml(data.error));
             return;
         }
         fields.client_secret.value = '';
         fields.token.value = '';
         godwitHideDrivePicker();
         var driveNote = data.drive ? ' — drive: ' + esc(data.drive) : '';
-        godwitShowMessage('<p style="color:green">Added ' + esc(data.name) + ' (' + esc(label) + ')' + driveNote + ' — checking connection…</p>');
-    });
+        // Deliberately does not auto-close the dialog: closing it would hide
+        // this confirmation the instant it's shown, the same
+        // swallowed-result regression 0.2.2 fixed for the page-wide message
+        // div. The user closes it once they've read the confirmation.
+        cfg.showMessage('<p style="color:green">Added ' + esc(data.name) + ' (' + esc(label) + ')' + driveNote + ' — checking connection…</p>');
+    }, cfg.showMessage, godwitRemotesRefresh);
 }
 
 function fmtDuration(s) {
@@ -357,23 +413,132 @@ function fmtDuration(s) {
     return h + 'h ' + m + 'm';
 }
 
+// GODWIT_WINDOWS_FORM_BEGIN
+// Dependency-free windows-form helpers, exercised directly (with no DOM) by
+// tests/windows_form_test.mjs, which extracts exactly this block. Keep it
+// free of document/window access.
+var godwitDayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function godwitHalfHourGrid() {
+    var opts = [];
+    for (var h = 0; h < 24; h++) {
+        opts.push((h < 10 ? '0' : '') + h + ':00');
+        opts.push((h < 10 ? '0' : '') + h + ':30');
+    }
+    return opts;
+}
+
+// A window (server schema) and a form row are the same shape; this only
+// exists to guarantee the JSON key order (days, start, end, limit_mbit) on
+// every save, since that's what keeps an unedited round trip
+// byte-identical to what was loaded.
+function godwitWindowToRow(w) {
+    return { days: (w.days || []).slice(), start: w.start, end: w.end, limit_mbit: w.limit_mbit };
+}
+
+function godwitRowToWindow(row) {
+    return {
+        days: row.days.slice().sort(function (a, b) { return a - b; }),
+        start: row.start,
+        end: row.end,
+        limit_mbit: typeof row.limit_mbit === 'number' ? row.limit_mbit : parseFloat(row.limit_mbit),
+    };
+}
+
+function godwitWindowsToRows(windows) { return (windows || []).map(godwitWindowToRow); }
+function godwitRowsToWindows(rows) { return rows.map(godwitRowToWindow); }
+
+// null = valid. Mirrors the settings_save server-side checks so bad input
+// never leaves the browser.
+function godwitValidateRow(row) {
+    if (!row.days || row.days.length === 0) { return 'each window needs at least one day ticked'; }
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(row.start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(row.end)) {
+        return 'start and end must be HH:MM';
+    }
+    var limit = typeof row.limit_mbit === 'number' ? row.limit_mbit : parseFloat(row.limit_mbit);
+    if (!isFinite(limit) || limit <= 0) { return 'speed limit must be a positive number'; }
+    return null;
+}
+// GODWIT_WINDOWS_FORM_END
+
 var godwitProfileUpstream = { '1000/400': 400, '500/50': 50 };
 // Windows/profile fields are only populated from the server on first load —
 // never on a later background refresh, or an in-progress edit would be
 // silently overwritten out from under the user (same reasoning as the
 // action-pending guard on godwitRemotesRefresh()).
 var godwitJobsLoaded = false;
+var godwitWindowRows = [];
 
 function godwitUpdateProfileWarning() {
     var upstream = godwitProfileUpstream[document.getElementById('godwit-profile').value];
     var el = document.getElementById('godwit-profile-warning');
     if (!upstream) { el.innerHTML = ''; return; }
-    var windows;
-    try { windows = JSON.parse(document.getElementById('godwit-windows').value); } catch (e) { el.innerHTML = ''; return; }
-    var worst = Math.max.apply(null, [0].concat((windows || []).map(function (w) { return w.limit_mbit || 0; })));
+    var worst = Math.max.apply(null, [0].concat(godwitWindowRows.map(function (r) { return parseFloat(r.limit_mbit) || 0; })));
     el.innerHTML = worst >= 0.8 * upstream
         ? '<p style="color:orange">Window limit ' + worst + ' Mbit/s is at or above 80% of this profile’s ' + upstream + ' Mbit/s upstream — uploads may saturate the line.</p>'
         : '';
+}
+
+function godwitSyncAdvancedJsonFromForm() {
+    document.getElementById('godwit-windows-json').value = JSON.stringify(godwitRowsToWindows(godwitWindowRows), null, 2);
+}
+
+function godwitSyncRowFromForm(rowIndex) {
+    var i = parseInt(rowIndex, 10);
+    var container = document.getElementById('godwit-windows-rows');
+    var row = godwitWindowRows[i];
+    row.days = Array.prototype.slice.call(container.querySelectorAll('.godwit-window-day[data-row="' + i + '"]:checked'))
+        .map(function (cb) { return parseInt(cb.dataset.day, 10); });
+    row.start = container.querySelector('.godwit-window-start[data-row="' + i + '"]').value;
+    row.end = container.querySelector('.godwit-window-end[data-row="' + i + '"]').value;
+    row.limit_mbit = container.querySelector('.godwit-window-limit[data-row="' + i + '"]').value;
+    godwitSyncAdvancedJsonFromForm();
+    godwitUpdateProfileWarning();
+}
+
+function godwitRenderWindowsForm() {
+    var container = document.getElementById('godwit-windows-rows');
+    var grid = godwitHalfHourGrid();
+    function optionsFor(value) {
+        var values = grid.slice();
+        // A time not on the half-hourly grid (e.g. hand-edited via the raw
+        // JSON) is never silently snapped to the nearest slot — it's kept
+        // selectable as an extra option instead.
+        if (values.indexOf(value) === -1) { values.unshift(value); }
+        return values.map(function (v) {
+            return '<option value="' + esc(v) + '"' + (v === value ? ' selected' : '') + '>' + esc(v) + '</option>';
+        }).join('');
+    }
+    container.innerHTML = godwitWindowRows.map(function (row, i) {
+        var days = godwitDayLabels.map(function (label, d) {
+            var checked = row.days.indexOf(d) !== -1 ? ' checked' : '';
+            return '<label><input type="checkbox" class="godwit-window-day" data-row="' + i + '" data-day="' + d + '"' + checked + '> ' + label + '</label>';
+        }).join(' ');
+        var allDayNote = row.start === row.end ? ' <em>(start == end means "all day")</em>' : '';
+        return '<div class="godwit-window-row" data-row="' + i + '" style="border:1px solid #ccc;padding:6px;margin-bottom:6px">' +
+            '<div>' + days + '</div>' +
+            '<label>Start <select class="godwit-window-start" data-row="' + i + '">' + optionsFor(row.start) + '</select></label> ' +
+            '<label>End <select class="godwit-window-end" data-row="' + i + '">' + optionsFor(row.end) + '</select></label>' + allDayNote + ' ' +
+            '<label>Limit (Mbit/s) <input type="text" inputmode="decimal" class="godwit-window-limit" data-row="' + i + '" value="' + esc(row.limit_mbit) + '" size="5"></label> ' +
+            '<button type="button" class="godwit-window-remove" data-row="' + i + '">Remove window</button>' +
+            '<div class="godwit-window-row-error" style="color:red"></div>' +
+            '</div>';
+    }).join('') || '<p>No windows configured — uploads never run automatically outside a "Run now". Add one below.</p>';
+
+    container.querySelectorAll('.godwit-window-day').forEach(function (cb) {
+        cb.addEventListener('change', function () { godwitSyncRowFromForm(cb.dataset.row); });
+    });
+    container.querySelectorAll('.godwit-window-start, .godwit-window-end, .godwit-window-limit').forEach(function (el) {
+        el.addEventListener('input', function () { godwitSyncRowFromForm(el.dataset.row); });
+        el.addEventListener('change', function () { godwitSyncRowFromForm(el.dataset.row); });
+    });
+    container.querySelectorAll('.godwit-window-remove').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            godwitWindowRows.splice(parseInt(btn.dataset.row, 10), 1);
+            godwitRenderWindowsForm();
+            godwitSyncAdvancedJsonFromForm();
+        });
+    });
 }
 
 function godwitJobsRefresh() {
@@ -421,8 +586,10 @@ function godwitJobsRefresh() {
                 '<th>Transfers</th><th>Excludes</th><th>Status</th><th>Queue</th></tr>' + rows + '</table>';
 
             if (!godwitJobsLoaded) {
-                document.getElementById('godwit-windows').value = JSON.stringify(data.settings.windows);
+                godwitWindowRows = godwitWindowsToRows(data.settings.windows);
                 document.getElementById('godwit-profile').value = data.settings.profile;
+                godwitRenderWindowsForm();
+                godwitSyncAdvancedJsonFromForm();
                 godwitJobsLoaded = true;
             }
             godwitUpdateProfileWarning();
@@ -458,14 +625,19 @@ function godwitJobsSave() {
 }
 
 function godwitSettingsSave() {
-    var windows;
-    try {
-        windows = JSON.parse(document.getElementById('godwit-windows').value);
-    } catch (e) {
-        godwitShowJobsMessage(godwitErrorHtml('Windows must be valid JSON: ' + e.message));
+    var errors = [];
+    godwitWindowRows.forEach(function (row, i) {
+        var err = godwitValidateRow(row);
+        if (err) { errors.push('Window ' + (i + 1) + ': ' + err); }
+    });
+    document.querySelectorAll('.godwit-window-row-error').forEach(function (el, i) {
+        el.textContent = godwitValidateRow(godwitWindowRows[i]) || '';
+    });
+    if (errors.length) {
+        godwitShowJobsMessage(godwitErrorHtml(errors.join('; ')));
         return;
     }
-    var settings = { windows: windows, profile: document.getElementById('godwit-profile').value };
+    var settings = { windows: godwitRowsToWindows(godwitWindowRows), profile: document.getElementById('godwit-profile').value };
     var btn = document.getElementById('godwit-settings-save');
     godwitRunAction('settings_save', { settings: JSON.stringify(settings) }, btn, 'Saving…', function (data) {
         if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
@@ -475,24 +647,43 @@ function godwitSettingsSave() {
 
 document.getElementById('godwit-jobs-save').addEventListener('click', godwitJobsSave);
 document.getElementById('godwit-settings-save').addEventListener('click', godwitSettingsSave);
+document.getElementById('godwit-windows-add').addEventListener('click', function () {
+    godwitWindowRows.push({ days: [0, 1, 2, 3, 4, 5, 6], start: '22:00', end: '06:00', limit_mbit: 100 });
+    godwitRenderWindowsForm();
+    godwitSyncAdvancedJsonFromForm();
+});
+document.getElementById('godwit-windows-json-apply').addEventListener('click', function () {
+    var el = document.getElementById('godwit-windows-json');
+    var errEl = document.getElementById('godwit-windows-json-error');
+    try {
+        var windows = JSON.parse(el.value);
+        if (!Array.isArray(windows)) { throw new Error('must be a JSON array'); }
+        windows.forEach(function (w, i) {
+            if (!Array.isArray(w.days)) { throw new Error('window ' + (i + 1) + ' needs a days array'); }
+        });
+        godwitWindowRows = godwitWindowsToRows(windows);
+        errEl.textContent = '';
+        godwitRenderWindowsForm();
+        godwitUpdateProfileWarning();
+    } catch (e) {
+        errEl.textContent = 'Invalid JSON: ' + e.message;
+    }
+});
 // Switching to a named profile sets a sensible default window ceiling —
 // ponytail: 70% of the profile's upstream, comfortably under the 80%
 // warning threshold rather than landing exactly on it. Kieren can still
 // type any number by hand afterwards; this only fires on an actual
 // dropdown change, never on page load, so it can't clobber a saved value.
-// "custom" leaves whatever is already in the windows field untouched.
+// "custom" leaves whatever is already in the windows form untouched.
 document.getElementById('godwit-profile').addEventListener('change', function () {
     var upstream = godwitProfileUpstream[this.value];
     if (upstream) {
-        try {
-            var windows = JSON.parse(document.getElementById('godwit-windows').value);
-            windows.forEach(function (w) { w.limit_mbit = Math.round(upstream * 0.7); });
-            document.getElementById('godwit-windows').value = JSON.stringify(windows);
-        } catch (e) { /* leave the windows field as-is if it isn't valid JSON right now */ }
+        godwitWindowRows.forEach(function (r) { r.limit_mbit = Math.round(upstream * 0.7); });
+        godwitRenderWindowsForm();
+        godwitSyncAdvancedJsonFromForm();
     }
     godwitUpdateProfileWarning();
 });
-document.getElementById('godwit-windows').addEventListener('input', godwitUpdateProfileWarning);
 document.getElementById('godwit-run-now').addEventListener('click', function () {
     godwitRunAction('run_now', {}, document.getElementById('godwit-run-now'), 'Starting…', function (data) {
         if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
@@ -514,6 +705,14 @@ document.getElementById('godwit-resume').addEventListener('click', function () {
 
 document.getElementById('godwit-start').addEventListener('click', function () { godwitPoll('start'); });
 document.getElementById('godwit-stop').addEventListener('click', function () { godwitPoll('stop'); });
+
+$('#drive-add-dialog').dialog({ autoOpen: false, modal: true, width: 620, title: 'Add Google Drive remote' });
+$('#onedrive-add-dialog').dialog({ autoOpen: false, modal: true, width: 620, title: 'Add OneDrive remote' });
+$('#onedrive-picker').dialog({ autoOpen: false, modal: true, width: 500, title: 'Choose a OneDrive drive' });
+
+document.getElementById('drive-add-open').addEventListener('click', function () { $('#drive-add-dialog').dialog('open'); });
+document.getElementById('onedrive-add-open').addEventListener('click', function () { $('#onedrive-add-dialog').dialog('open'); });
+document.getElementById('onedrive-picker-cancel').addEventListener('click', function () { godwitHideDrivePicker(); });
 
 document.getElementById('drive-add').addEventListener('click', function () {
     godwitAdd('drive', 'Google Drive', {

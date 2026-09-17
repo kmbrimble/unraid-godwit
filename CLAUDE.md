@@ -175,6 +175,61 @@ functions the web page and daemon use, not a bypass):
   sequence above (upgrade, two smoke-test syncs, the exclusion read, and
   ~7.5 GB of real Kieren upload): still `c26f0adb…`, still only `[gdrive]`.
 
+**v0.4.0 (built and offline-verified, 2026-09-18) is a settings-page UX
+rework plus one real bugfix, built while a live Google Drive seed
+(job_runs id 2, "Kieren") was running on the host — host access this
+session was scoped to read-only inspection (`ps`, `tail
+/var/log/godwit.log`, `ssh` greps of the host's own `/usr/local/emhttp`
+webGui files) specifically to avoid re-uploading budget mid-seed; no
+install, no daemon/rcd restart, no mutating rc call was made.** Verified
+offline: 210/210 PHP tests (`php tests/run.php`) plus 10/10 Node checks
+(`node tests/windows_form_test.mjs`, now wired into the PHP suite).
+
+- **UX**: Add Google Drive/Add OneDrive/the OneDrive drive picker are now
+  jQuery UI `.dialog()` modals; Status/Remotes/Jobs/Windows and
+  speed/Advanced are collapsible. Which stock unRAID mechanism and how it
+  was verified: jQuery UI is confirmed loaded globally by reading the
+  host's `/usr/local/emhttp/webGui/include/DefaultPageLayout.php` (line
+  142: a plain synchronous `<script src=".../dynamix.js">` in `<head>`,
+  before the page body) and confirming `dynamix.js` itself is the jQuery UI
+  bundle (`grep 'V.ui.version' dynamix.js` → `"1.14.1"`), plus finding
+  `.dialog({modal:true,...})` already used the same way on stock pages
+  (`dynamix/DeviceInfo.page`, `dynamix.vm.manager/VMMachines.page`). No
+  stock collapsible/accordion widget was found anywhere in
+  `webGui`/`dynamix*` (`slideToggle`, `.collapse(`, `<details` all came up
+  empty except one unrelated third-party plugin) — native
+  `<details>/<summary>` is therefore a documented negative, not a stock
+  mechanism, which is why it was chosen. The Windows and speed section
+  became a generated form; day-index-to-weekday correctness is proven by a
+  test that exercises `godwit_time_in_window()` itself across all 7
+  indices, not just the label text.
+- **Bugfix (issue #1, folded into this release)**: `godwitd`'s version
+  retention purge had never actually deleted anything since Phase 3 shipped
+  — `operations/list` was called without the `remote` param rclone
+  requires, so rcd rejected every call and the candidate list was always
+  empty. Found by the user reading `/var/run/godwit/rcd.log` during the
+  live seed. Fixed via a new `godwit_list_versions_dirs()` helper with a
+  tagged `dirs`/`absent`/`error` result, ground-truthed against the real
+  bundled rclone v1.75.1 binary through a local-backend rcd fixture (the
+  pre-fix call shape proven rejected, the fix proven to list real
+  directories and correctly treat a never-run share as absent rather than
+  an error).
+- **Review**: two rounds of `code-diff-reviewer` (6 passes each, unattended
+  MID band, score 7 both times). Round 1 (UX alone): 6× NO FINDINGS. Round
+  2 (UX + the retention fix together): a real bug at 4/6 agreement —
+  `godwitAdd()`'s success path immediately closed the dialog it had just
+  written a confirmation message into, hiding it — fixed and pinned with a
+  regression test proven red on the pre-fix code. See CHANGELOG.md 0.4.0
+  for the full detail on both rounds.
+
+**Not verified this release** (unchanged from prior phases, plus): no live
+browser exercise of the new modals/collapsible sections/generated form —
+this was a headless session with a live seed running, so all UI
+verification is via source-shape regression tests and the reasoning above,
+not a real click-through. The user should confirm this in a real browser
+before/while installing. The real reboot/array-stop test from Phase 1
+remains outstanding.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command
@@ -185,7 +240,10 @@ php tests/run.php
 
 (Requires `php-cli`, `php-sqlite3`, `php-curl`; `apt-get install -y php-cli
 php-sqlite3 php-curl` if missing. `scripts/build-plugin.sh` additionally
-needs `curl`, `unzip` and `xz-utils`.)
+needs `curl`, `unzip` and `xz-utils`. As of 0.4.0 this also requires `node`
+(present by default on `ubuntu-latest` CI runners) — `tests/run.php` shells
+out to `node tests/windows_form_test.mjs` and hard-fails, not skips, if
+`node` is missing.)
 
 ## Deploy and verify
 

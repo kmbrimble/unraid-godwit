@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.3.0">
+<!ENTITY version   "0.4.0">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,21 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.4.0
+- Fixed: version retention purge never ran (rcd rejected operations/list
+  for missing the required remote param, so old Drive versions were never
+  cleaned up). See CHANGELOG.md for detail.
+- Settings page UX rework: no functional change to the job engine, budget
+  ledger or scheduling semantics. Adding a Google Drive or OneDrive remote,
+  and the OneDrive drive picker, are now jQuery UI dialogs instead of
+  inline page furniture, with their own persistent success/error message
+  areas that stay open on error. The page is grouped into collapsible
+  Status/Remotes/Jobs/Windows and speed/Advanced sections (native
+  details/summary), with Status and Jobs open by default. The Windows and
+  speed section is now a generated form (day-of-week checkboxes, half-hourly
+  start/end dropdowns, a speed field) instead of a raw JSON textarea; the
+  raw JSON is still available, kept in sync, in the collapsed Advanced
+  section as an escape hatch.
 ###0.3.0
 - Phase 3: Google full backup. One job per share (Filing Cabinet, Kieren,
   Teegan, Photos) syncing /mnt/user/&lt;share&gt; to gdrive:godwit/&lt;share&gt;

@@ -10,6 +10,151 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-18
+
+### Fixed
+
+- **Retention purge never ran (issue #1).** `godwitd`'s version-retention
+  purge called `operations/list` with only `fs`, but rclone's rc endpoint
+  requires `fs` **and** `remote` (the path within that fs, `""` for the
+  root) — rcd rejected every call outright with `Didn't find key "remote"
+  in input`, so `$dirs` was always empty and the 30-day retention purge has
+  never deleted a single version, silently, since Phase 3 shipped. Found by
+  inspection of `/var/run/godwit/rcd.log` on the host during the first live
+  Google seed (four identical errors per retention tick, one per enabled
+  job). Fixed by extracting the call into `godwit_list_versions_dirs()`
+  (`plugin/scripts/lib.php`), which always sends `remote => ''` and returns
+  a tagged result: `dirs` on success, `absent => true` when the `_versions`
+  directory doesn't exist yet (normal before a share's first versioned
+  overwrite — ground-truthed against the real bundled rclone binary as
+  `error in ListJSON: directory not found`, so this case stays quiet), or
+  `error` on anything else, which `godwitd` now logs instead of silently
+  treating as "nothing to purge". Ground-truthed against the real bundled
+  rclone v1.75.1 binary via a local-backend rcd fixture: the exact pre-fix
+  call shape is proven rejected (red), then the fixed call lists real
+  on-disk date directories and correctly reports a never-run share as
+  absent rather than an error (green). Five additional unit tests exercise
+  the tagged-result branches with an injected `$call`, and a source-shape
+  test confirms `godwitd`'s retention block both calls the new helper and
+  logs on `error`. This touches `plugin/scripts/godwitd`, outside this
+  release's original front-end-only scope — called out here because it
+  fixes a real, host-observed bug rather than a UX change.
+
+### Changed
+
+Settings page UX rework (front-end/PHP entry points only — **no change to
+the job engine, budget ledger or scheduling semantics**).
+
+- **Modals.** "Add Google Drive remote" and "Add OneDrive remote" now open
+  a jQuery UI dialog (`.dialog({modal:true,...})` — confirmed as the stock
+  unRAID 7.3.1 webGUI convention by reading the host's
+  `/usr/local/emhttp/webGui/include/DefaultPageLayout.php` (loads
+  `jquery.ui.css` globally) and finding `.dialog(...)` already used the
+  same way on stock pages such as `dynamix/DeviceInfo.page` and
+  `dynamix.vm.manager/VMMachines.page`; SweetAlert (`swal()`) is also
+  stock but jQuery UI dialog was the closer fit for a form-with-fields
+  modal) instead of inline page furniture. Each dialog keeps its own
+  message div (`#drive-add-message` / `#onedrive-add-message`); both error
+  and success leave the dialog open so the message can actually be read (a
+  6-pass review at 4/6 agreement caught a first draft that auto-closed the
+  dialog immediately after writing the success message into it, hiding it
+  instantly — exactly the swallowed-result class 0.2.2 fixed for the
+  page-wide message div; a source-shape regression test now pins this).
+  The 0.2.2 persistent-message behaviour is preserved, just scoped
+  per-dialog instead of to the page-wide `#godwit-remotes-message`, which
+  still serves Test/Reauth/Delete. The OneDrive drive picker (0.2.4) is now the same kind of
+  dialog, with the existing radio list (suggested drive preselected) plus
+  a new Cancel button; jQuery UI moves dialog content in the DOM but never
+  changes element ids, so `godwitAdd()`/`godwitRunAction()` needed no
+  rewrite.
+- **Collapsible sections.** Status, Remotes, Jobs, Windows & speed and
+  Advanced are now native `<details>/<summary>` sections — grepping the
+  installed stock webGui/dynamix pages for an accordion/collapse widget
+  (`slideToggle`, `.collapse(`, `<details`) turned up nothing beyond one
+  third-party plugin, so this is a documented native-HTML choice, not a
+  stock unRAID mechanism. Status and Jobs default open; Remotes, Windows &
+  speed and Advanced default closed.
+- **Windows & speed form.** The raw JSON textarea is replaced by a
+  generated form: one row per window with seven day-of-week checkboxes
+  (labelled from `godwitDayLabels = ['Sun','Mon',...,'Sat']`, index 0 =
+  Sunday, matching `godwit_time_in_window()`'s use of PHP's `w` — proven
+  by a test that checks all 7 index→weekday pairings via
+  `godwit_time_in_window()` itself, not just the label text), a start/end
+  half-hourly dropdown (00:00–23:30, 48 slots), and a Mbit/s speed field.
+  Add-window/Remove-window buttons. `start == end` ("all day") remains
+  reachable and is labelled in the UI, not hidden as if a mistake. A time
+  outside the half-hourly grid (from a pre-existing hand-edited raw JSON
+  window) is added as an extra select option rather than silently snapped
+  to the nearest slot. The line-profile dropdown and its 80%-of-upstream
+  warning are now driven by the form's in-memory rows instead of parsing
+  the old textarea. The raw JSON is still editable as an escape hatch in
+  the collapsed Advanced section (`#godwit-windows-json` +
+  "Apply JSON to form"), kept in sync with the form on every form change;
+  Save always serializes from the form, never from the textarea directly.
+- **Server-side validation added at the `settings_save` trust boundary**
+  (`godwit_handle_job_action()` in `plugin/scripts/lib.php`): each window
+  now needs at least one day, `days` entries must be integers 0-6,
+  `start`/`end` must match `HH:MM` (00:00-23:59), and `limit_mbit` must be
+  a positive number — mirroring the client-side checks so a malformed
+  direct API call can't reach the daemon's schedule loop either.
+
+### Tests
+
+- `tests/windows_form_test.mjs` (new, run via `node`, wired into
+  `php tests/run.php` as its one documented test command): extracts the
+  dependency-free windows-form functions from `plugin/Godwit.page` between
+  `GODWIT_WINDOWS_FORM_BEGIN`/`END` markers and proves the default
+  midnight-wrap window round-trips through the form's row⇄window
+  conversion unchanged (including exact JSON key order, which is what
+  actually keeps a save byte-identical), that `start == end` round-trips
+  without being rejected or coerced, that an off-grid time is preserved
+  rather than snapped to the half-hourly grid, that days are sorted on the
+  way out, and each `godwitValidateRow()` rejection path. All 9 failed
+  (module/markers not found) before the markers and functions existed; a
+  10th case (a non-array `days` throwing before validation can reject it)
+  was added after the review round below caught the "Apply JSON to form"
+  handler skipping that check.
+- `tests/run.php`: a new test proves `days[] = [N]` is active on the exact
+  weekday the settings page's day label at index N claims, for all 7
+  indices, via `godwit_time_in_window()` itself (not just checking the
+  label text) — this is what a mislabelled checkbox would silently get
+  wrong. Four new tests on `godwit_handle_job_action('settings_save', …)`
+  cover the new validation (empty `days`, non-positive/non-numeric
+  `limit_mbit`, malformed `start`/`end`) and a `start == end` acceptance
+  case, plus a byte-identical round-trip test that posts the exact payload
+  shape the form's JS produces for an untouched default window and
+  compares the stored `windows` JSON bytes before/after. Verified red
+  against pre-change `lib.php` (`git stash` the validation, re-run): the
+  empty-`days`, non-positive-`limit_mbit` and malformed-`start`/`end`
+  tests failed as expected (3 failed, 199 passed); the byte-identical
+  round trip already passed pre-change (nothing in the old code corrupted
+  that case — its value is as a regression guard, not new-behaviour proof).
+  The day-label test failed pre-change because `plugin/Godwit.page` had no
+  `godwitDayLabels` array yet. 202/202 PHP tests pass at this point, plus
+  the 10 Node checks above (see the "Review" note below for the further
+  tests added on top of this baseline).
+
+### Review
+
+- Two rounds of `code-diff-reviewer` (6 passes each, unattended — MID band
+  both times, score 7, counsel offered-but-skipped per the unattended
+  default). Round 1 (UX rework alone): 6× NO FINDINGS. Round 2 (UX rework +
+  the issue #1 fix together): a real bug at 4/6 agreement — `godwitAdd()`'s
+  success path closed the just-opened dialog immediately after writing the
+  "Added X — checking connection…" confirmation into it, hiding the message
+  before it could be read (the same swallowed-result class 0.2.2 fixed for
+  the page-wide message div, reintroduced per-dialog). Fixed by not
+  auto-closing on success, and pinned with a source-shape regression test
+  proven red against the pre-fix code (`git stash`, 209 passed/1 failed,
+  then 210/0 after the fix). A second, single-pass (1/6) finding asked
+  whether jQuery UI's JS (not just its CSS) is actually loaded before this
+  page's script runs — resolved by host evidence, not by argument: the
+  host's `dynamix.js` (a plain synchronous `<script>` in `<head>`, per
+  `DefaultPageLayout.php:142`, before the page body) is itself the jQuery
+  UI bundle (`V.ui.version="1.14.1"` grepped directly from it), so
+  `$.fn.dialog` exists before this page's inline script runs. 210 PHP tests
+  + 10 Node checks pass after both fixes.
+
 ## [0.3.0] - 2026-09-17
 
 ### Added

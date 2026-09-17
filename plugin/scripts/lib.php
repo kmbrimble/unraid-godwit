@@ -1756,6 +1756,37 @@ function godwit_default_retention_days(): int
     return 30;
 }
 
+/**
+ * Lists the date-directories directly under $fs (a full "<remote>:godwit/_versions/<share>"
+ * path) ahead of a retention purge. `operations/list` requires both `fs`
+ * AND `remote` (the path within that fs, "" for the root) — omitting
+ * `remote` makes rcd reject the call outright with "Didn't find key
+ * \"remote\" in input", which silently produced an empty candidate list
+ * forever (issue #1). $call defaults to godwit_rc_call_params so callers
+ * can inject a fake response to test the error/absent paths without a
+ * real rcd. Returns exactly one of:
+ *   - ['dirs' => [...]] on success;
+ *   - ['dirs' => [], 'absent' => true] if the directory doesn't exist yet
+ *     (normal before the first versioned overwrite for that share — stay
+ *     quiet, ground-truthed against the real bundled rclone binary as
+ *     "error in ListJSON: directory not found");
+ *   - ['dirs' => [], 'error' => '...'] on any other failure — the caller
+ *     must log this rather than silently proceeding as "nothing to purge".
+ */
+function godwit_list_versions_dirs(array $listener, string $fs, ?callable $call = null): array
+{
+    $call = $call ?? 'godwit_rc_call_params';
+    $resp = $call($listener, 'operations/list', ['fs' => $fs, 'remote' => '', 'opt' => json_encode(['dirsOnly' => true])], 30);
+    if (is_array($resp['list'] ?? null)) {
+        return ['dirs' => array_map(fn ($e) => (string) ($e['Name'] ?? ''), $resp['list'])];
+    }
+    $error = (string) ($resp['error'] ?? '');
+    if (stripos($error, 'directory not found') !== false) {
+        return ['dirs' => [], 'absent' => true];
+    }
+    return ['dirs' => [], 'error' => $error !== '' ? $error : ('operations/list returned neither a list nor an error: ' . json_encode($resp))];
+}
+
 /** Which of $dateDirs (leaf names listed under godwit/_versions/<share>/) are older than the retention window. Anything not shaped exactly like YYYY-MM-DD is silently skipped, never purged — this is the offline half of the safety guard; godwit_assert_purge_path() is the online half applied to each candidate before any rc call. */
 function godwit_versions_purge_candidates(array $dateDirs, int $retainDays, \DateTimeImmutable $now): array
 {
@@ -2000,6 +2031,21 @@ function godwit_handle_job_action(string $action, array $post, string $dbPath, s
         foreach ($settings['windows'] as $w) {
             if (!isset($w['start'], $w['end'], $w['limit_mbit'], $w['days']) || !is_array($w['days'])) {
                 return ['error' => 'each window needs start, end, limit_mbit and a days array'];
+            }
+            if (count($w['days']) === 0) {
+                return ['error' => 'each window needs at least one day'];
+            }
+            foreach ($w['days'] as $day) {
+                if (!is_int($day) || $day < 0 || $day > 6) {
+                    return ['error' => 'each day must be an integer 0-6 (0 = Sunday)'];
+                }
+            }
+            if (!preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', (string) $w['start'])
+                || !preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', (string) $w['end'])) {
+                return ['error' => 'start and end must be HH:MM (00:00-23:59)'];
+            }
+            if (!is_numeric($w['limit_mbit']) || (float) $w['limit_mbit'] <= 0) {
+                return ['error' => 'limit_mbit must be a positive number'];
             }
         }
         // Merged against what's already on disk, not just the defaults — a
