@@ -856,6 +856,118 @@ t('godwit_walk_config_state: onedrive — declines refresh, answers "onedrive" a
     assert_eq('', $final['State'], 'onedrive walk must end at an empty state');
 });
 
+// --- godwit_walk_config_state(): full real OneDrive sequence -----------
+//
+// Ground truth: Kieren's 2026-09-17 19:50 AEST report reproduced with a real
+// OneDrive token. Root cause (orchestrator, verified against rclone v1.75.1
+// backend/onedrive/onedrive.go): the walker answered every question "false"
+// except choose_type_done, so the "config_driveid" question (state
+// "driveid_final") — which must be answered with one of Option.Examples[].
+// Value, a real drive ID — got "false", and rclone did
+// GET /drives/false/root and 400'd with exactly the message below. This
+// test must fail against the pre-fix walker (blanket "false") before the
+// fix and pass after — see the FAIL run in the handback.
+
+function godwit_test_onedrive_sequence_call(array $params, array $drives, ?callable &$afterDriveIdCall = null)
+{
+    $opt = json_decode($params['opt'], true);
+    switch ($opt['state']) {
+        case '*oauth-confirm,choose_type,,':
+            return ['State' => 'choose_type_done', 'Option' => ['Name' => 'config_type'], 'Error' => '', 'Result' => ''];
+        case 'choose_type_done':
+            assert_eq('onedrive', $opt['result'], 'choose_type_done must be answered "onedrive"');
+            return ['State' => 'driveid_final', 'Option' => [
+                'Name' => 'config_driveid',
+                'Help' => 'Select drive you want to use',
+                'Examples' => $drives,
+                'DefaultStr' => $drives[0]['Value'] ?? '',
+            ], 'Error' => '', 'Result' => ''];
+        case 'driveid_final':
+            if (!in_array($opt['result'], array_column($drives, 'Value'), true)) {
+                // This is rclone's real failure mode for the reported bug:
+                // GET /drives/false/root returns this exact 400 body.
+                return ['State' => 'driveid_final', 'Option' => null, 'Error' => 'Failed to query root for drive "' . $opt['result'] . '": HTTP error 400 (400 Bad Request) returned body: "{"error":{"code":"invalidRequest","message":"ObjectHandle is Invalid"}}"', 'Result' => ''];
+            }
+            return ['State' => 'driveid_final_end', 'Option' => ['Name' => 'config_drive_ok', 'Help' => 'Drive OK?', 'DefaultStr' => 'true'], 'Error' => '', 'Result' => ''];
+        case 'driveid_final_end':
+            assert_eq('true', $opt['result'], 'config_drive_ok must be answered "true"');
+            return ['State' => '', 'Option' => null, 'Error' => '', 'Result' => ''];
+    }
+    throw new \RuntimeException('unexpected state ' . $opt['state']);
+}
+
+t('godwit_walk_config_state: onedrive — real sequence, single drive, succeeds and names the drive', function () {
+    $drives = [['Value' => 'b!realDriveId123', 'Help' => 'KM OneDrive (personal)']];
+    $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
+    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $driveChosen = null;
+    $final = godwit_walk_config_state($call, 'od', $initial, 'onedrive', $driveChosen);
+    assert_eq('', $final['State'], 'onedrive walk with one drive must reach a terminal state');
+    assert_eq('KM OneDrive (personal)', $driveChosen, 'the single drive must be reported chosen');
+});
+
+t('godwit_walk_config_state: onedrive — two drives, one personal, picks the personal one', function () {
+    $drives = [
+        ['Value' => 'b!sharepointId', 'Help' => 'Team Library (business)'],
+        ['Value' => 'b!personalId', 'Help' => 'KM OneDrive (personal)'],
+    ];
+    $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
+    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $driveChosen = null;
+    $final = godwit_walk_config_state($call, 'od', $initial, 'onedrive', $driveChosen);
+    assert_eq('', $final['State'], 'onedrive walk with two drives (one personal) must reach a terminal state');
+    assert_eq('KM OneDrive (personal)', $driveChosen, 'the personal drive must be picked over the business one');
+});
+
+t('godwit_walk_config_state: onedrive — two drives, neither/both ambiguous, fails with a clear no-ID error', function () {
+    $drives = [
+        ['Value' => 'b!oneId', 'Help' => 'Site A (documentLibrary)'],
+        ['Value' => 'b!twoId', 'Help' => 'Site B (documentLibrary)'],
+    ];
+    $call = fn (array $p) => godwit_test_onedrive_sequence_call($p, $drives);
+    $initial = ['State' => '*oauth-confirm,choose_type,,', 'Option' => ['Name' => 'config_refresh_token'], 'Error' => '', 'Result' => ''];
+    $threw = false;
+    try {
+        godwit_walk_config_state($call, 'od', $initial, 'onedrive');
+    } catch (\RuntimeException $e) {
+        $threw = true;
+        assert_true(str_contains($e->getMessage(), 'Site A'), 'ambiguous error must name the drives, not IDs: ' . $e->getMessage());
+        assert_true(!str_contains($e->getMessage(), 'b!oneId'), 'ambiguous error must not leak drive IDs: ' . $e->getMessage());
+    }
+    assert_true($threw, 'an ambiguous drive choice (no personal drive) must fail rather than guess');
+});
+
+t('godwit_walk_config_state: unknown question with a Default answers it instead of failing', function () {
+    $call = function (array $params) {
+        $opt = json_decode($params['opt'], true);
+        if ($opt['state'] === 'some_new_question') {
+            assert_eq('yes-please', $opt['result'], 'an unrecognised question with a DefaultStr must be answered with that default');
+            return ['State' => '', 'Option' => null, 'Error' => '', 'Result' => ''];
+        }
+        throw new \RuntimeException('unexpected state ' . $opt['state']);
+    };
+    $initial = ['State' => 'some_new_question', 'Option' => ['Name' => 'config_something_new', 'Help' => 'A future rclone question', 'DefaultStr' => 'yes-please'], 'Error' => '', 'Result' => ''];
+    $final = godwit_walk_config_state($call, 't', $initial, 'drive');
+    assert_eq('', $final['State'], 'a defaultable unknown question must not block the walk');
+});
+
+t('godwit_walk_config_state: unknown question with no Default fails immediately, naming the question', function () {
+    $call = function (array $params) {
+        throw new \RuntimeException('must not make a continue call for an unanswerable question');
+    };
+    $initial = ['State' => 'some_new_question', 'Option' => ['Name' => 'config_something_new', 'Help' => "A future rclone question\nmore detail on a second line"], 'Error' => '', 'Result' => ''];
+    $threw = false;
+    try {
+        godwit_walk_config_state($call, 't', $initial, 'drive');
+    } catch (\RuntimeException $e) {
+        $threw = true;
+        assert_true(str_contains($e->getMessage(), 'config_something_new'), 'error must name the unrecognised question: ' . $e->getMessage());
+        assert_true(str_contains($e->getMessage(), 'A future rclone question'), 'error must include the first line of Help: ' . $e->getMessage());
+        assert_true(!str_contains($e->getMessage(), 'second line'), 'error must only include the first line of Help: ' . $e->getMessage());
+    }
+    assert_true($threw, 'an unanswerable question with no default must fail loudly, never guess "false"');
+});
+
 t('godwit_walk_config_state: onedrive — a bad/expired token fails at the driveid fallback (this session\'s exact fixture)', function () {
     // Ground truth: with a syntactically-fake access_token, rclone's own
     // Graph call to resolve drive_id/drive_type fails with
@@ -896,16 +1008,20 @@ t('godwit_walk_config_state: onedrive — a bad/expired token fails at the drive
 // remotes_reauth) only check for a thrown exception before reporting
 // {"ok": true}, so a remote could be reported as successfully added while
 // still stuck mid-configuration in rcd.
-t('godwit_walk_config_state: exhausting the step cap without an Error must still throw, never silently succeed', function () {
+t('godwit_walk_config_state: a recognised question that never terminates still hits the step cap, never spins forever', function () {
+    // A real loop-back exists in rclone's own state machine: answering
+    // "config_drive_ok" anything other than "true" sends OneDrive back to
+    // "choose_type" (backend/onedrive/onedrive.go, case "driveid_final_end").
+    // The walker always answers "true", so this can't recur in practice —
+    // this fixture instead simulates a recognised confirm (team-drive) that
+    // rcd keeps re-asking, to prove the cap still catches a genuine loop
+    // rather than assuming a recognised answer implies progress.
     $step = 0;
     $call = function (array $params) use (&$step) {
         $step++;
-        // Always comes back with a fresh non-empty State and no Error —
-        // simulates a real prompt this walker doesn't know how to answer
-        // (e.g. OneDrive's manual "driveid" entry with no Error attached).
-        return ['State' => 'some_unhandled_state_' . $step, 'Option' => ['Name' => 'x'], 'Error' => '', 'Result' => ''];
+        return ['State' => 'teamdrive_loop_' . $step, 'Option' => ['Name' => 'config_change_team_drive'], 'Error' => '', 'Result' => ''];
     };
-    $initial = ['State' => 'some_unhandled_state_0', 'Option' => ['Name' => 'x'], 'Error' => '', 'Result' => ''];
+    $initial = ['State' => 'teamdrive_loop_0', 'Option' => ['Name' => 'config_change_team_drive'], 'Error' => '', 'Result' => ''];
     $threw = false;
     try {
         godwit_walk_config_state($call, 't', $initial, 'drive');
@@ -913,6 +1029,7 @@ t('godwit_walk_config_state: exhausting the step cap without an Error must still
         $threw = true;
     }
     assert_true($threw, 'exhausting the step cap while still non-terminal must throw, not return {"ok": true}-shaped success');
+    assert_eq(10, $step, 'the cap must be exactly 10 continue calls, not fewer or unbounded');
 });
 
 // --- godwit_list_remotes(): never returns secret values --------------------

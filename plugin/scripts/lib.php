@@ -522,24 +522,99 @@ function godwit_config_continue_params(string $name, string $state, string $resu
 }
 
 /**
- * Walks rclone's non-interactive config state machine to completion,
- * declining every confirmation ("replace the token?", "Shared Drive?") with
- * "false" except OneDrive's account-type question ("choose_type_done"),
- * which must be answered "onedrive" so rclone resolves drive_id/drive_type
- * itself via its own Graph call. $call is injected so tests can drive this
- * against a fixture sequence instead of a real rcd. Throws on a
- * backend-reported Error (e.g. the token doesn't work) — callers classify
- * the message with godwit_classify_error() before showing it to the user.
+ * Picks a drive ID from OneDrive's "config_driveid" Examples. Each example's
+ * Value is a real drive ID and its Help is "DriveName (driveType)" (rclone
+ * v1.75.1 backend/onedrive/onedrive.go chooseDrive(), fmt.Sprintf("%s (%s)",
+ * DriveName, DriveType)) — a personal OneDrive's Help contains "(personal)".
+ * One drive: use it. Several with exactly one personal: use that one.
+ * Otherwise fail with a clear, ID-free error rather than guessing — the bug
+ * this whole rewrite exists to fix was guessing "false" here.
  */
-function godwit_walk_config_state(callable $call, string $name, array $response, string $type): array
+function godwit_choose_onedrive_drive(?array $opt, ?string &$driveChosen): string
 {
+    $examples = is_array($opt) ? ($opt['Examples'] ?? []) : [];
+    if (!is_array($examples) || count($examples) === 0) {
+        throw new \RuntimeException('OneDrive returned no drives to choose from');
+    }
+    if (count($examples) === 1) {
+        $driveChosen = (string) ($examples[0]['Help'] ?? $examples[0]['Value']);
+        return (string) $examples[0]['Value'];
+    }
+    foreach ($examples as $ex) {
+        if (stripos((string) ($ex['Help'] ?? ''), '(personal)') !== false) {
+            $driveChosen = (string) $ex['Help'];
+            return (string) $ex['Value'];
+        }
+    }
+    $names = array_map(fn ($ex) => (string) ($ex['Help'] ?? ''), $examples);
+    throw new \RuntimeException('multiple OneDrive drives found and none is personal — cannot choose automatically: ' . implode(', ', $names));
+}
+
+/**
+ * Falls back to an unrecognised Option's own DefaultStr when it has a
+ * non-empty one; otherwise fails loudly naming the question (Name + first
+ * line of Help) instead of guessing "false" — a wrong guess here is exactly
+ * how the OneDrive drive-selection bug shipped in the first place.
+ */
+function godwit_config_default_answer(?array $opt, ?string $optName): string
+{
+    $default = is_array($opt) ? ($opt['DefaultStr'] ?? null) : null;
+    if ($default !== null && $default !== '') {
+        return (string) $default;
+    }
+    $help = is_array($opt) ? (string) ($opt['Help'] ?? '') : '';
+    $firstLine = trim((string) strtok($help, "\n"));
+    $label = $optName !== null ? "\"$optName\"" : '(unnamed)';
+    throw new \RuntimeException("unexpected config question $label" . ($firstLine !== '' ? ": $firstLine" : ''));
+}
+
+/**
+ * Walks rclone's non-interactive config state machine to completion,
+ * answering each question from its Option metadata (Name, and Examples for
+ * choices) instead of a blanket "false". Verified against rclone v1.75.1
+ * source:
+ * - lib/oauthutil/oauthutil.go: "config_refresh_token" confirm ("Token
+ *   already configured - replace it?", defaults true) — declined with
+ *   "false" so a freshly pasted token always wins.
+ * - backend/drive/drive.go Config(): "config_change_team_drive" confirm —
+ *   declined with "false"; Google Drive's live add path is unchanged.
+ * - backend/onedrive/onedrive.go Config()/chooseDrive(): "config_type"
+ *   (state "choose_type_done") answered "onedrive"; the following
+ *   "config_driveid" question (state "driveid_final") MUST be answered with
+ *   one of Option.Examples[].Value — a real drive ID, not "false" (sending
+ *   "false" made rclone GET /drives/false/root and 400, the bug this walker
+ *   used to have) — see godwit_choose_onedrive_drive(); "config_drive_ok"
+ *   (state "driveid_final_end") confirms the chosen drive and MUST be
+ *   answered "true", since anything else loops back to "choose_type".
+ * $call is injected so tests can drive this against a fixture sequence
+ * instead of a real rcd. Throws on a backend-reported Error (e.g. the token
+ * doesn't work) or a question this walker can't answer — callers classify
+ * the message with godwit_classify_error() before showing it to the user.
+ * $driveChosen is set to the chosen drive's label when OneDrive's drive
+ * question was answered, so the caller can report it on success.
+ */
+function godwit_walk_config_state(callable $call, string $name, array $response, string $type, ?string &$driveChosen = null): array
+{
+    $driveChosen = null;
     $steps = 0;
     while (!empty($response['State']) && $steps < 10) {
         if (!empty($response['Error'])) {
             throw new \RuntimeException((string) $response['Error']);
         }
         $state = $response['State'];
-        $result = ($type === 'onedrive' && $state === 'choose_type_done') ? 'onedrive' : 'false';
+        $opt = $response['Option'] ?? null;
+        $optName = is_array($opt) ? ($opt['Name'] ?? null) : null;
+        if ($optName === 'config_refresh_token' || $optName === 'config_change_team_drive') {
+            $result = 'false';
+        } elseif ($optName === 'config_type' && $type === 'onedrive') {
+            $result = 'onedrive';
+        } elseif ($optName === 'config_driveid' && $type === 'onedrive') {
+            $result = godwit_choose_onedrive_drive($opt, $driveChosen);
+        } elseif ($optName === 'config_drive_ok') {
+            $result = 'true';
+        } else {
+            $result = godwit_config_default_answer($opt, $optName);
+        }
         $response = $call(godwit_config_continue_params($name, $state, $result));
         if (!is_array($response)) {
             throw new \RuntimeException('rcd did not answer the config continue call');
@@ -941,23 +1016,24 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
         }
         if (!empty($initial['Error'])) {
             $message = godwit_redact((string) $initial['Error']);
-            $log("remote add $type $name: failed validation: $message");
+            $log("remote add $type $name: failed: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
         $updateCall = function (array $p) use ($listener) {
             return godwit_rc_call_params($listener, 'config/update', $p, 60);
         };
+        $driveChosen = null;
         try {
-            godwit_walk_config_state($updateCall, $name, $initial, $type);
+            godwit_walk_config_state($updateCall, $name, $initial, $type, $driveChosen);
         } catch (\Throwable $e) {
             // Roll back the half-created remote rather than leaving a broken
             // entry the page can't fix except by hand.
             godwit_rc_call_params($listener, 'config/delete', ['name' => $name]);
             $message = godwit_redact($e->getMessage());
-            $log("remote add $type $name: failed validation: $message");
+            $log("remote add $type $name: failed: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
-        $log("remote add $type $name: ok");
+        $log("remote add $type $name: ok" . ($driveChosen !== null ? " (drive: $driveChosen)" : ''));
         // Wakes godwitd's loop (polls this marker every second) so the new
         // remote gets its first health check within a second or two instead
         // of waiting up to an hour — see godwitd's docblock for the marker.
@@ -1002,7 +1078,7 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
             godwit_walk_config_state($updateCall, $name, $initial, $current['type']);
         } catch (\Throwable $e) {
             $message = godwit_redact($e->getMessage());
-            $log("remote reauth $name: failed validation: $message");
+            $log("remote reauth $name: failed: $message");
             return ['error' => $message, 'classification' => godwit_classify_error($message)];
         }
         $log("remote reauth $name: ok");
