@@ -9,7 +9,7 @@
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
 <!ENTITY plgPATH   "/boot/config/plugins/&name;">
 <!ENTITY emhttp    "/usr/local/emhttp/plugins/&name;">
-<!ENTITY md5       "62d9e7702fddd7014eb1ee6e9414ec22">
+<!ENTITY md5       "1c10a68bfaf6386d2bd64c28739e9223">
 ]>
 
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
