@@ -1216,3 +1216,633 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
 
     return ['error' => 'unknown action'];
 }
+
+// === Phase 3: Jobs, budget, windows, status =================================
+//
+// Everything below is new for Phase 3 — the first phase that writes to Google
+// Drive. Every function that touches the source/destination direction is kept
+// pure and separately assertable (godwit_assert_job_direction()) so the
+// direction guarantee doesn't depend on remembering to check it at every call
+// site. Facts ground-truthed against the bundled rclone v1.75.1 binary before
+// writing any of this (see the handback for the exact commands):
+//   - `rc --loopback options/get` confirms the `_config` keys used below
+//     (Transfers, MaxTransfer, CutoffMode, MaxDelete, BackupDir, DryRun,
+//     MaxDuration) and their casing/types (CutoffMode is the string
+//     HARD|SOFT|CAUTIOUS; MaxDuration is a Duration string like "6h30m").
+//   - `--bwlimit 31250000B` is accepted — rclone's `M` suffix is MiB, not
+//     Mbit, so passing a raw byte count with the `B` suffix is the only way
+//     to avoid a silent ~5% overshoot (250 Mbit/s ≠ "31.25M").
+//   - drive_chunk_size / drive_stop_on_upload_limit are backend options, not
+//     `_config` keys; set via RCLONE_DRIVE_CHUNK_SIZE / RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT
+//     in rcd's environment (rclone's standard RCLONE_<BACKEND>_<FLAG>
+//     convention, same one godwit_rcd_env() already relies on for
+//     RCLONE_RC_USER/PASS) — this keeps dstFs a plain "remote:path" with no
+//     connection-string params, which keeps godwit_assert_job_direction() and
+//     the --backup-dir same-remote check trivial.
+
+/** Excludes applied to every job regardless of share — Mac junk and Windows/Recycle Bin debris. Unanchored (no leading /) so they match at any depth. */
+function godwit_global_excludes(): array
+{
+    return ['.DS_Store', '._*', '.Trashes/**', '.Recycle.Bin/**', 'Thumbs.db'];
+}
+
+/**
+ * The four Phase 3 default jobs, in the queue order PLAN.md/CLAUDE.md specify
+ * (small first, so something is fully backed up quickly): Filing Cabinet,
+ * Kieren, Teegan, Photos. Kieren carries the D13/D14 exclusions
+ * (TimeMachine — live sparsebundle, heavy churn; Backup/BombVault — contains
+ * Godwit's own rclone.conf and the SecretsMan store, must never sit
+ * unencrypted in Drive). Anchored (leading /) so only the top-level
+ * TimeMachine/Backup folders are excluded, not any same-named folder deeper
+ * in the tree.
+ */
+function godwit_default_jobs(): array
+{
+    return [
+        ['name' => 'Filing Cabinet', 'share' => 'Filing Cabinet', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => []],
+        ['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => ['/TimeMachine/**', '/Backup/BombVault/**']],
+        ['name' => 'Teegan', 'share' => 'Teegan', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => []],
+        ['name' => 'Photos', 'share' => 'Photos', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => []],
+    ];
+}
+
+/** Loads jobs.json, seeding the Phase 3 defaults on first run (file absent). Never mutates disk itself — callers that seed defaults must save explicitly. */
+function godwit_load_jobs(string $cfgDir): array
+{
+    $path = $cfgDir . '/jobs.json';
+    if (!is_file($path)) {
+        return godwit_default_jobs();
+    }
+    $decoded = json_decode((string) file_get_contents($path), true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+function godwit_save_jobs(string $cfgDir, array $jobs): void
+{
+    if (!is_dir($cfgDir)) {
+        mkdir($cfgDir, 0755, true);
+    }
+    file_put_contents($cfgDir . '/jobs.json', json_encode(array_values($jobs), JSON_PRETTY_PRINT));
+}
+
+/**
+ * Compiles a job's exclude rules (global + per-job) to an ordered list of
+ * rclone filter-file lines. Exclude-only filter lists need no trailing
+ * "+ **" — rclone's own default for a filter with no include rules is to
+ * include everything not explicitly excluded.
+ */
+function godwit_compile_filter_rules(array $job): array
+{
+    $patterns = array_merge(godwit_global_excludes(), $job['excludes'] ?? []);
+    return array_map(fn ($p) => '- ' . $p, $patterns);
+}
+
+function godwit_write_filter_file(string $path, array $rules): void
+{
+    file_put_contents($path, implode(PHP_EOL, $rules) . PHP_EOL);
+}
+
+/**
+ * The two Fs a job builds — kept separate from the rc-call params so
+ * godwit_assert_job_direction() can check them before anything is ever sent
+ * to rcd. $job['share'] is deliberately rejected if it contains a path
+ * separator (no traversal out of /mnt/user/<share>) and dstFs is always the
+ * bare "remote:path" form the direction/overlap checks assume — see the
+ * RCLONE_DRIVE_* env vars above for why no connection-string params are
+ * needed.
+ */
+function godwit_build_job_fs(array $job, string $shareRoot = '/mnt/user'): array
+{
+    $share = (string) ($job['share'] ?? '');
+    if ($share === '' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
+        throw new \InvalidArgumentException('invalid share name for job: ' . var_export($share, true));
+    }
+    $remote = (string) ($job['remote'] ?? '');
+    if ($remote === '' || strpos($remote, '/') !== false || strpos($remote, ':') !== false) {
+        throw new \InvalidArgumentException('invalid remote name for job: ' . var_export($remote, true));
+    }
+    return [
+        'srcFs' => rtrim($shareRoot, '/') . '/' . $share,
+        'dstFs' => $remote . ':godwit/' . $share,
+    ];
+}
+
+/**
+ * Hard assertion (never bypassable by a caller-supplied direction) that a
+ * built job's Fs pair can only ever copy from a local share into a remote —
+ * srcFs must be a real absolute path under $shareRoot, dstFs must be
+ * "remote:path" with no local path shape. Throws on any violation; callers
+ * never send Fs pairs to rcd without calling this first.
+ */
+function godwit_assert_job_direction(array $fs, string $shareRoot = '/mnt/user'): void
+{
+    $root = rtrim($shareRoot, '/') . '/';
+    if (strpos($fs['srcFs'], $root) !== 0 || strlen($fs['srcFs']) <= strlen($root)) {
+        throw new \RuntimeException('refusing job: srcFs is not a local path under ' . $shareRoot . ' (' . $fs['srcFs'] . ')');
+    }
+    if (!preg_match('/^[A-Za-z0-9_.+@ -]+:[^:]*$/', $fs['dstFs'])) {
+        throw new \RuntimeException('refusing job: dstFs is not a plain remote:path (' . $fs['dstFs'] . ')');
+    }
+    if (strpos($fs['dstFs'], $root) === 0) {
+        throw new \RuntimeException('refusing job: dstFs looks like a local path (' . $fs['dstFs'] . ')');
+    }
+}
+
+function godwit_backup_dir_fs(array $job, string $dateYmd): string
+{
+    return $job['remote'] . ':godwit/_versions/' . $job['share'] . '/' . $dateYmd;
+}
+
+function godwit_sync_rc_path(string $mode): string
+{
+    return $mode === 'copy' ? 'sync/copy' : 'sync/sync';
+}
+
+/**
+ * Builds the full `sync/sync` or `sync/copy` `_async` rc call params for a
+ * job. $maxTransferBytes is the remaining daily budget (§4.3: the ledger is
+ * the real guard, this is belt-and-braces — Phase 1's spike found
+ * MaxTransfer can overshoot by up to transfers × average file size).
+ * BackupDir is only set in sync mode — copy mode never deletes, so there's
+ * nothing to version. MaxDuration, when given, is the soft-stop mechanism
+ * (§4.5): a non-HARD CutoffMode with a duration set to "time left in the
+ * window" makes rclone itself stop picking up new files at the boundary
+ * while letting an in-flight transfer finish — ponytail: this doesn't adapt
+ * if the window is edited mid-run; the job just runs to MaxDuration as
+ * computed at start. Re-evaluated next tick after the job's next start.
+ */
+function godwit_build_sync_params(array $job, array $fs, string $filterFile, int $maxTransferBytes, ?string $backupDirFs, ?int $maxDurationSeconds, bool $dryRun = false): array
+{
+    godwit_assert_job_direction($fs);
+    $config = [
+        'Transfers' => (int) ($job['transfers'] ?? 4),
+        'MaxDelete' => (int) ($job['max_delete'] ?? 1000),
+        'CutoffMode' => 'CAUTIOUS',
+        'MaxTransfer' => $maxTransferBytes,
+        'DryRun' => $dryRun,
+    ];
+    if ($backupDirFs !== null) {
+        $config['BackupDir'] = $backupDirFs;
+    }
+    if ($maxDurationSeconds !== null) {
+        $config['MaxDuration'] = $maxDurationSeconds . 's';
+    }
+    return [
+        '_async' => true,
+        'srcFs' => $fs['srcFs'],
+        'dstFs' => $fs['dstFs'],
+        '_config' => json_encode($config),
+        '_filter' => json_encode(['FilterFrom' => [$filterFile]]),
+    ];
+}
+
+/**
+ * Rejects a jobs.json save when two enabled jobs' destinations overlap
+ * (same or nested remote:path) or a destination sits under a remote's own
+ * godwit/_versions tree — either would let two jobs write the same object,
+ * or a job silently back up its own version history. Returns an error
+ * string, or null if the set is safe. Disabled jobs are not checked — they
+ * can never run, so an overlap with one is not exploitable.
+ */
+function godwit_validate_job_destinations(array $jobs): ?string
+{
+    $dests = [];
+    foreach ($jobs as $job) {
+        if (empty($job['enabled'])) {
+            continue;
+        }
+        $fs = godwit_build_job_fs($job);
+        if (preg_match('#^[^:]+:godwit/_versions(/|$)#', $fs['dstFs'])) {
+            return "job \"{$job['name']}\" destination sits under godwit/_versions — not allowed";
+        }
+        $dests[] = ['name' => $job['name'], 'dst' => rtrim($fs['dstFs'], '/') . '/'];
+    }
+    for ($i = 0; $i < count($dests); $i++) {
+        for ($j = $i + 1; $j < count($dests); $j++) {
+            $a = $dests[$i]['dst'];
+            $b = $dests[$j]['dst'];
+            if (strpos($a, $b) === 0 || strpos($b, $a) === 0) {
+                return "jobs \"{$dests[$i]['name']}\" and \"{$dests[$j]['name']}\" have overlapping destinations";
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Picks which enabled, not-already-running jobs to start next: at most one
+ * per remote (§4.2), in jobs.json array order (queue order is simply the
+ * array order the defaults seed in — Filing Cabinet, Kieren, Teegan,
+ * Photos). $activeRemotes lists remotes with a job already running (from
+ * either a previous selection this tick, or one still in flight from a
+ * prior tick).
+ */
+function godwit_select_next_jobs(array $jobs, array $activeRemotes): array
+{
+    $inUse = $activeRemotes;
+    $selected = [];
+    foreach ($jobs as $job) {
+        if (empty($job['enabled'])) {
+            continue;
+        }
+        if (in_array($job['remote'], $inUse, true)) {
+            continue;
+        }
+        $selected[] = $job;
+        $inUse[] = $job['remote'];
+    }
+    return $selected;
+}
+
+// --- Daily budget ledger -----------------------------------------------
+
+function godwit_default_budget_cap_bytes(): int
+{
+    return 700 * 1024 * 1024 * 1024; // 700 GiB, D12
+}
+
+function godwit_open_budget_table(SQLite3 $db): void
+{
+    $db->exec('CREATE TABLE IF NOT EXISTS budget_ledger (
+        remote TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        bytes INTEGER NOT NULL
+    )');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_budget_ledger_remote_ts ON budget_ledger(remote, ts)');
+}
+
+/** Records one stats-delta sample. Only positive deltas are worth recording — a delta of 0 (or negative, e.g. a stats-group reset) adds nothing to the ledger. */
+function godwit_record_ledger_delta(SQLite3 $db, string $remote, int $ts, int $bytesDelta): void
+{
+    if ($bytesDelta <= 0) {
+        return;
+    }
+    $stmt = $db->prepare('INSERT INTO budget_ledger (remote, ts, bytes) VALUES (:remote, :ts, :bytes)');
+    $stmt->bindValue(':remote', $remote, SQLITE3_TEXT);
+    $stmt->bindValue(':ts', $ts, SQLITE3_INTEGER);
+    $stmt->bindValue(':bytes', $bytesDelta, SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+/** Sum of bytes recorded for $remote in the rolling 24h window ending at $now — the real budget guard (§4.3), independent of whatever MaxTransfer was passed to any individual job. */
+function godwit_ledger_used_24h(SQLite3 $db, string $remote, int $now): int
+{
+    $stmt = $db->prepare('SELECT COALESCE(SUM(bytes), 0) AS used FROM budget_ledger WHERE remote = :remote AND ts > :since');
+    $stmt->bindValue(':remote', $remote, SQLITE3_TEXT);
+    $stmt->bindValue(':since', $now - 86400, SQLITE3_INTEGER);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    return (int) ($row['used'] ?? 0);
+}
+
+/** Drops ledger rows older than the rolling window plus a safety margin — called on godwitd's hourly trim tick, same cadence as godwit_trim_heartbeat(). */
+function godwit_trim_ledger(SQLite3 $db, int $now, int $retainSeconds = 90000): void
+{
+    $stmt = $db->prepare('DELETE FROM budget_ledger WHERE ts < :cutoff');
+    $stmt->bindValue(':cutoff', $now - $retainSeconds, SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+function godwit_remaining_budget(int $capBytes, int $usedBytes): int
+{
+    return max(0, $capBytes - $usedBytes);
+}
+
+// --- Throttling (drive_stop_on_upload_limit) ----------------------------
+
+function godwit_open_throttle_table(SQLite3 $db): void
+{
+    $db->exec('CREATE TABLE IF NOT EXISTS remote_throttle (remote TEXT PRIMARY KEY, until_ts INTEGER NOT NULL)');
+}
+
+function godwit_mark_throttled(SQLite3 $db, string $remote, int $untilTs): void
+{
+    $stmt = $db->prepare('INSERT INTO remote_throttle (remote, until_ts) VALUES (:remote, :until)
+        ON CONFLICT(remote) DO UPDATE SET until_ts = excluded.until_ts');
+    $stmt->bindValue(':remote', $remote, SQLITE3_TEXT);
+    $stmt->bindValue(':until', $untilTs, SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+/** Null once $now has passed the stored until_ts — a remote is only "throttled" while this returns non-null. */
+function godwit_throttled_until(SQLite3 $db, string $remote, int $now): ?int
+{
+    $stmt = $db->prepare('SELECT until_ts FROM remote_throttle WHERE remote = :remote');
+    $stmt->bindValue(':remote', $remote, SQLITE3_TEXT);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    if ($row === false || (int) $row['until_ts'] <= $now) {
+        return null;
+    }
+    return (int) $row['until_ts'];
+}
+
+/** Whether an rc job error looks like Google's daily-upload-limit rejection (surfaces via --drive-stop-on-upload-limit as a fatal transfer error, distinct from the auth/quota errors godwit_classify_error() already handles). */
+function godwit_is_upload_limit_error(string $message): bool
+{
+    return stripos($message, 'upload limit') !== false || stripos($message, 'uploadLimitExceeded') !== false;
+}
+
+// --- Windows and speed ---------------------------------------------------
+
+function godwit_default_windows(): array
+{
+    return [['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => 250.0]];
+}
+
+function godwit_mbit_to_bytes_per_sec(float $mbit): int
+{
+    return (int) round($mbit * 1000000 / 8);
+}
+
+/** rclone's `M` bwlimit suffix is MiB, not Mbit — passing raw bytes with a `B` suffix is the only way to hit an exact Mbit/s figure. Ground-truthed: the bundled v1.75.1 binary accepts `--bwlimit <n>B`. */
+function godwit_bwlimit_rc_value(float $mbit): string
+{
+    return godwit_mbit_to_bytes_per_sec($mbit) . 'B';
+}
+
+function godwit_format_mbit_and_mib(float $mbit): string
+{
+    $mib = godwit_mbit_to_bytes_per_sec($mbit) / 1048576;
+    return sprintf('%s Mbit/s (%.1f MiB/s)', rtrim(rtrim(sprintf('%.2f', $mbit), '0'), '.'), $mib);
+}
+
+/**
+ * Whether $window is active at $now, handling the midnight-wrap case
+ * (end < start, e.g. the D12 default 22:00–06:00) by treating it as two
+ * half-open ranges: "today from start to midnight" and "today from midnight
+ * to end, if yesterday was a window day". $now's timezone is used as-is —
+ * callers are responsible for constructing it in the daemon's configured
+ * timezone (Australia/Brisbane on the live host, DST-free AEST).
+ */
+function godwit_time_in_window(array $window, \DateTimeImmutable $now): bool
+{
+    $day = (int) $now->format('w');
+    $nowMin = ((int) $now->format('H')) * 60 + (int) $now->format('i');
+    [$sh, $sm] = array_map('intval', explode(':', $window['start']));
+    [$eh, $em] = array_map('intval', explode(':', $window['end']));
+    $startMin = $sh * 60 + $sm;
+    $endMin = $eh * 60 + $em;
+    $days = $window['days'];
+
+    if ($startMin < $endMin) {
+        return in_array($day, $days, true) && $nowMin >= $startMin && $nowMin < $endMin;
+    }
+    if ($startMin === $endMin) {
+        // Zero-width or full-day window (start == end) — treat as "all day" on a window day, matching a weekly-grid UI where a user drags a row across the whole day.
+        return in_array($day, $days, true);
+    }
+    $prevDay = ($day + 6) % 7;
+    return (in_array($day, $days, true) && $nowMin >= $startMin)
+        || (in_array($prevDay, $days, true) && $nowMin < $endMin);
+}
+
+/** First window (in list order) active at $now, or null if none is. */
+function godwit_active_window(array $windows, \DateTimeImmutable $now): ?array
+{
+    foreach ($windows as $w) {
+        if (godwit_time_in_window($w, $now)) {
+            return $w;
+        }
+    }
+    return null;
+}
+
+/**
+ * Seconds remaining until $window's own end boundary, from $now — used to
+ * set MaxDuration on a job started inside a window so it soft-stops at the
+ * boundary (see godwit_build_sync_params()'s docblock) rather than being
+ * hard-killed. Handles the midnight-wrap case the same way
+ * godwit_time_in_window() classifies membership.
+ */
+function godwit_seconds_to_window_end(array $window, \DateTimeImmutable $now): int
+{
+    [$eh, $em] = array_map('intval', explode(':', $window['end']));
+    $end = $now->setTime($eh, $em, 0);
+    if ($end <= $now) {
+        $end = $end->modify('+1 day');
+    }
+    return $end->getTimestamp() - $now->getTimestamp();
+}
+
+function godwit_line_profiles(): array
+{
+    return [
+        '1000/400' => ['down_mbit' => 1000.0, 'up_mbit' => 400.0],
+        '500/50' => ['down_mbit' => 500.0, 'up_mbit' => 50.0],
+    ];
+}
+
+/** Warns when a window's upload limit is at or above 80% of the selected line profile's upstream — e.g. the D12 default 250 Mbit/s against the post-trip 500/50 profile (50 Mbit/s upstream: 250 ≥ 40). Null if the profile is unknown or the limit is comfortably under. */
+function godwit_profile_warning(string $profileKey, float $windowLimitMbit): ?string
+{
+    $profiles = godwit_line_profiles();
+    if (!isset($profiles[$profileKey])) {
+        return null;
+    }
+    $upstream = $profiles[$profileKey]['up_mbit'];
+    if ($upstream <= 0 || $windowLimitMbit < 0.8 * $upstream) {
+        return null;
+    }
+    return sprintf(
+        'Window limit %.0f Mbit/s is at or above 80%% of the "%s" profile\'s upstream (%.0f Mbit/s) — uploads may saturate the line.',
+        $windowLimitMbit,
+        $profileKey,
+        $upstream
+    );
+}
+
+// --- Version retention purge ---------------------------------------------
+
+function godwit_default_retention_days(): int
+{
+    return 30;
+}
+
+/** Which of $dateDirs (leaf names listed under godwit/_versions/<share>/) are older than the retention window. Anything not shaped exactly like YYYY-MM-DD is silently skipped, never purged — this is the offline half of the safety guard; godwit_assert_purge_path() is the online half applied to each candidate before any rc call. */
+function godwit_versions_purge_candidates(array $dateDirs, int $retainDays, \DateTimeImmutable $now): array
+{
+    $cutoff = $now->modify("-{$retainDays} days");
+    $out = [];
+    foreach ($dateDirs as $d) {
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $d)) {
+            continue;
+        }
+        $dt = \DateTimeImmutable::createFromFormat('!Y-m-d', $d, $now->getTimezone());
+        if ($dt === false || $dt >= $cutoff) {
+            continue;
+        }
+        $out[] = $d;
+    }
+    return $out;
+}
+
+/**
+ * The purge safety guard: throws unless the fully-assembled path is exactly
+ * "godwit/_versions/<share>/<YYYY-MM-DD>" with no traversal, no extra
+ * segments, nothing that could resolve outside _versions/. This is the only
+ * function allowed to build a path for `operations/purge` — callers must
+ * never hand rcd a hand-built string.
+ */
+function godwit_assert_purge_path(string $remote, string $share, string $dateDir): string
+{
+    if ($remote === '' || strpos($remote, ':') !== false || strpos($remote, '/') !== false) {
+        throw new \InvalidArgumentException('invalid remote for purge');
+    }
+    if ($share === '' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
+        throw new \InvalidArgumentException('invalid share for purge');
+    }
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateDir)) {
+        throw new \InvalidArgumentException('refusing to purge a non-date path: ' . var_export($dateDir, true));
+    }
+    $path = "godwit/_versions/$share/$dateDir";
+    if (!preg_match('#^godwit/_versions/[^/]+/\d{4}-\d{2}-\d{2}$#', $path)) {
+        throw new \InvalidArgumentException('purge path failed the safety check: ' . $path);
+    }
+    return $remote . ':' . $path;
+}
+
+// --- Job runs (SQLite) and requeue after restart --------------------------
+
+function godwit_open_job_runs_table(SQLite3 $db): void
+{
+    $db->exec('CREATE TABLE IF NOT EXISTS job_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_name TEXT NOT NULL,
+        remote TEXT NOT NULL,
+        started_ts INTEGER NOT NULL,
+        ended_ts INTEGER,
+        bytes INTEGER NOT NULL DEFAULT 0,
+        files INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT
+    )');
+    $db->exec('CREATE INDEX IF NOT EXISTS idx_job_runs_job_started ON job_runs(job_name, started_ts)');
+}
+
+function godwit_start_job_run(SQLite3 $db, string $jobName, string $remote, int $ts): int
+{
+    $stmt = $db->prepare('INSERT INTO job_runs (job_name, remote, started_ts) VALUES (:job, :remote, :ts)');
+    $stmt->bindValue(':job', $jobName, SQLITE3_TEXT);
+    $stmt->bindValue(':remote', $remote, SQLITE3_TEXT);
+    $stmt->bindValue(':ts', $ts, SQLITE3_INTEGER);
+    $stmt->execute();
+    return $db->lastInsertRowID();
+}
+
+function godwit_finish_job_run(SQLite3 $db, int $runId, int $ts, int $bytes, int $files, int $errors, string $outcome): void
+{
+    $stmt = $db->prepare('UPDATE job_runs SET ended_ts = :ts, bytes = :bytes, files = :files, errors = :errors, outcome = :outcome WHERE id = :id');
+    $stmt->bindValue(':ts', $ts, SQLITE3_INTEGER);
+    $stmt->bindValue(':bytes', $bytes, SQLITE3_INTEGER);
+    $stmt->bindValue(':files', $files, SQLITE3_INTEGER);
+    $stmt->bindValue(':errors', $errors, SQLITE3_INTEGER);
+    $stmt->bindValue(':outcome', $outcome, SQLITE3_TEXT);
+    $stmt->bindValue(':id', $runId, SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+function godwit_last_job_run(SQLite3 $db, string $jobName): ?array
+{
+    $stmt = $db->prepare('SELECT * FROM job_runs WHERE job_name = :job ORDER BY started_ts DESC LIMIT 1');
+    $stmt->bindValue(':job', $jobName, SQLITE3_TEXT);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    return $row === false ? null : $row;
+}
+
+/**
+ * On godwitd startup: closes any run row left open (ended_ts NULL) by a
+ * prior process that died mid-job — a restart of godwitd/rcd always loses
+ * whatever rc job was in flight, since rcd's job state lives in that
+ * process's memory only. Marking them 'interrupted' rather than deleting
+ * them keeps the run history honest. Returns the closed job names/remotes so
+ * the caller can requeue them immediately — safe because sync is idempotent
+ * (a re-run only transfers what's still actually missing/changed).
+ */
+function godwit_interrupt_open_runs(SQLite3 $db, int $ts): array
+{
+    $rows = [];
+    $res = $db->query('SELECT id, job_name, remote FROM job_runs WHERE ended_ts IS NULL');
+    while ($row = $res->fetchArray(SQLITE3_ASSOC)) {
+        $rows[] = $row;
+    }
+    foreach ($rows as $row) {
+        godwit_finish_job_run($db, (int) $row['id'], $ts, 0, 0, 0, 'interrupted');
+    }
+    return $rows;
+}
+
+// --- Notifications ---------------------------------------------------------
+
+function godwit_open_notify_state_table(SQLite3 $db): void
+{
+    $db->exec('CREATE TABLE IF NOT EXISTS notify_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+}
+
+function godwit_get_notify_state(SQLite3 $db, string $key): ?string
+{
+    $stmt = $db->prepare('SELECT value FROM notify_state WHERE key = :key');
+    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    return $row === false ? null : (string) $row['value'];
+}
+
+function godwit_set_notify_state(SQLite3 $db, string $key, string $value): void
+{
+    $stmt = $db->prepare('INSERT INTO notify_state (key, value) VALUES (:key, :value)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value');
+    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    $stmt->bindValue(':value', $value, SQLITE3_TEXT);
+    $stmt->execute();
+}
+
+/** A run ending in error notifies every time — unlike the health-check's 2-strikes rule, a job run is already a discrete, infrequent event (at most a few a day), so there is no steady-state spam to guard against. */
+function godwit_job_error_notification(string $jobName, ?string $errorMessage): array
+{
+    return [
+        'subject' => "Godwit: $jobName run failed",
+        'description' => $errorMessage !== null && $errorMessage !== '' ? "$jobName: $errorMessage" : "$jobName's backup run ended in error",
+        'importance' => 'alert',
+    ];
+}
+
+/** At most once per calendar day (in $today's timezone) per remote — checked/set via notify_state so a restart doesn't re-notify within the same day. */
+function godwit_budget_reached_notification(SQLite3 $db, string $remote, string $today): ?array
+{
+    $key = "budget_reached:$remote";
+    if (godwit_get_notify_state($db, $key) === $today) {
+        return null;
+    }
+    godwit_set_notify_state($db, $key, $today);
+    return [
+        'subject' => "Godwit: $remote daily upload budget reached",
+        'description' => "$remote has used its rolling 24h upload budget — new transfers will wait for headroom to free up.",
+        'importance' => 'warning',
+    ];
+}
+
+/** Notifies once on entering the throttled state, not on every tick it remains throttled — mirrors the auth-expired transition pattern in godwit_health_notifications(). */
+function godwit_throttled_notification(string $remote, bool $wasAlreadyThrottled): ?array
+{
+    if ($wasAlreadyThrottled) {
+        return null;
+    }
+    return [
+        'subject' => "Godwit: $remote throttled by Google for 24h",
+        'description' => "$remote hit Google's daily upload limit — no further uploads to $remote until the throttle clears.",
+        'importance' => 'alert',
+    ];
+}
+
+/** Notifies once ever per job (persisted in notify_state) the first time it completes a full run with outcome 'completed'. */
+function godwit_first_seed_notification(SQLite3 $db, string $jobName): ?array
+{
+    $key = "first_seed_done:$jobName";
+    if (godwit_get_notify_state($db, $key) !== null) {
+        return null;
+    }
+    godwit_set_notify_state($db, $key, '1');
+    return [
+        'subject' => "Godwit: $jobName first full seed complete",
+        'description' => "$jobName has completed its first full backup to Google Drive.",
+        'importance' => 'normal',
+    ];
+}

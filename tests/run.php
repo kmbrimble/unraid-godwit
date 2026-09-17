@@ -1762,6 +1762,467 @@ t('godwit_handle_remote_action: remotes_add_onedrive with a missing expiry field
     exec('rm -rf ' . escapeshellarg($env['tmp']));
 });
 
+// === Phase 3: Jobs, budget, windows, status ================================
+
+// --- Job builder + direction assertion ----------------------------------
+
+t('godwit_build_job_fs: builds a plain local-src / remote-dst pair', function () {
+    $fs = godwit_build_job_fs(['share' => 'Kieren', 'remote' => 'gdrive']);
+    assert_eq('/mnt/user/Kieren', $fs['srcFs'], 'srcFs');
+    assert_eq('gdrive:godwit/Kieren', $fs['dstFs'], 'dstFs');
+});
+
+t('godwit_build_job_fs: rejects a share name containing a path separator', function () {
+    try {
+        godwit_build_job_fs(['share' => 'Kieren/../../etc', 'remote' => 'gdrive']);
+        throw new \RuntimeException('expected an exception for a traversal share name');
+    } catch (\InvalidArgumentException $e) {
+        assert_true(true, 'threw as expected');
+    }
+});
+
+t('godwit_assert_job_direction: accepts a correctly-built pair', function () {
+    $fs = godwit_build_job_fs(['share' => 'Teegan', 'remote' => 'gdrive']);
+    godwit_assert_job_direction($fs);
+    assert_true(true, 'no exception');
+});
+
+t('godwit_assert_job_direction: throws if srcFs and dstFs were swapped (the safety-critical case)', function () {
+    $swapped = ['srcFs' => 'gdrive:godwit/Kieren', 'dstFs' => '/mnt/user/Kieren'];
+    try {
+        godwit_assert_job_direction($swapped);
+        throw new \RuntimeException('expected an exception for a reversed direction');
+    } catch (\RuntimeException $e) {
+        assert_true(str_contains($e->getMessage(), 'not a local path'), 'expected the src-not-local message: ' . $e->getMessage());
+    }
+});
+
+t('godwit_assert_job_direction: throws when dstFs is itself a local path', function () {
+    try {
+        godwit_assert_job_direction(['srcFs' => '/mnt/user/Kieren', 'dstFs' => '/mnt/user/Kieren2']);
+        throw new \RuntimeException('expected an exception');
+    } catch (\RuntimeException $e) {
+        assert_true(str_contains($e->getMessage(), 'not a plain remote:path') || str_contains($e->getMessage(), 'looks like a local path'), $e->getMessage());
+    }
+});
+
+t('godwit_assert_job_direction: throws when srcFs is outside /mnt/user', function () {
+    try {
+        godwit_assert_job_direction(['srcFs' => '/etc/passwd', 'dstFs' => 'gdrive:godwit/x']);
+        throw new \RuntimeException('expected an exception');
+    } catch (\RuntimeException $e) {
+        assert_true(str_contains($e->getMessage(), 'not a local path'), $e->getMessage());
+    }
+});
+
+t('godwit_build_sync_params: sync mode sets BackupDir, copy mode does not', function () {
+    $job = ['share' => 'Photos', 'remote' => 'gdrive', 'mode' => 'sync', 'transfers' => 4, 'max_delete' => 1000];
+    $fs = godwit_build_job_fs($job);
+    $params = godwit_build_sync_params($job, $fs, '/tmp/filter.txt', 700 * 1024 * 1024 * 1024, godwit_backup_dir_fs($job, '2026-09-17'), null);
+    $config = json_decode($params['_config'], true);
+    assert_eq('gdrive:godwit/_versions/Photos/2026-09-17', $config['BackupDir'], 'BackupDir should be set for sync mode');
+    assert_eq('CAUTIOUS', $config['CutoffMode'], 'CutoffMode');
+
+    $copyParams = godwit_build_sync_params($job, $fs, '/tmp/filter.txt', 1000, null, null);
+    $copyConfig = json_decode($copyParams['_config'], true);
+    assert_true(!array_key_exists('BackupDir', $copyConfig), 'copy mode must not set BackupDir');
+});
+
+t('godwit_build_sync_params: refuses to build params for a reversed-direction Fs pair', function () {
+    $bad = ['srcFs' => 'gdrive:godwit/Kieren', 'dstFs' => '/mnt/user/Kieren'];
+    try {
+        godwit_build_sync_params(['share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync'], $bad, '/tmp/f', 100, null, null);
+        throw new \RuntimeException('expected an exception');
+    } catch (\RuntimeException $e) {
+        assert_true(str_contains($e->getMessage(), 'not a local path'), $e->getMessage());
+    }
+});
+
+t('godwit_sync_rc_path: sync and copy map to the right rc endpoint', function () {
+    assert_eq('sync/sync', godwit_sync_rc_path('sync'), 'sync');
+    assert_eq('sync/copy', godwit_sync_rc_path('copy'), 'copy');
+});
+
+// --- Overlap / destination validation ------------------------------------
+
+t('godwit_validate_job_destinations: the four Phase 3 defaults do not overlap', function () {
+    assert_eq(null, godwit_validate_job_destinations(godwit_default_jobs()), 'default jobs should not overlap');
+});
+
+t('godwit_validate_job_destinations: rejects two jobs with the same destination', function () {
+    $jobs = [
+        ['name' => 'A', 'share' => 'Kieren', 'remote' => 'gdrive', 'enabled' => true],
+        ['name' => 'B', 'share' => 'Kieren', 'remote' => 'gdrive', 'enabled' => true],
+    ];
+    $err = godwit_validate_job_destinations($jobs);
+    assert_true($err !== null && str_contains($err, 'overlapping'), 'expected an overlap error: ' . var_export($err, true));
+});
+
+t('godwit_validate_job_destinations: ignores a disabled job\'s overlap', function () {
+    $jobs = [
+        ['name' => 'A', 'share' => 'Kieren', 'remote' => 'gdrive', 'enabled' => true],
+        ['name' => 'B', 'share' => 'Kieren', 'remote' => 'gdrive', 'enabled' => false],
+    ];
+    assert_eq(null, godwit_validate_job_destinations($jobs), 'a disabled job cannot run, so it cannot overlap');
+});
+
+t('godwit_validate_job_destinations: rejects a destination under godwit/_versions', function () {
+    $jobs = [['name' => 'Bad', 'share' => '_versions', 'remote' => 'gdrive', 'enabled' => true]];
+    $err = godwit_validate_job_destinations($jobs);
+    assert_true($err !== null && str_contains($err, '_versions'), var_export($err, true));
+});
+
+// --- Filter compilation + effect (against the real bundled rclone) ------
+
+t('godwit_compile_filter_rules: global excludes plus per-job excludes, in order', function () {
+    $job = ['excludes' => ['/TimeMachine/**', '/Backup/BombVault/**']];
+    $rules = godwit_compile_filter_rules($job);
+    assert_true(in_array('- .DS_Store', $rules, true), 'global exclude present');
+    assert_true(in_array('- /TimeMachine/**', $rules, true), 'job exclude present');
+    assert_eq(count(godwit_global_excludes()) + 2, count($rules), 'total rule count');
+});
+
+t('godwit_compile_filter_rules + rclone lsf -R: excludes are actually filtered by the bundled binary', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return; // not cached locally — covered by host verification instead.
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-filter-' . bin2hex(random_bytes(4));
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    assert_true(is_file($rclone), 'expected an unzipped rclone binary');
+
+    $tree = $tmp . '/tree';
+    $paths = [
+        'TimeMachine/backup.sparsebundle/x',       // anchored exclude: must be filtered
+        'Backup/BombVault/secrets.cfg',             // anchored exclude: must be filtered
+        'Backup/AirVault/photo.jpg',                 // sibling of BombVault: must survive
+        '.DS_Store',                                  // unanchored exclude at root
+        'nested/dir/.DS_Store',                       // unanchored exclude at any depth
+        'nested/dir/._resource',                      // unanchored ._* at any depth
+        'loose-file.txt',                             // ordinary file: must survive
+    ];
+    foreach ($paths as $p) {
+        $full = $tree . '/' . $p;
+        @mkdir(dirname($full), 0755, true);
+        file_put_contents($full, 'x');
+    }
+
+    $job = ['excludes' => ['/TimeMachine/**', '/Backup/BombVault/**']];
+    $filterFile = $tmp . '/filter.txt';
+    godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+
+    $out = [];
+    exec($rclone . ' lsf -R --filter-from ' . escapeshellarg($filterFile) . ' ' . escapeshellarg($tree), $out);
+    $listed = implode("\n", $out);
+
+    foreach (['TimeMachine/backup.sparsebundle/x', 'Backup/BombVault/secrets.cfg', '.DS_Store', 'nested/dir/.DS_Store', 'nested/dir/._resource'] as $excluded) {
+        assert_true(!str_contains($listed, $excluded), "$excluded should have been filtered out; lsf output:\n$listed");
+    }
+    foreach (['Backup/AirVault/photo.jpg', 'loose-file.txt'] as $kept) {
+        assert_true(str_contains($listed, $kept), "$kept should have survived filtering; lsf output:\n$listed");
+    }
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+// --- Budget ledger maths --------------------------------------------------
+
+t('godwit_ledger_used_24h: sums only samples inside the rolling 24h window', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_budget_table($db);
+    $now = 1000000;
+    godwit_record_ledger_delta($db, 'gdrive', $now - 90000, 5_000_000_000); // >24h ago: excluded
+    godwit_record_ledger_delta($db, 'gdrive', $now - 3600, 2_000_000_000);
+    godwit_record_ledger_delta($db, 'gdrive', $now - 60, 1_000_000_000);
+    godwit_record_ledger_delta($db, 'onedrive', $now - 60, 9_000_000_000); // different remote: excluded
+    assert_eq(3_000_000_000, godwit_ledger_used_24h($db, 'gdrive', $now), 'rolling sum');
+});
+
+t('godwit_ledger_used_24h: a delta exactly at the 24h boundary is excluded (ts > since, not >=)', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_budget_table($db);
+    $now = 1000000;
+    godwit_record_ledger_delta($db, 'gdrive', $now - 86400, 1_000_000_000);
+    assert_eq(0, godwit_ledger_used_24h($db, 'gdrive', $now), 'exactly-24h-old sample rolls off');
+});
+
+t('godwit_record_ledger_delta: ignores zero/negative deltas (a stats-group reset must not subtract from the ledger)', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_budget_table($db);
+    godwit_record_ledger_delta($db, 'gdrive', 1000, -500);
+    godwit_record_ledger_delta($db, 'gdrive', 1000, 0);
+    assert_eq(0, godwit_ledger_used_24h($db, 'gdrive', 100000), 'no rows should have been recorded');
+});
+
+t('godwit_remaining_budget: caps at zero, never negative', function () {
+    assert_eq(0, godwit_remaining_budget(100, 150), 'overshoot clamps to 0');
+    assert_eq(50, godwit_remaining_budget(100, 50), 'plain subtraction');
+});
+
+t('godwit_default_budget_cap_bytes: matches the D12 700 GiB default', function () {
+    assert_eq(700 * 1024 * 1024 * 1024, godwit_default_budget_cap_bytes(), '700 GiB in bytes');
+});
+
+t('budget ledger: overshoot scenario — MaxTransfer per job can overshoot, the ledger still reflects real usage and zeroes remaining', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_budget_table($db);
+    $cap = 10_000_000_000;
+    $now = 500000;
+    // Two jobs each requested max_transfer=remaining, but (per Phase 1's spike finding) actually transferred more due to in-flight files rounding up.
+    godwit_record_ledger_delta($db, 'gdrive', $now - 100, 6_000_000_000);
+    $remaining1 = godwit_remaining_budget($cap, godwit_ledger_used_24h($db, 'gdrive', $now));
+    assert_eq(4_000_000_000, $remaining1, 'remaining after first job');
+    godwit_record_ledger_delta($db, 'gdrive', $now - 50, 5_000_000_000); // overshoots remaining1
+    $remaining2 = godwit_remaining_budget($cap, godwit_ledger_used_24h($db, 'gdrive', $now));
+    assert_eq(0, $remaining2, 'the ledger, not MaxTransfer, is what actually stops further starts once the cap is exceeded');
+});
+
+// --- Throttling ------------------------------------------------------------
+
+t('godwit_throttled_until / godwit_mark_throttled: throttle applies and expires', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_throttle_table($db);
+    $now = 1000000;
+    assert_eq(null, godwit_throttled_until($db, 'gdrive', $now), 'not throttled yet');
+    godwit_mark_throttled($db, 'gdrive', $now + 86400);
+    assert_eq($now + 86400, godwit_throttled_until($db, 'gdrive', $now), 'throttled until the stored ts');
+    assert_eq(null, godwit_throttled_until($db, 'gdrive', $now + 86400 + 1), 'expired after until_ts passes');
+});
+
+t('godwit_is_upload_limit_error: recognises the drive_stop_on_upload_limit error shape', function () {
+    assert_true(godwit_is_upload_limit_error('googleapi: Error 403: User rate limit exceeded... uploadLimitExceeded'), 'should match');
+    assert_true(!godwit_is_upload_limit_error('permission denied'), 'unrelated error must not match');
+});
+
+// --- Windows and speed -----------------------------------------------------
+
+function godwit_test_dt(string $s): \DateTimeImmutable
+{
+    return new \DateTimeImmutable($s, new \DateTimeZone('Australia/Brisbane'));
+}
+
+t('godwit_time_in_window: the D12 default (22:00-06:00 every day) covers late evening', function () {
+    $w = godwit_default_windows()[0];
+    assert_true(godwit_time_in_window($w, godwit_test_dt('2026-09-17 23:00:00')), '23:00 should be inside the window');
+});
+
+t('godwit_time_in_window: the D12 default covers pre-dawn on the following calendar day (midnight wrap)', function () {
+    $w = godwit_default_windows()[0];
+    assert_true(godwit_time_in_window($w, godwit_test_dt('2026-09-18 05:00:00')), '05:00 the next day should still be inside the window');
+});
+
+t('godwit_time_in_window: just after the window closes is outside', function () {
+    $w = godwit_default_windows()[0];
+    assert_true(!godwit_time_in_window($w, godwit_test_dt('2026-09-18 06:00:00')), '06:00 is the boundary — outside');
+    assert_true(!godwit_time_in_window($w, godwit_test_dt('2026-09-18 07:00:00')), '07:00 is outside');
+});
+
+t('godwit_time_in_window: just before the window opens is outside', function () {
+    $w = godwit_default_windows()[0];
+    assert_true(!godwit_time_in_window($w, godwit_test_dt('2026-09-17 21:59:00')), '21:59 is outside');
+});
+
+t('godwit_time_in_window: respects the weekday list on a midnight-wrap window', function () {
+    // Window only active Mon (day 1): 2026-09-14 is a Monday.
+    $w = ['days' => [1], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => 100.0];
+    assert_true(godwit_time_in_window($w, godwit_test_dt('2026-09-14 23:00:00')), 'Monday 23:00 is inside');
+    assert_true(godwit_time_in_window($w, godwit_test_dt('2026-09-15 05:00:00')), 'Tuesday 05:00 (spillover from Monday) is inside');
+    assert_true(!godwit_time_in_window($w, godwit_test_dt('2026-09-15 23:00:00')), 'Tuesday 23:00 is outside — Tuesday is not a window day');
+});
+
+t('godwit_active_window: returns null outside every window', function () {
+    assert_eq(null, godwit_active_window(godwit_default_windows(), godwit_test_dt('2026-09-17 12:00:00')), 'midday should be outside the D12 default');
+});
+
+t('godwit_seconds_to_window_end: mid-window returns seconds to the boundary, wrapping past midnight', function () {
+    $w = godwit_default_windows()[0];
+    $secs = godwit_seconds_to_window_end($w, godwit_test_dt('2026-09-17 23:00:00'));
+    assert_eq(7 * 3600, $secs, '23:00 to 06:00 next day is 7 hours');
+});
+
+t('godwit_mbit_to_bytes_per_sec: 250 Mbit/s converts to the exact byte rate (not the M/MiB suffix)', function () {
+    assert_eq(31250000, godwit_mbit_to_bytes_per_sec(250.0), '250 Mbit/s = 31,250,000 B/s');
+});
+
+t('godwit_bwlimit_rc_value: emits an explicit byte count with a B suffix, never an M (MiB) suffix', function () {
+    assert_eq('31250000B', godwit_bwlimit_rc_value(250.0), 'must not be "31.25M" — that is 262 Mbit/s, a ~5% overshoot');
+});
+
+t('godwit_format_mbit_and_mib: shows both units', function () {
+    $s = godwit_format_mbit_and_mib(250.0);
+    assert_true(str_contains($s, '250'), $s);
+    assert_true(str_contains($s, '29.8'), "expected ~29.8 MiB/s: $s");
+});
+
+t('godwit_profile_warning: 250 Mbit/s window against the 500/50 profile warns (250 >= 80% of 50)', function () {
+    $w = godwit_profile_warning('500/50', 250.0);
+    assert_true($w !== null && str_contains($w, '50'), var_export($w, true));
+});
+
+t('godwit_profile_warning: 250 Mbit/s window against the 1000/400 profile does not warn (250 < 80% of 400)', function () {
+    assert_eq(null, godwit_profile_warning('1000/400', 250.0), 'should be comfortably under 320');
+});
+
+t('godwit_profile_warning: exactly at the 80% boundary warns', function () {
+    assert_true(godwit_profile_warning('500/50', 40.0) !== null, '40 is exactly 80% of 50 — should warn');
+});
+
+// --- Queue ordering / one-per-remote ---------------------------------------
+
+t('godwit_select_next_jobs: default jobs queue in Filing Cabinet, Kieren, Teegan, Photos order but only one starts (all share gdrive)', function () {
+    $selected = godwit_select_next_jobs(godwit_default_jobs(), []);
+    assert_eq(1, count($selected), 'only one job per remote may start at once');
+    assert_eq('Filing Cabinet', $selected[0]['name'], 'smallest share starts first');
+});
+
+t('godwit_select_next_jobs: skips a remote that already has a job active', function () {
+    $selected = godwit_select_next_jobs(godwit_default_jobs(), ['gdrive']);
+    assert_eq(0, count($selected), 'gdrive already busy — nothing new starts');
+});
+
+t('godwit_select_next_jobs: two different remotes can each start one job', function () {
+    $jobs = [
+        ['name' => 'A', 'share' => 'A', 'remote' => 'gdrive', 'enabled' => true],
+        ['name' => 'B', 'share' => 'B', 'remote' => 'onedrive', 'enabled' => true],
+    ];
+    $selected = godwit_select_next_jobs($jobs, []);
+    assert_eq(2, count($selected), 'different remotes run independently');
+});
+
+t('godwit_select_next_jobs: disabled jobs never get selected', function () {
+    $jobs = [['name' => 'A', 'share' => 'A', 'remote' => 'gdrive', 'enabled' => false]];
+    assert_eq(0, count(godwit_select_next_jobs($jobs, [])), 'disabled job must not start');
+});
+
+// --- Requeue after restart --------------------------------------------------
+
+t('godwit_interrupt_open_runs: closes an in-flight run as interrupted and reports it for requeue', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    $runId = godwit_start_job_run($db, 'Kieren', 'gdrive', 1000);
+    $closed = godwit_interrupt_open_runs($db, 2000);
+    assert_eq(1, count($closed), 'one open run should have been found');
+    assert_eq('Kieren', $closed[0]['job_name'], 'job name');
+    $last = godwit_last_job_run($db, 'Kieren');
+    assert_eq('interrupted', $last['outcome'], 'run should be marked interrupted');
+    assert_eq(2000, (int) $last['ended_ts'], 'ended_ts should be set');
+});
+
+t('godwit_interrupt_open_runs: a cleanly finished run is left alone', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    $runId = godwit_start_job_run($db, 'Photos', 'gdrive', 1000);
+    godwit_finish_job_run($db, $runId, 1500, 100, 5, 0, 'completed');
+    $closed = godwit_interrupt_open_runs($db, 2000);
+    assert_eq(0, count($closed), 'nothing should be reported for requeue');
+    assert_eq('completed', godwit_last_job_run($db, 'Photos')['outcome'], 'outcome must be unchanged');
+});
+
+// --- Version retention purge safety -----------------------------------------
+
+t('godwit_versions_purge_candidates: only date-shaped dirs older than retainDays are candidates', function () {
+    $now = godwit_test_dt('2026-09-17 00:00:00');
+    $dirs = ['2026-08-01', '2026-09-10', '2026-09-17', 'latest', '..', 'all'];
+    $candidates = godwit_versions_purge_candidates($dirs, 30, $now);
+    assert_true(in_array('2026-08-01', $candidates, true), '2026-08-01 is >30 days old');
+    assert_true(!in_array('2026-09-10', $candidates, true), '2026-09-10 is within 30 days');
+    assert_true(!in_array('latest', $candidates, true), 'non-date names must never be candidates');
+    assert_true(!in_array('..', $candidates, true), 'traversal-shaped names must never be candidates');
+    assert_true(!in_array('all', $candidates, true), 'non-date names must never be candidates');
+});
+
+t('godwit_assert_purge_path: builds the exact expected path for a valid date dir', function () {
+    assert_eq('gdrive:godwit/_versions/Kieren/2026-08-01', godwit_assert_purge_path('gdrive', 'Kieren', '2026-08-01'), 'path shape');
+});
+
+t('godwit_assert_purge_path: refuses a non-date dir name (must never target anything outside _versions/)', function () {
+    foreach (['..', 'all', '2026-13-99extra', '../../etc', ''] as $bad) {
+        try {
+            godwit_assert_purge_path('gdrive', 'Kieren', $bad);
+            throw new \RuntimeException("expected an exception for dateDir=" . var_export($bad, true));
+        } catch (\InvalidArgumentException $e) {
+            assert_true(true, 'threw as expected for ' . var_export($bad, true));
+        }
+    }
+});
+
+t('godwit_assert_purge_path: refuses a share name with a path separator', function () {
+    try {
+        godwit_assert_purge_path('gdrive', 'Kieren/../../secrets', '2026-08-01');
+        throw new \RuntimeException('expected an exception');
+    } catch (\InvalidArgumentException $e) {
+        assert_true(true, 'threw as expected');
+    }
+});
+
+t('godwit_assert_purge_path: refuses a remote name containing a colon or slash', function () {
+    foreach (['gdrive:evil', 'gdrive/evil'] as $bad) {
+        try {
+            godwit_assert_purge_path($bad, 'Kieren', '2026-08-01');
+            throw new \RuntimeException('expected an exception for remote=' . $bad);
+        } catch (\InvalidArgumentException $e) {
+            assert_true(true, 'threw as expected');
+        }
+    }
+});
+
+// --- Notifications -----------------------------------------------------
+
+t('godwit_budget_reached_notification: fires once, not again the same day', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_notify_state_table($db);
+    $n1 = godwit_budget_reached_notification($db, 'gdrive', '2026-09-17');
+    assert_true($n1 !== null, 'first call today should notify');
+    $n2 = godwit_budget_reached_notification($db, 'gdrive', '2026-09-17');
+    assert_eq(null, $n2, 'second call same day should not notify again');
+    $n3 = godwit_budget_reached_notification($db, 'gdrive', '2026-09-18');
+    assert_true($n3 !== null, 'a new day should notify again');
+});
+
+t('godwit_throttled_notification: fires only on entering the throttled state', function () {
+    $n1 = godwit_throttled_notification('gdrive', false);
+    assert_true($n1 !== null, 'entering throttled should notify');
+    $n2 = godwit_throttled_notification('gdrive', true);
+    assert_eq(null, $n2, 'already throttled must not notify again');
+});
+
+t('godwit_first_seed_notification: fires exactly once ever per job', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_notify_state_table($db);
+    $n1 = godwit_first_seed_notification($db, 'Filing Cabinet');
+    assert_true($n1 !== null, 'first completion should notify');
+    $n2 = godwit_first_seed_notification($db, 'Filing Cabinet');
+    assert_eq(null, $n2, 'must never notify twice for the same job');
+});
+
+t('godwit_job_error_notification: always builds an alert-level notification', function () {
+    $n = godwit_job_error_notification('Teegan', 'connection reset');
+    assert_eq('alert', $n['importance'], 'importance');
+    assert_true(str_contains($n['description'], 'connection reset'), $n['description']);
+});
+
+// --- jobs.json load/save ----------------------------------------------------
+
+t('godwit_load_jobs: seeds the Phase 3 defaults when jobs.json does not exist', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-jobs-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    $jobs = godwit_load_jobs($tmp);
+    assert_eq(4, count($jobs), 'four default jobs');
+    assert_eq('Filing Cabinet', $jobs[0]['name'], 'queue order preserved');
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+t('godwit_save_jobs / godwit_load_jobs: round-trips', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-jobs-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    $jobs = [['name' => 'Solo', 'share' => 'Solo', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 2, 'max_delete' => 500, 'excludes' => []]];
+    godwit_save_jobs($tmp, $jobs);
+    $loaded = godwit_load_jobs($tmp);
+    assert_eq('Solo', $loaded[0]['name'], 'round trip');
+    assert_true(is_file($tmp . '/jobs.json'), 'jobs.json should exist');
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
 // --- report ---------------------------------------------------------------
 
 printf("\n%d passed, %d failed\n", $passed, $failed);
