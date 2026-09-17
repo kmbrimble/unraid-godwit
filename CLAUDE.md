@@ -516,44 +516,68 @@ explicit instruction (they installed and are verifying v0.4.2 live; no
 install, no daemon/rcd restart, no mutating rc call was made this
 session). The user installs v0.4.3 by hand once released.
 
-**v0.4.4 (2026-09-18) fixes v0.4.3's own new end-to-end test being flaky
-on main — found by the user, not by CI or this session's own review.**
-The user ran `php tests/run.php` from `/projects/unraid-godwit` at the
+**v0.4.4 (2026-09-18) fixes v0.4.3's own new end-to-end test being red on
+main — found by the user, not by CI or this session's own review.** The
+user ran `php tests/run.php` from `/projects/unraid-godwit` at the
 released v0.4.3 tag 5 times: all 5 failed, always the same test, always
-the same shape (`bytes (0)`, `errorMsg = 'context canceled'`). Reproduced
-by hand against the bundled v1.75.1 binary directly (`rclone rcd` + raw
-`curl` rc calls, not the PHP harness) before touching any code, per the
-user's explicit instruction to find the cause rather than guess: the
-test's source tree split many small files into one subdirectory and a
-single oversized file (5x the transferable total) into a second, to force
-the MaxTransfer cutoff. rclone's directory march has no guaranteed
-traversal order between the two — when it happens to discover the
-oversized file first, that one candidate alone already exceeds
-MaxTransfer, so CAUTIOUS's cutoff trips before the other directory is
-even listed, cancelling the whole sync context with zero bytes
-transferred and `errorMsg = "context canceled"`. This is not "rare
-flakiness" in the usual sense (intermittent pass/fail) — it is decided
-once, deterministically, by whatever order that machine's/that session's
-directory walk happens to use, which is why it passed 15/15 times in the
-worktree that wrote it and failed 5/5 times on a fresh checkout. Fixed by
-moving every file into a single flat directory of uniform sizes (no
-oversized outlier, no second directory to race against), with
-`MaxTransfer` set to 60% of the real transferable total — ground-truthed
-locally at 15/15 repeat runs landing within ~0.15% of `MaxTransfer`, the
-expected masking error text
-(`can't move object - incompatible remotes`, a genuine rclone error from
-the pre-created destination-directory collision — not the cutoff's own
-text) and exactly 2 errors, every time. No production code changed —
-`godwit_bytes_near_max_transfer()`, `godwit_classify_job_outcome()` and
-`godwit_job_status_label()` are byte-identical to v0.4.3; only the test
-harness that exercises them against a real rcd was rewritten.
+the same shape (`bytes (0)`, `errorMsg = 'context canceled'`).
 
-Verified offline: 260/260 (`php tests/run.php`), stable across 15 repeat
-runs (this release's own bug was exactly the kind of thing 3 repeats
-missed — 15 is deliberately generous). **Not verified this release**:
-nothing against the live Google Drive remote or the host — the user is
-still verifying v0.4.2/v0.4.3 live and explicitly asked for build+release
-only, no install, no daemon/rcd restart, no mutating rc call.
+**Two separate problems, found by reproducing directly against the
+bundled v1.75.1 binary (`rclone rcd` + raw `curl` rc calls) before
+touching any code, per the user's explicit instruction to find the cause
+rather than guess:**
+
+1. **This session's original "260/260, stable across 3 repeats" claim in
+   the v0.4.3 handback was worthless — the test never actually ran.**
+   Every rcd end-to-end test in this suite (not just the new one) opens
+   with `if (!is_file($zip)) { return; }`, and this project's `t()`
+   helper counts a clean `return` as `PASS`. `build/` is populated only
+   by `scripts/build-plugin.sh` and is gitignored — it does not exist in
+   a fresh `git worktree`, so every rcd e2e test silently *skipped* (not
+   ran, not passed) in the worktree v0.4.3 was built and "verified" in.
+   The same is true of `.github/workflows/ci.yml`, which checks out fresh
+   and never runs `build-plugin.sh` — these tests have never executed in
+   CI, a pre-existing gap not introduced by this release. The only reason
+   the user's run actually caught this is that `/projects/unraid-godwit`'s
+   shared checkout happens to have a `build/` cached locally from earlier
+   manual work. Not fixed this release (out of scope, recorded here so
+   it isn't lost again — see "Test command" below): the tests now log an
+   explicit "skipped — build/ not populated" line instead of silently
+   returning, so a suspiciously-fast green run has a visible clue, but
+   CI still does not exercise these tests at all.
+2. **Once actually executed, the test itself had a real bug.** Its source
+   tree split into two subdirectories — many small files in one, a single
+   oversized file (5x the transferable total) in the other, to force the
+   MaxTransfer cutoff. rclone's directory march has no guaranteed
+   traversal order between the two — when it discovers the oversized file
+   first, that one candidate alone already exceeds MaxTransfer, so
+   CAUTIOUS's cutoff trips before the other directory is even listed,
+   cancelling the whole sync context with zero bytes transferred and
+   `errorMsg = "context canceled"`. Fixed by moving every file into a
+   single flat directory of uniform sizes (no oversized outlier, no
+   second directory to race against), with `MaxTransfer` set to 60% of
+   the real transferable total — ground-truthed at 10/10 repeat runs
+   (with `build/` actually populated and confirmed present before every
+   run this time) landing within ~0.15% of `MaxTransfer`, the expected
+   masking error text (`can't move object - incompatible remotes`, a
+   genuine rclone error from the pre-created destination-directory
+   collision — not the cutoff's own text) and exactly 2 errors, every
+   time.
+
+No production code changed — `godwit_bytes_near_max_transfer()`,
+`godwit_classify_job_outcome()` and `godwit_job_status_label()` are
+byte-identical to v0.4.3; only the test harness that exercises them
+against a real rcd was rewritten.
+
+Verified offline: 260/260 (`php tests/run.php`), with `build/` manually
+populated and its presence confirmed before each of 10 repeat runs (this
+release's own bug — an unpopulated `build/` silently skipping the very
+test under test — is exactly the kind of thing that made the *previous*
+release's "stable across repeats" claim meaningless; this time presence
+was checked, not assumed). **Not verified this release**: nothing against
+the live Google Drive remote or the host — the user is still verifying
+v0.4.2/v0.4.3 live and explicitly asked for build+release only, no
+install, no daemon/rcd restart, no mutating rc call.
 
 See PLAN.md §5 for the remaining phases.
 
@@ -569,6 +593,25 @@ needs `curl`, `unzip` and `xz-utils`. As of 0.4.0 this also requires `node`
 (present by default on `ubuntu-latest` CI runners) — `tests/run.php` shells
 out to `node tests/windows_form_test.mjs` and hard-fails, not skips, if
 `node` is missing.)
+
+**Known gap (found 2026-09-18, v0.4.4): every real-rcd end-to-end test
+silently SKIPS — not "passes" — unless `build/rclone-v1.75.1-linux-amd64.zip`
+is present**, and each such test's own `t()` result reads as `PASS` either
+way (a clean early `return` and a real green assertion look identical in
+the suite's output). `build/` is gitignored and only populated by
+`scripts/build-plugin.sh`, so it does **not** exist in a fresh `git
+worktree` — meaning every `/feature` session's own "N/N passed, stable
+across repeats" claim for anything touching these tests has been
+unverified by construction unless that session separately ran
+`build-plugin.sh` or copied a cached zip in first. It also does not exist
+in `.github/workflows/ci.yml` (checks out fresh, never builds) — these
+tests have **never run in CI**, on any release to date. To actually
+exercise them locally: `bash scripts/build-plugin.sh <any-version>` first
+(downloads and SHA256-verifies the real binary into `build/`), or copy an
+already-cached `build/*.zip` from another checkout. As of v0.4.4 these
+tests log an explicit "skipped — build/ ... not found" line instead of a
+bare `return`, so a suspiciously test-count-light run is at least visible
+in the output — this does not close the CI gap, which remains open.
 
 ## Deploy and verify
 

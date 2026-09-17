@@ -14,34 +14,52 @@ sort *before* `1.0.9`.
 
 ### Fixed
 
-- **v0.4.3's own new end-to-end test was flaky on main — found by the
-  user running `php tests/run.php` 5 times from `/projects/unraid-godwit`
+- **v0.4.3's own new end-to-end test was red on main — found by the user
+  running `php tests/run.php` 5 times from `/projects/unraid-godwit`
   after the release, all 5 failing deterministically** (`259 passed, 1
   failed`, always the same test: `bytes (0) vs MaxTransfer (...)`,
-  `errorMsg = 'context canceled'`). Root cause, diagnosed by reproducing
-  the exact scenario directly against the bundled v1.75.1 binary (not
-  guessed): the test split its source tree into two subdirectories — many
-  small files in one, a single oversized file (5x the total) in the
-  other, to force the MaxTransfer cutoff. rclone's directory march does
-  not guarantee it visits the first subdirectory before the second — when
-  it discovers the oversized file first, that ONE candidate alone already
-  exceeds MaxTransfer, so CAUTIOUS's cutoff trips before any file in the
-  other directory is even listed, cancelling the whole sync context
-  (`context canceled`) with zero bytes transferred. This reproduced
-  nothing about the masking bug the test exists to prove, and — critically
-  — is not a rare/flaky race in the sense of "sometimes passes, sometimes
-  fails": it is decided once by directory traversal order, which appears
-  to differ deterministically between environments (the interactive
-  session that wrote the test happened to get the other ordering,
-  consistently; a later plain checkout got this ordering, also
-  consistently). Fixed by moving every file into a SINGLE flat directory
-  of uniform-sized files, with `MaxTransfer` set to 60% of the real
+  `errorMsg = 'context canceled'`).
+  **Two separate problems, not one**, both found only by reproducing
+  directly against the bundled v1.75.1 binary (not guessed):
+  1. Every rcd end-to-end test in this suite (not just the new one) opens
+     with `if (!is_file($zip)) { return; }`, and this project's `t()`
+     helper counts a clean `return` as `PASS`. `build/` is gitignored
+     (only populated by `scripts/build-plugin.sh`) and does not exist in
+     a fresh `git worktree` — so this test, and every other rcd e2e test,
+     silently *skipped* (not passed, not ran) in the worktree that wrote
+     it, and its "260/260, stable across repeats" claim in the original
+     v0.4.3 handback was worthless: the test that mattered never actually
+     executed. It also means these tests never run in CI (`ci.yml`
+     checks out fresh and never runs `build-plugin.sh`) — a pre-existing
+     gap, not introduced by this release, but this is what let a broken
+     e2e test ship. `/projects/unraid-godwit`'s shared checkout happens to
+     have a locally cached `build/` from earlier manual work, which is
+     why the user's run actually executed it and caught the bug.
+  2. The test itself had a real bug once actually executed: it split its
+     source tree into two subdirectories — many small files in one, a
+     single oversized file (5x the total) in the other, to force the
+     MaxTransfer cutoff. rclone's directory march does not guarantee it
+     visits the first subdirectory before the second — when it discovers
+     the oversized file first, that ONE candidate alone already exceeds
+     MaxTransfer, so CAUTIOUS's cutoff trips before any file in the other
+     directory is even listed, cancelling the whole sync context
+     (`context canceled`) with zero bytes transferred. This reproduced
+     nothing about the masking bug the test exists to prove.
+  Fixed (2): moved every file into a SINGLE flat directory of
+  uniform-sized files, with `MaxTransfer` set to 60% of the real
   transferable total (matching the measurements already cited for the 2%
-  tolerance) — ground-truthed locally at 15/15 repeat runs landing within
-  ~0.15% of `MaxTransfer`, with the expected masking error text
-  (`can't move object - incompatible remotes` — a genuine rclone error
-  from the pre-created destination-directory collision, not the cutoff's
-  own text) and exactly 2 errors, every time.
+  tolerance) — ground-truthed at 10/10 repeat runs (with `build/`
+  actually populated this time, confirmed present before every run)
+  landing within ~0.15% of `MaxTransfer`, with the expected masking error
+  text (`can't move object - incompatible remotes` — a genuine rclone
+  error from the pre-created destination-directory collision, not the
+  cutoff's own text) and exactly 2 errors, every time. Not fixed (1): the
+  gitignored-`build/`-means-silent-skip gap is a pre-existing, structural
+  issue affecting every rcd e2e test in this suite, not something this
+  release's scope covers — recorded in CLAUDE.md's Test command section
+  so it isn't lost again, and this test now logs an explicit "skipped —
+  build/ not populated" line instead of silently returning, so the next
+  person who sees a suspiciously-fast green run has a clue.
 - No production code changed this release — `godwit_bytes_near_max_transfer()`,
   `godwit_classify_job_outcome()` and `godwit_job_status_label()` are
   unchanged from v0.4.3; only the test harness that exercises them against

@@ -1270,6 +1270,7 @@ t('godwit_read_rc_credentials: returns null when godwitd has never written one',
 t('godwit_handle_remote_action: add drive -> list (no secrets in response) -> delete, against a real rcd', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return; // not cached locally in this environment — covered by host verification instead.
     }
     $tmp = sys_get_temp_dir() . '/godwit-remote-action-' . bin2hex(random_bytes(4));
@@ -1939,6 +1940,7 @@ t('godwit_compile_filter_rules: global excludes plus per-job excludes, in order'
 t('godwit_compile_filter_rules + rclone lsf -R: excludes are actually filtered by the bundled binary', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return; // not cached locally — covered by host verification instead.
     }
     $tmp = sys_get_temp_dir() . '/godwit-filter-' . bin2hex(random_bytes(4));
@@ -2761,6 +2763,7 @@ t('godwit_load_settings / godwit_save_settings: seeds D12 defaults, round-trips,
 t('godwit_build_sync_params + rc sync/copy: excludes are honoured, budget cutoff produces the exact error string godwit_classify_job_outcome() expects', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return; // not cached locally — covered by host verification instead.
     }
     $tmp = sys_get_temp_dir() . '/godwit-e2e-sync-' . bin2hex(random_bytes(4));
@@ -2854,6 +2857,7 @@ t('godwit_build_sync_params + rc sync/copy: excludes are honoured, budget cutoff
 t('godwit_build_sync_params + rc sync/copy: a MaxTransfer cutoff that skips an entire subdirectory (the exact shape of the 2026-09-18 Kieren/Teegan incident — a dest dir the cutoff never reached) still classifies as budget, not error, because NoUpdateDirModTime stops rclone from ever trying to timestamp a directory that does not exist yet', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return; // not cached locally — covered by host verification instead.
     }
     $tmp = sys_get_temp_dir() . '/godwit-e2e-dirmodtime-' . bin2hex(random_bytes(4));
@@ -2951,6 +2955,7 @@ t('godwit_build_sync_params + rc sync/copy: a MaxTransfer cutoff that skips an e
 t('v0.4.3 end-to-end against a real rcd: a genuine per-file error masking the MaxTransfer cutoff text is still classified budget via the byte-proximity fallback, and the real error is not hidden — reproduces the exact shape of the 2026-09-18 Photos/Teegan/Kieren incident, where every budget-capped run also had real per-file errors', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return;
     }
     $tmp = sys_get_temp_dir() . '/godwit-e2e-maskedbudget-' . bin2hex(random_bytes(4));
@@ -3073,6 +3078,7 @@ t('v0.4.3 end-to-end against a real rcd: a genuine per-file error masking the Ma
 t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --max-duration classifies as window (proven against the real binary, not assumed)', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return;
     }
     $tmp = sys_get_temp_dir() . '/godwit-e2e-duration-' . bin2hex(random_bytes(4));
@@ -3159,6 +3165,7 @@ t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --
 t('rc sync/copy: rclone\'s OWN graceful MaxTransfer cutoff (not godwitd\'s job/stop) costs up to Transfers errors, not a fixed 1 (a separate 20-run bash repro at Transfers=8 measured 1-4; this single run just proves the count stays in [1, Transfers] and that the notification baseline must be Transfers, not a fixed 1) — an earlier version of this fix assumed rclone\'s own cutoff was always exactly 1, measured only at Transfers=1', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return;
     }
     $tmp = sys_get_temp_dir() . '/godwit-e2e-multitransfer-' . bin2hex(random_bytes(4));
@@ -3234,6 +3241,7 @@ t('rc sync/copy: rclone\'s OWN graceful MaxTransfer cutoff (not godwitd\'s job/s
 t('rc job/stop (godwitd\'s own mid-run ledger stop, $stoppedForBudget) costs one "context canceled" error per in-flight transfer slot, not the MaxTransfer/MaxDuration cutoffs\' own baselines — proves godwit_cap_stop_notification()\'s per-path baseline is real, not assumed', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return;
     }
     $tmp = sys_get_temp_dir() . '/godwit-e2e-jobstop-' . bin2hex(random_bytes(4));
@@ -3312,6 +3320,7 @@ t('rc job/stop (godwitd\'s own mid-run ledger stop, $stoppedForBudget) costs one
 t('godwit_list_versions_dirs: end-to-end against a real rcd — lists real date dirs, and a not-yet-created share is absent, not an error', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return; // not cached locally — covered by host verification instead.
     }
     $tmp = sys_get_temp_dir() . '/godwit-e2e-versions-list-' . bin2hex(random_bytes(4));
