@@ -86,8 +86,34 @@ if (file_exists($pidFile)) {
     <button id="godwit-run-now" type="button">Run now</button>
     <button id="godwit-pause" type="button">Pause all</button>
     <button id="godwit-resume" type="button">Resume all</button>
+    <button id="job-add-open" type="button">Add job</button>
 </p>
 <div id="godwit-jobs-message"></div>
+
+<div id="job-add-dialog" style="display:none">
+    <h3>Add job</h3>
+    <label>Name <input type="text" id="job-add-name" size="30"></label><br>
+    <label>Share <input type="text" id="job-add-share" size="30"></label><br>
+    <label>Remote <select id="job-add-remote"></select></label><br>
+    <label>Type
+        <select id="job-add-type">
+            <option value="share">Whole share</option>
+            <option value="selective">Selective — browse folders/files</option>
+        </select>
+    </label><br>
+    <div id="job-add-selective" style="display:none">
+        <button id="job-add-browse" type="button">Browse…</button>
+        <span id="job-add-selection-summary"></span>
+    </div>
+    <button id="job-add" type="button">Add job</button>
+    <div id="job-add-message"></div>
+</div>
+
+<div id="tree-dialog" style="display:none">
+    <p>Total selected: <span id="tree-total-size">—</span></p>
+    <div id="tree-root">Loading…</div>
+    <button id="tree-done" type="button">Done</button>
+</div>
 </details>
 
 <details id="godwit-section-windows">
@@ -190,6 +216,12 @@ function godwitRemotesRefresh() {
                 return;
             }
             var remotes = data.remotes || [];
+            var remoteSelect = document.getElementById('job-add-remote');
+            var prevRemote = remoteSelect.value;
+            remoteSelect.innerHTML = remotes.map(function (r) {
+                return '<option value="' + esc(r.name) + '">' + esc(r.name) + ' (' + esc(r.type) + ')</option>';
+            }).join('');
+            if (remotes.some(function (r) { return r.name === prevRemote; })) { remoteSelect.value = prevRemote; }
             if (remotes.length === 0) {
                 el.innerHTML = '<p>No remotes configured yet.</p>';
                 return;
@@ -541,6 +573,267 @@ function godwitRenderWindowsForm() {
     });
 }
 
+// GODWIT_TREE_BEGIN
+// Tri-state tree-selection logic (PLAN.md §4.4: "a folder's
+// checkbox includes everything below it; children can be un-ticked to
+// exclude"). Pure, DOM-free and dependency-free so tests/windows_form_test.mjs
+// can exercise it directly with no browser. `included`/`excluded` are arrays
+// of {path, is_dir}, `path` always share-relative with no leading/trailing
+// slash. This is deliberately a single level of override — un-ticking a
+// child of an included folder excludes it, but nothing lets you re-include
+// something nested under an excluded child; PLAN.md doesn't ask for that,
+// and the two-list model here can't express it.
+function godwitTreeAncestorPaths(path) {
+    var parts = path.split('/');
+    var out = [];
+    for (var i = 1; i <= parts.length; i++) { out.push(parts.slice(0, i).join('/')); }
+    return out; // ancestors first, path itself last
+}
+
+function godwitTreeFindByPath(list, path) {
+    for (var i = 0; i < list.length; i++) { if (list[i].path === path) { return list[i]; } }
+    return null;
+}
+
+// The *included* entry (closest ancestor, or the node itself) governing
+// this path's default state — null if none exists.
+function godwitTreeGoverningInclude(path, included) {
+    var ancestors = godwitTreeAncestorPaths(path);
+    for (var i = ancestors.length - 1; i >= 0; i--) {
+        var hit = godwitTreeFindByPath(included, ancestors[i]);
+        if (hit) { return hit; }
+    }
+    return null;
+}
+
+// Checked = explicitly included, or an included ancestor governs it and
+// neither it nor any of its ancestors (up to the governing include) is
+// explicitly excluded — un-ticking a folder must also un-tick everything
+// already visible beneath it, not just that exact path.
+function godwitTreeNodeChecked(path, included, excluded) {
+    var gov = godwitTreeGoverningInclude(path, included);
+    if (!gov) { return false; }
+    if (gov.path === path) { return true; }
+    var ancestors = godwitTreeAncestorPaths(path);
+    for (var i = 0; i < ancestors.length; i++) {
+        if (godwitTreeFindByPath(excluded, ancestors[i])) { return false; }
+    }
+    return true;
+}
+
+// Returns new {included, excluded} arrays after toggling one node's
+// checkbox. Never mutates the arrays passed in.
+function godwitTreeToggle(node, included, excluded) {
+    var path = node.path;
+    var wasChecked = godwitTreeNodeChecked(path, included, excluded);
+    var newIncluded = included.filter(function (n) { return n.path !== path; });
+    var newExcluded = excluded.filter(function (n) { return n.path !== path; });
+    if (wasChecked) {
+        var gov = godwitTreeGoverningInclude(path, included);
+        if (gov && gov.path === path) {
+            // Explicit include removed — any exclusions nested under it are
+            // now meaningless and are dropped too.
+            newExcluded = newExcluded.filter(function (n) { return n.path.indexOf(path + '/') !== 0; });
+        } else {
+            // Implied via an ancestor — un-tick it explicitly.
+            newExcluded.push({ path: path, is_dir: node.is_dir });
+        }
+    } else {
+        var gov2 = godwitTreeGoverningInclude(path, included);
+        if (!gov2) {
+            // No included ancestor — this becomes its own include root.
+            newIncluded.push({ path: path, is_dir: node.is_dir });
+        }
+        // else: it was excluded under an included ancestor — removing it
+        // from newExcluded above already re-includes it.
+    }
+    return { included: newIncluded, excluded: newExcluded };
+}
+// GODWIT_TREE_END
+
+var godwitJobSelections = {}; // job name -> {type, included, excluded}, the source of truth for every row's tree selection
+var godwitPendingNewJobs = []; // jobs added this session, not yet saved
+var godwitTreeIncluded = [];
+var godwitTreeExcluded = [];
+var godwitTreeShare = '';
+var godwitTreeTargetName = null; // null = the Add-job dialog's own scratch selection
+var godwitTreeScratch = { included: [], excluded: [] };
+
+function godwitTreeSelectionFor(name) {
+    return name === null ? godwitTreeScratch : (godwitJobSelections[name] || { included: [], excluded: [] });
+}
+
+function godwitTreeNodeLabel(entry) { return entry.name + (entry.is_dir ? '/' : ''); }
+
+function godwitTreeRenderChildren(container, parentPath, entries) {
+    container.innerHTML = entries.map(function (e) {
+        var path = parentPath ? parentPath + '/' + e.name : e.name;
+        var checked = godwitTreeNodeChecked(path, godwitTreeIncluded, godwitTreeExcluded);
+        var expandBtn = e.is_dir ? '<button type="button" class="godwit-tree-expand" data-path="' + esc(path) + '">▸</button> ' : '';
+        return '<div class="godwit-tree-node" data-path="' + esc(path) + '" style="margin-left:16px">' +
+            expandBtn +
+            '<label><input type="checkbox" class="godwit-tree-check" data-path="' + esc(path) + '" data-isdir="' + (e.is_dir ? '1' : '0') + '"' + (checked ? ' checked' : '') + '> ' + esc(godwitTreeNodeLabel(e)) + '</label> ' +
+            '<span class="godwit-tree-size" data-path="' + esc(path) + '"></span>' +
+            (e.is_dir ? '<div class="godwit-tree-children" style="display:none"></div>' : '') +
+            '</div>';
+    }).join('');
+}
+
+function godwitTreeLoad(parentPath, container) {
+    return godwitApiCall('tree_list', { share: godwitTreeShare, path: parentPath }).done(function (data) {
+        if (data.error) { container.innerHTML = godwitErrorHtml(data.error); return; }
+        godwitTreeRenderChildren(container, parentPath, data.entries || []);
+    });
+}
+
+// Sums each *included root's* on-demand size (never a full-tree walk, per
+// PLAN.md §4.4) rather than every visible node, since an included root's
+// own total already covers everything ticked beneath it.
+function godwitTreeUpdateTotal() {
+    var totalEl = document.getElementById('tree-total-size');
+    if (godwitTreeIncluded.length === 0) { totalEl.textContent = fmtBytes(0); return; }
+    totalEl.textContent = 'calculating…';
+    var total = 0;
+    var pending = godwitTreeIncluded.length;
+    godwitTreeIncluded.forEach(function (node) {
+        godwitApiCall('tree_size', { share: godwitTreeShare, path: node.path }).done(function (data) {
+            total += data.bytes || 0;
+        }).always(function () {
+            pending--;
+            if (pending === 0) { totalEl.textContent = fmtBytes(total); }
+        });
+    });
+}
+
+document.getElementById('tree-root').addEventListener('click', function (ev) {
+    if (ev.target.classList.contains('godwit-tree-expand')) {
+        var node = ev.target.closest('.godwit-tree-node');
+        var children = node.querySelector('.godwit-tree-children');
+        if (children.style.display === 'none') {
+            children.style.display = 'block';
+            ev.target.textContent = '▾';
+            if (!children.dataset.loaded) {
+                godwitTreeLoad(node.dataset.path, children).done(function () { children.dataset.loaded = '1'; });
+            }
+        } else {
+            children.style.display = 'none';
+            ev.target.textContent = '▸';
+        }
+        return;
+    }
+    if (ev.target.classList.contains('godwit-tree-check')) {
+        var path = ev.target.dataset.path;
+        var isDir = ev.target.dataset.isdir === '1';
+        var result = godwitTreeToggle({ path: path, is_dir: isDir }, godwitTreeIncluded, godwitTreeExcluded);
+        godwitTreeIncluded = result.included;
+        godwitTreeExcluded = result.excluded;
+        document.querySelectorAll('.godwit-tree-check').forEach(function (cb) {
+            cb.checked = godwitTreeNodeChecked(cb.dataset.path, godwitTreeIncluded, godwitTreeExcluded);
+        });
+        godwitTreeUpdateTotal();
+    }
+});
+
+function godwitTreeOpen(share, targetName) {
+    godwitTreeShare = share;
+    godwitTreeTargetName = targetName;
+    var sel = godwitTreeSelectionFor(targetName);
+    godwitTreeIncluded = sel.included.slice();
+    godwitTreeExcluded = sel.excluded.slice();
+    document.getElementById('tree-root').innerHTML = 'Loading…';
+    godwitTreeLoad('', document.getElementById('tree-root'));
+    godwitTreeUpdateTotal();
+    $('#tree-dialog').dialog('open');
+}
+
+document.getElementById('tree-done').addEventListener('click', function () {
+    var sel = { included: godwitTreeIncluded, excluded: godwitTreeExcluded };
+    if (godwitTreeTargetName === null) {
+        godwitTreeScratch = sel;
+        document.getElementById('job-add-selection-summary').textContent =
+            godwitTreeIncluded.length + ' selected (' + godwitTreeExcluded.length + ' excluded)';
+    } else {
+        godwitJobSelections[godwitTreeTargetName] = { type: 'selective', included: sel.included, excluded: sel.excluded };
+        godwitJobsRefresh();
+    }
+    $('#tree-dialog').dialog('close');
+});
+
+document.getElementById('job-add-type').addEventListener('change', function () {
+    document.getElementById('job-add-selective').style.display = this.value === 'selective' ? 'block' : 'none';
+});
+
+document.getElementById('job-add-browse').addEventListener('click', function () {
+    var share = document.getElementById('job-add-share').value.trim();
+    if (!share) { document.getElementById('job-add-message').innerHTML = godwitErrorHtml('enter a share name first'); return; }
+    godwitTreeOpen(share, null);
+});
+
+document.getElementById('job-add').addEventListener('click', function () {
+    var name = document.getElementById('job-add-name').value.trim();
+    var share = document.getElementById('job-add-share').value.trim();
+    var remote = document.getElementById('job-add-remote').value;
+    var type = document.getElementById('job-add-type').value;
+    var msg = document.getElementById('job-add-message');
+    if (!name || !share || !remote) {
+        msg.innerHTML = godwitErrorHtml('name, share and remote are all required');
+        return;
+    }
+    if (name in godwitJobSelections || godwitPendingNewJobs.some(function (j) { return j.name === name; })) {
+        msg.innerHTML = godwitErrorHtml('a job named "' + name + '" already exists');
+        return;
+    }
+    if (type === 'selective' && godwitTreeScratch.included.length === 0) {
+        msg.innerHTML = godwitErrorHtml('browse and select at least one folder or file first');
+        return;
+    }
+    godwitPendingNewJobs.push({ name: name, share: share, remote: remote, mode: 'sync', enabled: true, transfers: 4, max_delete: 1000 });
+    godwitJobSelections[name] = type === 'selective'
+        ? { type: 'selective', included: godwitTreeScratch.included, excluded: godwitTreeScratch.excluded }
+        : { type: 'share', included: [], excluded: [] };
+    godwitTreeScratch = { included: [], excluded: [] };
+    document.getElementById('job-add-selection-summary').textContent = '';
+    document.getElementById('job-add-name').value = '';
+    document.getElementById('job-add-share').value = '';
+    msg.innerHTML = '';
+    $('#job-add-dialog').dialog('close');
+    godwitJobsRefresh();
+});
+
+document.getElementById('godwit-jobs-table').addEventListener('click', function (ev) {
+    if (ev.target.classList.contains('godwit-job-browse')) {
+        var tr = ev.target.closest('tr');
+        godwitTreeOpen(tr.dataset.share, tr.dataset.name);
+    }
+});
+
+function godwitJobRowHtml(j) {
+    var sel = godwitJobSelections[j.name] || { type: j.type || 'share', included: j.included || [], excluded: j.excluded || [] };
+    var pending = !('status_text' in j);
+    var state = pending ? 'not yet saved' : (j.running
+        ? 'running — ' + fmtBytes(j.progress.bytes) + ', ' + j.progress.files + ' files, ' +
+          (j.progress.speed_bps !== null ? fmtBytes(j.progress.speed_bps) + '/s' : 'speed unknown') +
+          ', ETA ' + fmtDuration(j.progress.eta_seconds)
+        : j.status_text);
+    var queue = pending || j.running ? '-' : (j.queue_position !== null ? j.queue_position : '-');
+    var selectionCell = sel.type === 'selective'
+        ? '<button type="button" class="godwit-job-browse" data-name="' + esc(j.name) + '">Browse (' + sel.included.length + ')</button>'
+        : '<input type="text" class="godwit-job-excludes" value="' + esc((j.excludes || []).join(', ')) + '" size="30">';
+    return '<tr data-name="' + esc(j.name) + '" data-share="' + esc(j.share) + '" data-remote="' + esc(j.remote) + '" data-maxdelete="' + (j.max_delete || 1000) + '">' +
+        '<td>' + esc(j.name) + '</td>' +
+        '<td>' + esc(j.remote) + '</td>' +
+        '<td>' + esc(sel.type) + '</td>' +
+        '<td><input type="checkbox" class="godwit-job-enabled"' + (j.enabled ? ' checked' : '') + '></td>' +
+        '<td><select class="godwit-job-mode">' +
+        '<option value="sync"' + (j.mode === 'sync' ? ' selected' : '') + '>sync</option>' +
+        '<option value="copy"' + (j.mode === 'copy' ? ' selected' : '') + '>copy</option></select></td>' +
+        '<td><input type="number" class="godwit-job-transfers" value="' + (j.transfers || 4) + '" size="3"></td>' +
+        '<td>' + selectionCell + '</td>' +
+        '<td>' + esc(state) + '</td>' +
+        '<td>' + esc(String(queue)) + '</td>' +
+        '</tr>';
+}
+
 function godwitJobsRefresh() {
     if (godwitActionPending) { return; }
     godwitApiCall('jobs_status', {})
@@ -559,29 +852,18 @@ function godwitJobsRefresh() {
             }).join('');
             document.getElementById('godwit-budget-bars').innerHTML = budgetHtml || '<p>No remotes configured.</p>';
 
-            var rows = (data.jobs || []).map(function (j) {
-                var state = j.running
-                    ? 'running — ' + fmtBytes(j.progress.bytes) + ', ' + j.progress.files + ' files, ' +
-                      (j.progress.speed_bps !== null ? fmtBytes(j.progress.speed_bps) + '/s' : 'speed unknown') +
-                      ', ETA ' + fmtDuration(j.progress.eta_seconds)
-                    : j.status_text;
-                var queue = j.running ? '-' : (j.queue_position !== null ? j.queue_position : '-');
-                return '<tr data-name="' + esc(j.name) + '" data-share="' + esc(j.share) + '" data-remote="' + esc(j.remote) + '" data-maxdelete="' + j.max_delete + '">' +
-                    '<td>' + esc(j.name) + '</td>' +
-                    '<td>' + esc(j.remote) + '</td>' +
-                    '<td><input type="checkbox" class="godwit-job-enabled"' + (j.enabled ? ' checked' : '') + '></td>' +
-                    '<td><select class="godwit-job-mode">' +
-                    '<option value="sync"' + (j.mode === 'sync' ? ' selected' : '') + '>sync</option>' +
-                    '<option value="copy"' + (j.mode === 'copy' ? ' selected' : '') + '>copy</option></select></td>' +
-                    '<td><input type="number" class="godwit-job-transfers" value="' + j.transfers + '" size="3"></td>' +
-                    '<td><input type="text" class="godwit-job-excludes" value="' + esc((j.excludes || []).join(', ')) + '" size="30"></td>' +
-                    '<td>' + esc(state) + '</td>' +
-                    '<td>' + esc(String(queue)) + '</td>' +
-                    '</tr>';
-            }).join('');
+            // Seed the selection map from the server only for jobs it doesn't
+            // already know about — a job re-browsed this session must not be
+            // clobbered by the next 15s poll.
+            (data.jobs || []).forEach(function (j) {
+                if (!(j.name in godwitJobSelections)) {
+                    godwitJobSelections[j.name] = { type: j.type || 'share', included: j.included || [], excluded: j.excluded || [] };
+                }
+            });
+            var rows = (data.jobs || []).concat(godwitPendingNewJobs).map(godwitJobRowHtml).join('');
             document.getElementById('godwit-jobs-table').innerHTML =
-                '<table border="1" cellpadding="4"><tr><th>Name</th><th>Remote</th><th>Enabled</th><th>Mode</th>' +
-                '<th>Transfers</th><th>Excludes</th><th>Status</th><th>Queue</th></tr>' + rows + '</table>';
+                '<table border="1" cellpadding="4"><tr><th>Name</th><th>Remote</th><th>Type</th><th>Enabled</th><th>Mode</th>' +
+                '<th>Transfers</th><th>Excludes / Selection</th><th>Status</th><th>Queue</th></tr>' + rows + '</table>';
 
             if (!godwitJobsLoaded) {
                 godwitWindowRows = godwitWindowsToRows(data.settings.windows);
@@ -604,20 +886,31 @@ function godwitJobsRefresh() {
 function godwitJobsSave() {
     var rows = document.querySelectorAll('#godwit-jobs-table tr[data-name]');
     var jobs = Array.prototype.map.call(rows, function (tr) {
-        return {
-            name: tr.dataset.name,
+        var name = tr.dataset.name;
+        var sel = godwitJobSelections[name] || { type: 'share', included: [], excluded: [] };
+        var job = {
+            name: name,
             share: tr.dataset.share,
             remote: tr.dataset.remote,
             enabled: tr.querySelector('.godwit-job-enabled').checked,
             mode: tr.querySelector('.godwit-job-mode').value,
             transfers: parseInt(tr.querySelector('.godwit-job-transfers').value, 10) || 4,
             max_delete: parseInt(tr.dataset.maxdelete, 10) || 1000,
-            excludes: tr.querySelector('.godwit-job-excludes').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+            type: sel.type,
         };
+        if (sel.type === 'selective') {
+            job.included = sel.included;
+            job.excluded = sel.excluded;
+            job.excludes = [];
+        } else {
+            job.excludes = tr.querySelector('.godwit-job-excludes').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+        }
+        return job;
     });
     var btn = document.getElementById('godwit-jobs-save');
     godwitRunAction('jobs_save', { jobs: JSON.stringify(jobs) }, btn, 'Saving…', function (data) {
         if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
+        godwitPendingNewJobs = [];
         godwitShowJobsMessage('<p style="color:green">Jobs saved.</p>');
     }, godwitShowJobsMessage, godwitJobsRefresh);
 }
@@ -707,9 +1000,12 @@ document.getElementById('godwit-stop').addEventListener('click', function () { g
 $('#drive-add-dialog').dialog({ autoOpen: false, modal: true, width: 620, title: 'Add Google Drive remote' });
 $('#onedrive-add-dialog').dialog({ autoOpen: false, modal: true, width: 620, title: 'Add OneDrive remote' });
 $('#onedrive-picker').dialog({ autoOpen: false, modal: true, width: 500, title: 'Choose a OneDrive drive' });
+$('#job-add-dialog').dialog({ autoOpen: false, modal: true, width: 500, title: 'Add job' });
+$('#tree-dialog').dialog({ autoOpen: false, modal: true, width: 500, height: 500, title: 'Browse' });
 
 document.getElementById('drive-add-open').addEventListener('click', function () { $('#drive-add-dialog').dialog('open'); });
 document.getElementById('onedrive-add-open').addEventListener('click', function () { $('#onedrive-add-dialog').dialog('open'); });
+document.getElementById('job-add-open').addEventListener('click', function () { $('#job-add-dialog').dialog('open'); });
 document.getElementById('onedrive-picker-cancel').addEventListener('click', function () { godwitHideDrivePicker(); });
 
 document.getElementById('drive-add').addEventListener('click', function () {

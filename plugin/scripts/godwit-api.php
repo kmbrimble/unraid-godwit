@@ -47,7 +47,7 @@ if (in_array($action, $remoteActions, true)) {
     return;
 }
 
-$jobActions = ['jobs_status', 'jobs_save', 'settings_save', 'run_now', 'pause', 'resume'];
+$jobActions = ['jobs_status', 'jobs_save', 'settings_save', 'run_now', 'pause', 'resume', 'tree_list', 'tree_size'];
 if (in_array($action, $jobActions, true)) {
     $cfgDir = getenv('GODWIT_CFGDIR') ?: '/boot/config/plugins/godwit';
     echo json_encode(godwit_handle_job_action($action, $_POST, $dbPath, $runDir, $cfgDir));

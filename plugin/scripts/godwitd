@@ -380,7 +380,7 @@ while ($running) {
             // remote per tick.
             $remoteBudget = [];
             foreach (array_values(array_unique(array_column($jobs, 'remote'))) as $remote) {
-                $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
+                $cap = godwit_budget_cap_bytes($remote, $settings);
                 $remoteBudget[$remote] = ['cap' => $cap, 'remaining' => godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $remote, $now))];
             }
             // v0.4.2 minimum-budget-threshold gate: a job resuming known-
@@ -497,7 +497,7 @@ while ($running) {
                 // finishes; issued every tick until the job actually reports
                 // finished, which is harmless — rclone treats a repeat
                 // job/stop on an already-stopping job as a no-op.
-                $cap = (int) ($settings['budget_caps'][$aj['remote']] ?? godwit_default_budget_cap_bytes());
+                $cap = godwit_budget_cap_bytes($aj['remote'], $settings);
                 if (godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $aj['remote'], $now)) <= 0) {
                     godwit_rc_call_params($rcd['listener'], 'job/stop', ['jobid' => $aj['jobid']], 15);
                     $activeJobs[$name]['stop_reason'] = 'budget';

@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.4.4">
+<!ENTITY version   "0.5.0">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,19 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.5.0
+- Phase 4: OneDrive selective backup. A new "selective" job type lets you
+  hand-pick individual folders/files from a share via a browsable
+  tri-state tree (Add job → Browse…), instead of backing up the whole
+  share — compiled to an rclone filter file the same way share jobs
+  compile their excludes. On-demand, cached folder/file size estimates
+  (no full-tree walk). A selected file over OneDrive's 250 GiB per-file
+  limit is flagged. Every remote's base "godwit" folder is now created
+  proactively after a healthy check, so a brand-new remote no longer logs
+  "directory not found" noise before its first backup. OneDrive's daily
+  upload budget is now unlimited by default (previously silently
+  inherited Google Drive's 700 GiB cap) — configurable the same way as
+  Google's, per PLAN.md.
 ###0.4.4
 - No functional change. Fixed v0.4.3's own new end-to-end test being
   flaky on a fresh checkout (found by the user running it 5 times after

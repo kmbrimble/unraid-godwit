@@ -1365,8 +1365,12 @@ t('Godwit.page: the intro no longer names an internal phase number — phases ar
 
 t('Godwit.page: the non-running job status line renders the server-computed status_text, not a client-rebuilt outcome string', function () use ($repoRoot) {
     $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
-    $start = strpos($page, 'function godwitJobsRefresh()');
-    assert_true($start !== false, 'expected to find function godwitJobsRefresh()');
+    // Phase 4 moved per-row rendering (including the running/non-running
+    // status line) out of godwitJobsRefresh() into its own godwitJobRowHtml()
+    // so the same row markup can be shared with client-side pending (not yet
+    // saved) jobs — this test now checks that function instead.
+    $start = strpos($page, 'function godwitJobRowHtml(');
+    assert_true($start !== false, 'expected to find function godwitJobRowHtml()');
     $end = strpos($page, "\nfunction ", $start + 1);
     $body = substr($page, $start, $end - $start);
     assert_true(str_contains($body, 'j.status_text'), 'expected the non-running branch to use j.status_text: ' . $body);
@@ -1979,6 +1983,246 @@ t('godwit_compile_filter_rules + rclone lsf -R: excludes are actually filtered b
         assert_true(str_contains($listed, $kept), "$kept should have survived filtering; lsf output:\n$listed");
     }
     exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+// --- Phase 4: selective (OneDrive tree) filter compilation ---------------
+
+t('godwit_compile_filter_rules: routes to godwit_compile_selective_filter_rules() for type=selective', function () {
+    $job = ['type' => 'selective', 'included' => [['path' => 'Documents', 'is_dir' => true]], 'excluded' => []];
+    $rules = godwit_compile_filter_rules($job);
+    assert_true(in_array('+ /Documents/**', $rules, true), 'include rule present');
+    assert_eq('- **', end($rules), 'trailing catch-all deny');
+});
+
+t('godwit_compile_selective_filter_rules: excludes ordered before their including ancestor, global excludes present, trailing deny', function () {
+    $job = [
+        'included' => [['path' => 'Documents', 'is_dir' => true]],
+        'excluded' => [['path' => 'Documents/Drafts', 'is_dir' => true]],
+    ];
+    $rules = godwit_compile_selective_filter_rules($job);
+    $excludePos = array_search('- /Documents/Drafts/**', $rules, true);
+    $includePos = array_search('+ /Documents/**', $rules, true);
+    assert_true($excludePos !== false && $includePos !== false, 'both rules present');
+    assert_true($excludePos < $includePos, 'exclude must come before its ancestor include so the more specific rule wins');
+    assert_true(in_array('- .DS_Store', $rules, true), 'global excludes still apply inside a selective job');
+    assert_eq('- **', end($rules), 'trailing catch-all deny');
+});
+
+t('godwit_tree_node_filter_line: a single selected file compiles without the recursive /** suffix', function () {
+    assert_eq('+ /Photos/beach.jpg', godwit_tree_node_filter_line('+', ['path' => 'Photos/beach.jpg', 'is_dir' => false]), 'include line for a file');
+    assert_eq('- /Photos/beach.jpg', godwit_tree_node_filter_line('-', ['path' => '/Photos/beach.jpg/', 'is_dir' => false]), 'exclude line for a file, slashes trimmed');
+});
+
+t('godwit_compile_selective_filter_rules + rclone lsf -R: only ticked subtrees survive, un-ticked children are excluded, unselected siblings never appear (ground-truthed against the real bundled binary)', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-selective-' . bin2hex(random_bytes(4));
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    assert_true(is_file($rclone), 'expected an unzipped rclone binary');
+
+    $tree = $tmp . '/tree';
+    $paths = [
+        'Documents/Taxes/2025.pdf',      // included subtree: must survive
+        'Documents/Drafts/todo.txt',     // un-ticked child of an included folder: must be filtered
+        'Documents/.DS_Store',           // global junk exclude inside an included folder: must be filtered
+        'Pictures/holiday.jpg',          // never selected at all: must be filtered
+        'loose-file.txt',                 // never selected, top level: must be filtered
+    ];
+    foreach ($paths as $p) {
+        $full = $tree . '/' . $p;
+        @mkdir(dirname($full), 0755, true);
+        file_put_contents($full, 'x');
+    }
+
+    $job = [
+        'included' => [['path' => 'Documents', 'is_dir' => true]],
+        'excluded' => [['path' => 'Documents/Drafts', 'is_dir' => true]],
+    ];
+    $filterFile = $tmp . '/filter.txt';
+    godwit_write_filter_file($filterFile, godwit_compile_selective_filter_rules($job));
+
+    $out = [];
+    exec($rclone . ' lsf -R --filter-from ' . escapeshellarg($filterFile) . ' ' . escapeshellarg($tree), $out);
+    $listed = implode("\n", $out);
+
+    foreach (['Documents/Drafts/todo.txt', 'Documents/.DS_Store', 'Pictures/holiday.jpg', 'loose-file.txt'] as $excluded) {
+        assert_true(!str_contains($listed, $excluded), "$excluded should have been filtered out; lsf output:\n$listed");
+    }
+    assert_true(str_contains($listed, 'Documents/Taxes/2025.pdf'), "Documents/Taxes/2025.pdf should have survived filtering; lsf output:\n$listed");
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+// --- Phase 4: tree-selection job validation --------------------------------
+
+t('godwit_validate_selective_job: a valid selection passes', function () {
+    $job = ['name' => 'x', 'included' => [['path' => 'Documents', 'is_dir' => true]], 'excluded' => [['path' => 'Documents/Drafts', 'is_dir' => true]]];
+    assert_eq(null, godwit_validate_selective_job($job), 'valid selection should pass');
+});
+
+t('godwit_validate_selective_job: rejects an empty included list', function () {
+    $err = godwit_validate_selective_job(['name' => 'x', 'included' => []]);
+    assert_true($err !== null && str_contains($err, 'at least one'), 'expected an error, got: ' . var_export($err, true));
+});
+
+t('godwit_validate_selective_job: rejects an excluded path with no included ancestor', function () {
+    $job = ['name' => 'x', 'included' => [['path' => 'Documents', 'is_dir' => true]], 'excluded' => [['path' => 'Pictures/holiday', 'is_dir' => true]]];
+    $err = godwit_validate_selective_job($job);
+    assert_true($err !== null && str_contains($err, 'not under any included path'), 'expected an error, got: ' . var_export($err, true));
+});
+
+t('godwit_validate_selective_job: rejects path traversal in an included entry', function () {
+    $job = ['name' => 'x', 'included' => [['path' => '../etc/passwd', 'is_dir' => false]]];
+    $err = godwit_validate_selective_job($job);
+    assert_true($err !== null && str_contains($err, 'invalid included path'), 'expected an error, got: ' . var_export($err, true));
+});
+
+t('godwit_handle_job_action jobs_save: rejects a selective job with no included paths', function () use ($repoRoot) {
+    $cfgDir = sys_get_temp_dir() . '/godwit-cfg-' . bin2hex(random_bytes(4));
+    $jobs = [['name' => 'Selective', 'share' => 'Kieren', 'remote' => 'kmonedrive', 'type' => 'selective', 'included' => []]];
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($jobs)], '/nonexistent.db', sys_get_temp_dir(), $cfgDir);
+    assert_true(isset($result['error']) && str_contains($result['error'], 'at least one'), 'expected a validation error, got: ' . var_export($result, true));
+    exec('rm -rf ' . escapeshellarg($cfgDir));
+});
+
+t('godwit_handle_job_action jobs_save: accepts a valid selective job and round-trips type/included/excluded', function () use ($repoRoot) {
+    $cfgDir = sys_get_temp_dir() . '/godwit-cfg-' . bin2hex(random_bytes(4));
+    $jobs = [['name' => 'Selective', 'share' => 'Kieren', 'remote' => 'kmonedrive', 'type' => 'selective', 'mode' => 'sync', 'included' => [['path' => 'Documents', 'is_dir' => true]], 'excluded' => []]];
+    $runDir = sys_get_temp_dir() . '/godwit-run-' . bin2hex(random_bytes(4));
+    @mkdir($runDir, 0755, true);
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($jobs)], '/nonexistent.db', $runDir, $cfgDir);
+    assert_true(($result['ok'] ?? false) === true, 'expected ok=true, got: ' . var_export($result, true));
+    $saved = godwit_load_jobs($cfgDir);
+    assert_eq('selective', $saved[0]['type'], 'type round-trips');
+    assert_eq('Documents', $saved[0]['included'][0]['path'], 'included path round-trips');
+    exec('rm -rf ' . escapeshellarg($cfgDir) . ' ' . escapeshellarg($runDir));
+});
+
+// --- Phase 4: tree listing (scandir over /mnt/user/<share>) ----------------
+
+t('godwit_tree_safe_path: rejects traversal, absolute escape and a share with a slash', function () {
+    assert_eq(null, godwit_tree_safe_path('Kieren', '../../etc'), 'traversal above the share rejected');
+    assert_eq(null, godwit_tree_safe_path('Kieren', 'a/../../b'), 'embedded .. rejected');
+    assert_eq(null, godwit_tree_safe_path('a/b', ''), 'share with a slash rejected');
+    assert_eq('/mnt/user/Kieren/Documents', godwit_tree_safe_path('Kieren', '/Documents/'), 'leading/trailing slashes trimmed');
+});
+
+t('godwit_tree_list: lists a real temp directory, folders before files, alphabetical', function () {
+    $root = sys_get_temp_dir() . '/godwit-tree-' . bin2hex(random_bytes(4));
+    @mkdir($root . '/Share/Zeta', 0755, true);
+    @mkdir($root . '/Share/Alpha', 0755, true);
+    file_put_contents($root . '/Share/readme.txt', 'x');
+    $result = godwit_tree_list('Share', '', $root);
+    assert_true(!isset($result['error']), 'expected no error, got: ' . var_export($result, true));
+    $names = array_map(fn ($e) => $e['name'], $result['entries']);
+    assert_eq(['Alpha', 'Zeta', 'readme.txt'], $names, 'folders sorted before files, then alphabetically');
+    assert_eq(true, $result['entries'][0]['is_dir'], 'first entry is a directory');
+    assert_eq(false, $result['entries'][2]['is_dir'], 'last entry is a file');
+    exec('rm -rf ' . escapeshellarg($root));
+});
+
+t('godwit_tree_list: an invalid share is rejected before touching the filesystem', function () {
+    $result = godwit_tree_list('../etc', '', '/mnt/user');
+    assert_true(isset($result['error']), 'expected an error');
+});
+
+// --- Phase 4: on-demand, cached node sizing (du -sb, never a PHP walker) --
+
+t('godwit_du_bytes: parses the real `du -sb` output shape via an injected $run', function () {
+    $bytes = godwit_du_bytes('/some/path', fn ($cmd) => "12345\t/some/path\n");
+    assert_eq(12345, $bytes, 'parses the leading byte count');
+});
+
+t('godwit_du_bytes: returns null on empty output (path vanished mid-check)', function () {
+    assert_eq(null, godwit_du_bytes('/gone', fn ($cmd) => ''), 'empty output yields null, not 0');
+});
+
+t('godwit_tree_node_size: computes once via the injected $run, then serves from cache without calling $run again', function () {
+    $root = sys_get_temp_dir() . '/godwit-size-' . bin2hex(random_bytes(4));
+    @mkdir($root . '/Share/Documents', 0755, true);
+    file_put_contents($root . '/Share/Documents/file.txt', 'x');
+    $db = new SQLite3(':memory:');
+    $calls = 0;
+    $run = function ($cmd) use (&$calls) { $calls++; return "999\t/x\n"; };
+
+    $r1 = godwit_tree_node_size($db, 'Share', 'Documents', $root, $run);
+    assert_eq(999, $r1['bytes'], 'first computed value');
+    assert_eq(false, $r1['cached'], 'first call is a fresh compute');
+    assert_eq(1, $calls, 'first call must shell out');
+
+    $r2 = godwit_tree_node_size($db, 'Share', 'Documents', $root, $run);
+    assert_eq(999, $r2['bytes'], 'second call returns the same cached value');
+    assert_eq(true, $r2['cached'], 'second call is served from cache');
+    assert_eq(1, $calls, 'second call must be served from cache, not re-shell out');
+    exec('rm -rf ' . escapeshellarg($root));
+});
+
+t('godwit_tree_node_size: a single file over the 250 GiB OneDrive ceiling carries a warning', function () {
+    $root = sys_get_temp_dir() . '/godwit-size-' . bin2hex(random_bytes(4));
+    @mkdir($root . '/Share', 0755, true);
+    file_put_contents($root . '/Share/huge.mov', 'x');
+    $db = new SQLite3(':memory:');
+    $tooBig = (string) (300 * 1024 * 1024 * 1024) . "\t/x\n";
+    $r = godwit_tree_node_size($db, 'Share', 'huge.mov', $root, fn ($cmd) => $tooBig);
+    assert_true(isset($r['warning']) && str_contains($r['warning'], '250 GiB'), 'expected a 250 GiB warning, got: ' . var_export($r, true));
+});
+
+t('godwit_tree_node_size: a folder under the ceiling carries no warning even if large', function () {
+    $root = sys_get_temp_dir() . '/godwit-size-' . bin2hex(random_bytes(4));
+    @mkdir($root . '/Share/Documents', 0755, true);
+    $db = new SQLite3(':memory:');
+    $big = (string) (300 * 1024 * 1024 * 1024) . "\t/x\n";
+    $r = godwit_tree_node_size($db, 'Share', 'Documents', $root, fn ($cmd) => $big);
+    assert_true(!isset($r['warning']), 'a directory total should never trip the single-file ceiling');
+});
+
+// --- Phase 4: per-remote budget cap (OneDrive defaults to unlimited) -------
+
+t('godwit_budget_cap_bytes: gdrive falls back to the 700 GiB D12 default when unconfigured', function () {
+    assert_eq(700 * 1024 * 1024 * 1024, godwit_budget_cap_bytes('gdrive', []), 'gdrive default cap');
+});
+
+t('godwit_budget_cap_bytes: any other unconfigured remote is effectively unlimited (PLAN.md: OneDrive budget off by default)', function () {
+    assert_eq(PHP_INT_MAX, godwit_budget_cap_bytes('kmonedrive', []), 'unconfigured non-gdrive remote is unlimited');
+});
+
+t('godwit_budget_cap_bytes: an explicit setting always wins, for any remote', function () {
+    $settings = ['budget_caps' => ['gdrive' => 123, 'kmonedrive' => 456]];
+    assert_eq(123, godwit_budget_cap_bytes('gdrive', $settings), 'explicit gdrive override wins');
+    assert_eq(456, godwit_budget_cap_bytes('kmonedrive', $settings), 'explicit kmonedrive override wins');
+});
+
+// --- Phase 4: ensure a remote's base "godwit" dir exists on every healthy check ---
+
+t('godwit_run_health_check: calls operations/mkdir on <remote>:godwit after a status=ok check', function () {
+    $db = new SQLite3(':memory:');
+    $calls = [];
+    $fakeCall = function ($listener, $method, $params, $timeout = 60, &$meta = null) use (&$calls) {
+        $calls[] = $method;
+        if ($method === 'operations/about') {
+            return ['total' => 100, 'used' => 10, 'free' => 90];
+        }
+        return [];
+    };
+    godwit_run_health_check($db, ['type' => 'unix', 'path' => '/x'], 'kmonedrive', $fakeCall);
+    assert_true(in_array('operations/mkdir', $calls, true), 'expected operations/mkdir to have been called, got: ' . implode(',', $calls));
+});
+
+t('godwit_run_health_check: does not call operations/mkdir when the check itself errors', function () {
+    $db = new SQLite3(':memory:');
+    $calls = [];
+    $fakeCall = function ($listener, $method, $params, $timeout = 60, &$meta = null) use (&$calls) {
+        $calls[] = $method;
+        if ($method === 'operations/about') {
+            return ['error' => 'some transport failure'];
+        }
+        return [];
+    };
+    godwit_run_health_check($db, ['type' => 'unix', 'path' => '/x'], 'kmonedrive', $fakeCall);
+    assert_true(!in_array('operations/mkdir', $calls, true), 'operations/mkdir must not run against a remote that just failed its check');
 });
 
 // --- Budget ledger maths --------------------------------------------------

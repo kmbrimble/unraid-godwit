@@ -964,11 +964,21 @@ function godwit_store_remote_health(SQLite3 $db, string $name, int $ts, array $r
 }
 
 /** Runs one read-only health check for $remoteName, stores it and fires any notifications it triggers. Shared by godwitd's periodic tick, its on-demand marker-file check, and the page's "Test connection" action, so all three go through the exact same notify-once logic. */
-function godwit_run_health_check(SQLite3 $db, array $listener, string $remoteName): array
+function godwit_run_health_check(SQLite3 $db, array $listener, string $remoteName, ?callable $call = null): array
 {
     godwit_open_remotes_health_table($db);
     $prevRow = godwit_remote_health_row($db, $remoteName);
-    $result = godwit_check_remote_about($listener, $remoteName);
+    $result = godwit_check_remote_about($listener, $remoteName, 60, $call);
+    if ($result['status'] === 'ok') {
+        // Phase 4: guarantees <remote>:godwit exists before any job (share
+        // or selective) ever tries to write under it or list its version
+        // dirs — operations/mkdir is a no-op when the directory already
+        // exists, so this is safe and cheap to run on every check, not
+        // just once. Fixes the "operations/list: directory not found"
+        // noise a brand-new remote (e.g. a just-added OneDrive) used to
+        // generate on every godwitd restart before its first backup ran.
+        godwit_ensure_remote_base_dir($listener, $remoteName, $call);
+    }
     $decision = godwit_health_notifications($remoteName, $prevRow, $result);
     foreach ($decision['notifications'] as $n) {
         godwit_notify($n['subject'], $n['description'], $n['importance']);
@@ -976,6 +986,13 @@ function godwit_run_health_check(SQLite3 $db, array $listener, string $remoteNam
     $ts = time();
     godwit_store_remote_health($db, $remoteName, $ts, $result, $decision['quota_alerted'], $decision['fail_count']);
     return $result + ['checked_ts' => $ts];
+}
+
+/** Idempotently creates <remote>:godwit (operations/mkdir is a no-op if it already exists) — see godwit_run_health_check()'s docblock for why. $call defaults to godwit_rc_call_params, same injection pattern as godwit_check_remote_about(). */
+function godwit_ensure_remote_base_dir(array $listener, string $remoteName, ?callable $call = null): void
+{
+    $call = $call ?? 'godwit_rc_call_params';
+    $call($listener, 'operations/mkdir', ['fs' => $remoteName . ':godwit', 'remote' => ''], 30);
 }
 
 /** Params for a `config/update` call that replaces an existing remote's token only (re-authorise). Other fields (client_id, scope, drive_type, ...) are left exactly as they are — config/update only touches keys it's given. */
@@ -1277,10 +1294,10 @@ function godwit_global_excludes(): array
 function godwit_default_jobs(): array
 {
     return [
-        ['name' => 'Filing Cabinet', 'share' => 'Filing Cabinet', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => []],
-        ['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => ['/TimeMachine/**', '/Backup/BombVault/**']],
-        ['name' => 'Teegan', 'share' => 'Teegan', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => []],
-        ['name' => 'Photos', 'share' => 'Photos', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => []],
+        ['name' => 'Filing Cabinet', 'share' => 'Filing Cabinet', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => [], 'type' => 'share'],
+        ['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => ['/TimeMachine/**', '/Backup/BombVault/**'], 'type' => 'share'],
+        ['name' => 'Teegan', 'share' => 'Teegan', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => [], 'type' => 'share'],
+        ['name' => 'Photos', 'share' => 'Photos', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true, 'transfers' => 4, 'max_delete' => 1000, 'excludes' => [], 'type' => 'share'],
     ];
 }
 
@@ -1304,20 +1321,252 @@ function godwit_save_jobs(string $cfgDir, array $jobs): void
 }
 
 /**
- * Compiles a job's exclude rules (global + per-job) to an ordered list of
- * rclone filter-file lines. Exclude-only filter lists need no trailing
- * "+ **" — rclone's own default for a filter with no include rules is to
- * include everything not explicitly excluded.
+ * Compiles a job's rules to an ordered list of rclone filter-file lines.
+ * A "share" job (Phase 3) is exclude-only: global + per-job excludes, no
+ * trailing "+ **" needed since rclone's own default with no include rules
+ * is to include everything not explicitly excluded. A "selective" job
+ * (Phase 4) branches to godwit_compile_selective_filter_rules() instead,
+ * whose default is the opposite (exclude everything not explicitly
+ * ticked).
  */
 function godwit_compile_filter_rules(array $job): array
 {
+    if (($job['type'] ?? 'share') === 'selective') {
+        return godwit_compile_selective_filter_rules($job);
+    }
     $patterns = array_merge(godwit_global_excludes(), $job['excludes'] ?? []);
     return array_map(fn ($p) => '- ' . $p, $patterns);
+}
+
+/** One rclone filter-file line for a tree node: "$sign /path/**" for a directory (recursive), "$sign /path" for a single file. */
+function godwit_tree_node_filter_line(string $sign, array $node): string
+{
+    $path = trim((string) ($node['path'] ?? ''), '/');
+    $isDir = $node['is_dir'] ?? true;
+    return $sign . ' /' . $path . ($isDir ? '/**' : '');
+}
+
+/**
+ * Selective-job filter compilation (Phase 4, §4.4): unlike a share job, a
+ * selective job's default is EXCLUDE — only the tri-state tree's ticked
+ * nodes are backed up. Rule order matters (rclone evaluates top to bottom,
+ * first match wins per path): 'excluded' entries (an included folder's
+ * un-ticked children) are emitted BEFORE 'included' entries so the more
+ * specific exclude wins over its ancestor's broader include. The global
+ * junk excludes still apply inside included folders. The trailing "- **"
+ * is required — without it rclone's own default (include anything no rule
+ * matched) would defeat the whole point of a selective job. This is the
+ * documented rclone idiom for "just this subtree" ("+ /dir/**" then
+ * "- *"; a directory path is kept traversable towards a deeper include
+ * even without a separate ancestor rule) — ground-truthed against the real
+ * bundled binary by the rcd e2e filter test, not assumed.
+ */
+function godwit_compile_selective_filter_rules(array $job): array
+{
+    $rules = array_map(fn ($p) => '- ' . $p, godwit_global_excludes());
+    foreach ($job['excluded'] ?? [] as $node) {
+        $rules[] = godwit_tree_node_filter_line('-', $node);
+    }
+    foreach ($job['included'] ?? [] as $node) {
+        $rules[] = godwit_tree_node_filter_line('+', $node);
+    }
+    $rules[] = '- **';
+    return $rules;
 }
 
 function godwit_write_filter_file(string $path, array $rules): void
 {
     file_put_contents($path, implode(PHP_EOL, $rules) . PHP_EOL);
+}
+
+/** Resolves $share/$relPath to a real filesystem path under $shareRoot for the Phase 4 tree picker, rejecting traversal the same way godwit_build_job_fs()'s share check does — no absolute paths, no "..", no empty segments. Returns null on anything unsafe; callers must never build a tree path from unvalidated input themselves. */
+function godwit_tree_safe_path(string $share, string $relPath, string $shareRoot = '/mnt/user'): ?string
+{
+    if ($share === '' || $share === '.' || $share === '..' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
+        return null;
+    }
+    $relPath = trim($relPath, '/');
+    if ($relPath !== '') {
+        foreach (explode('/', $relPath) as $seg) {
+            if ($seg === '' || $seg === '.' || $seg === '..') {
+                return null;
+            }
+        }
+    }
+    return rtrim($shareRoot, '/') . '/' . $share . ($relPath !== '' ? '/' . $relPath : '');
+}
+
+/** Lists the immediate children of $share/$relPath — plain scandir, no recursion (PLAN.md §4.4: a full walk would wake the pool) — for the tree picker. Folders sort before files, then alphabetically, case-insensitively. */
+function godwit_tree_list(string $share, string $relPath, string $shareRoot = '/mnt/user'): array
+{
+    $base = godwit_tree_safe_path($share, $relPath, $shareRoot);
+    if ($base === null) {
+        return ['error' => 'invalid path'];
+    }
+    if (!is_dir($base)) {
+        return ['error' => 'not a directory'];
+    }
+    $entries = @scandir($base);
+    if ($entries === false) {
+        return ['error' => 'could not read directory'];
+    }
+    $out = [];
+    foreach ($entries as $name) {
+        if ($name === '.' || $name === '..') {
+            continue;
+        }
+        $out[] = ['name' => $name, 'is_dir' => is_dir($base . '/' . $name)];
+    }
+    usort($out, fn ($a, $b) => ($b['is_dir'] <=> $a['is_dir']) ?: strcasecmp($a['name'], $b['name']));
+    return ['entries' => $out];
+}
+
+function godwit_open_node_size_cache_table(SQLite3 $db): void
+{
+    $db->exec('CREATE TABLE IF NOT EXISTS node_size_cache (
+        share TEXT NOT NULL,
+        rel_path TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        computed_ts INTEGER NOT NULL,
+        PRIMARY KEY (share, rel_path)
+    )');
+}
+
+function godwit_cached_node_size(SQLite3 $db, string $share, string $relPath): ?int
+{
+    $stmt = $db->prepare('SELECT bytes FROM node_size_cache WHERE share = :share AND rel_path = :rel');
+    $stmt->bindValue(':share', $share, SQLITE3_TEXT);
+    $stmt->bindValue(':rel', $relPath, SQLITE3_TEXT);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    return $row === false ? null : (int) $row['bytes'];
+}
+
+function godwit_store_node_size(SQLite3 $db, string $share, string $relPath, int $bytes, int $ts): void
+{
+    $stmt = $db->prepare('INSERT INTO node_size_cache (share, rel_path, bytes, computed_ts) VALUES (:share, :rel, :bytes, :ts)
+        ON CONFLICT(share, rel_path) DO UPDATE SET bytes = excluded.bytes, computed_ts = excluded.computed_ts');
+    $stmt->bindValue(':share', $share, SQLITE3_TEXT);
+    $stmt->bindValue(':rel', $relPath, SQLITE3_TEXT);
+    $stmt->bindValue(':bytes', $bytes, SQLITE3_INTEGER);
+    $stmt->bindValue(':ts', $ts, SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+/** Total size of a path via `du -sb` — the native platform tool for a recursive size sum, not a hand-rolled recursive PHP walker. $run is injected (default: real shell_exec) so tests can fake the output without a real multi-GB tree. */
+function godwit_du_bytes(string $path, ?callable $run = null): ?int
+{
+    $run = $run ?? fn (string $cmd) => shell_exec($cmd);
+    $out = $run('du -sb ' . escapeshellarg($path) . ' 2>/dev/null');
+    if ($out === null || $out === false || trim((string) $out) === '') {
+        return null;
+    }
+    $parts = preg_split('/\s+/', trim((string) $out));
+    return isset($parts[0]) && is_numeric($parts[0]) ? (int) $parts[0] : null;
+}
+
+/** rclone's documented OneDrive personal single-file ceiling — used only to flag a selected file that would fail the upload outright, never to block a folder-size estimate. */
+function godwit_onedrive_max_file_bytes(): int
+{
+    return 250 * 1024 * 1024 * 1024; // 250 GiB
+}
+
+/**
+ * A tree node's size (Phase 4, §4.4): computed on demand and cached, never
+ * during page load — a full walk of a pool share would wake every disk.
+ * Cached indefinitely once computed (SQLite, share+rel_path keyed); there
+ * is no automatic invalidation, since a stale size estimate for an
+ * already-ticked node isn't safety-critical (the real sync always
+ * transfers whatever is actually there) — only the page's running-total
+ * display depends on it. $run is passed straight through to
+ * godwit_du_bytes() so tests can fake it.
+ */
+function godwit_tree_node_size(SQLite3 $db, string $share, string $relPath, string $shareRoot = '/mnt/user', ?callable $run = null): array
+{
+    godwit_open_node_size_cache_table($db);
+    $cached = godwit_cached_node_size($db, $share, $relPath);
+    if ($cached !== null) {
+        $result = ['bytes' => $cached, 'cached' => true];
+    } else {
+        $path = godwit_tree_safe_path($share, $relPath, $shareRoot);
+        if ($path === null || !file_exists($path)) {
+            return ['error' => 'invalid path'];
+        }
+        $bytes = godwit_du_bytes($path, $run);
+        if ($bytes === null) {
+            return ['error' => 'could not compute size'];
+        }
+        godwit_store_node_size($db, $share, $relPath, $bytes, time());
+        $result = ['bytes' => $bytes, 'cached' => false];
+    }
+    $fullPath = godwit_tree_safe_path($share, $relPath, $shareRoot);
+    if ($fullPath !== null && is_file($fullPath) && $result['bytes'] > godwit_onedrive_max_file_bytes()) {
+        $result['warning'] = "this file is larger than OneDrive's 250 GiB per-file limit and will fail to upload";
+    }
+    return $result;
+}
+
+/** A single tree-selection node ({path, is_dir}) validated and normalised (no leading/trailing slash), or null if it's not shaped like a safe relative path — no traversal, no empty segments. */
+function godwit_validate_tree_node($node): ?string
+{
+    if (!is_array($node) || !isset($node['path']) || !is_string($node['path'])) {
+        return null;
+    }
+    $path = trim($node['path'], '/');
+    if ($path === '') {
+        return null;
+    }
+    foreach (explode('/', $path) as $seg) {
+        if ($seg === '' || $seg === '.' || $seg === '..') {
+            return null;
+        }
+    }
+    return $path;
+}
+
+/**
+ * Validates a selective job's tree-selection fields (Phase 4): 'included'
+ * must be a non-empty array of {path, is_dir} entries, each a safe
+ * relative path under the job's own share. 'excluded' (optional) is
+ * validated the same way, and every excluded path must itself sit under
+ * one of the included paths — an exclusion with no included ancestor can
+ * never affect the compiled filter and is almost certainly a client bug.
+ * Returns an error string, or null if the job is valid.
+ */
+function godwit_validate_selective_job(array $job): ?string
+{
+    $included = $job['included'] ?? [];
+    if (!is_array($included) || count($included) === 0) {
+        return "job \"{$job['name']}\": a selective job needs at least one included folder or file";
+    }
+    $includedPaths = [];
+    foreach ($included as $node) {
+        $path = godwit_validate_tree_node($node);
+        if ($path === null) {
+            return "job \"{$job['name']}\": invalid included path";
+        }
+        $includedPaths[] = $path;
+    }
+    $excluded = $job['excluded'] ?? [];
+    if (!is_array($excluded)) {
+        return "job \"{$job['name']}\": excluded must be an array";
+    }
+    foreach ($excluded as $node) {
+        $path = godwit_validate_tree_node($node);
+        if ($path === null) {
+            return "job \"{$job['name']}\": invalid excluded path";
+        }
+        $underIncluded = false;
+        foreach ($includedPaths as $inc) {
+            if (strpos($path . '/', rtrim($inc, '/') . '/') === 0) {
+                $underIncluded = true;
+                break;
+            }
+        }
+        if (!$underIncluded) {
+            return "job \"{$job['name']}\": excluded path \"$path\" is not under any included path";
+        }
+    }
+    return null;
 }
 
 /**
@@ -1731,6 +1980,23 @@ function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \
 function godwit_default_budget_cap_bytes(): int
 {
     return 700 * 1024 * 1024 * 1024; // 700 GiB, D12
+}
+
+/**
+ * The budget cap that applies to $remote: whatever's explicitly configured
+ * in settings.budget_caps, or — if unconfigured — the D12 700 GiB default
+ * for "gdrive" specifically (the Google daily-quota risk that default
+ * exists for), and effectively unlimited (PHP_INT_MAX) for any other
+ * remote. PLAN.md §4.3: "OneDrive: budget off by default (none
+ * documented), configurable if throttling ever warrants it" — before this
+ * (Phase 3), every remote silently inherited gdrive's 700 GiB cap.
+ */
+function godwit_budget_cap_bytes(string $remote, array $settings): int
+{
+    if (isset($settings['budget_caps'][$remote])) {
+        return (int) $settings['budget_caps'][$remote];
+    }
+    return $remote === 'gdrive' ? godwit_default_budget_cap_bytes() : PHP_INT_MAX;
 }
 
 function godwit_open_budget_table(SQLite3 $db): void
@@ -2171,7 +2437,7 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
     // avoids querying the ledger twice per remote.
     $remoteBudget = [];
     foreach (array_values(array_unique(array_column($jobs, 'remote'))) as $remote) {
-        $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
+        $cap = godwit_budget_cap_bytes($remote, $settings);
         $used = godwit_ledger_used_24h($db, $remote, $now);
         $remoteBudget[$remote] = ['cap' => $cap, 'remaining' => godwit_remaining_budget($cap, $used), 'used' => $used];
     }
@@ -2198,7 +2464,7 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
         $active = godwit_active_run($db, $job['name']);
         $last = godwit_last_job_run($db, $job['name']);
         $pos = $queuePositions[$job['name']] ?? null;
-        $budget = $remoteBudget[$job['remote']] ?? ['cap' => godwit_default_budget_cap_bytes(), 'remaining' => 0];
+        $budget = $remoteBudget[$job['remote']] ?? ['cap' => godwit_budget_cap_bytes($job['remote'], $settings), 'remaining' => 0];
         $minFraction = (float) ($settings['budget_min_fractions'][$job['remote']] ?? GODWIT_MIN_BUDGET_FRACTION);
         $gated = $active === null && godwit_job_budget_gated($last, $budget['cap'], $budget['remaining'], $minFraction);
         $jobsOut[] = [
@@ -2210,6 +2476,9 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
             'transfers' => (int) ($job['transfers'] ?? 4),
             'max_delete' => (int) ($job['max_delete'] ?? 1000),
             'excludes' => $job['excludes'] ?? [],
+            'type' => $job['type'] ?? 'share',
+            'included' => $job['included'] ?? [],
+            'excluded' => $job['excluded'] ?? [],
             'running' => $active !== null,
             'progress' => $active !== null ? [
                 'bytes' => (int) $active['bytes'],
@@ -2307,6 +2576,15 @@ function godwit_handle_job_action(string $action, array $post, string $dbPath, s
             if (!in_array($job['mode'] ?? 'sync', ['sync', 'copy'], true)) {
                 return ['error' => "job \"{$job['name']}\": mode must be sync or copy"];
             }
+            if (!in_array($job['type'] ?? 'share', ['share', 'selective'], true)) {
+                return ['error' => "job \"{$job['name']}\": type must be share or selective"];
+            }
+            if (($job['type'] ?? 'share') === 'selective') {
+                $selectiveError = godwit_validate_selective_job($job);
+                if ($selectiveError !== null) {
+                    return ['error' => $selectiveError];
+                }
+            }
         }
         $overlapError = godwit_validate_job_destinations($jobs);
         if ($overlapError !== null) {
@@ -2349,6 +2627,20 @@ function godwit_handle_job_action(string $action, array $post, string $dbPath, s
         godwit_save_settings($cfgDir, array_merge(godwit_load_settings($cfgDir), $settings));
         @touch($runDir . '/jobs-changed');
         return ['ok' => true];
+    }
+
+    if ($action === 'tree_list') {
+        return godwit_tree_list((string) ($post['share'] ?? ''), (string) ($post['path'] ?? ''));
+    }
+
+    if ($action === 'tree_size') {
+        try {
+            $db = new SQLite3($dbPath);
+            $db->busyTimeout(5000);
+        } catch (\Throwable $e) {
+            return ['error' => 'state database unavailable'];
+        }
+        return godwit_tree_node_size($db, (string) ($post['share'] ?? ''), (string) ($post['path'] ?? ''));
     }
 
     if ($action === 'run_now') {

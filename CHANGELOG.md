@@ -10,6 +10,59 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-18
+
+### Added
+
+- **Phase 4: OneDrive selective backup.** Jobs can now be "selective"
+  instead of whole-share: a browsable, lazy-loaded, tri-state checkbox
+  tree over `/mnt/user/<share>` (Godwit.page: Jobs → Add job → Browse…,
+  or the "Browse (N)" button on an existing selective job's row) lets you
+  tick individual folders or files. Ticking a folder includes everything
+  below it; an already-included folder's children can be un-ticked to
+  exclude just that subtree — the same model PLAN.md §4.4 describes for
+  the Unbalanced-style picker. The selection compiles to an rclone
+  `--filter-from` file (`godwit_compile_selective_filter_rules()`):
+  excludes ordered before their including ancestor so the more specific
+  rule wins, global junk excludes still applied, and a trailing `- **`
+  default-deny since a selective job's default (unlike a share job) is
+  exclude, not include. Ground-truthed against the real bundled rclone
+  v1.75.1 binary via a new rcd end-to-end test (`tests/run.php`), not
+  assumed from rclone's documented idiom alone.
+- **Tree browsing/backend**: `godwit_tree_list()` (plain `scandir`, no
+  recursion — a full walk would wake the pool) and `godwit_tree_node_size()`
+  (on-demand, SQLite-cached per share+path, computed via `du -sb` — the
+  native tool for a recursive size total, not a hand-rolled PHP walker).
+  A selected single file over OneDrive personal's 250 GiB per-file
+  ceiling (`godwit_onedrive_max_file_bytes()`) carries a `warning` in the
+  `tree_size` response. New `godwit-api.php` actions: `tree_list`,
+  `tree_size`.
+- `godwit_validate_selective_job()`: a selective job needs at least one
+  included path, and every excluded path must sit under an included one
+  (an exclusion with no included ancestor can never affect the compiled
+  filter and is almost certainly a client bug) — enforced server-side in
+  `jobs_save`, the same defence-in-depth pattern as the existing
+  direction/overlap checks.
+
+### Fixed
+
+- **OneDrive's daily upload budget silently inherited Google Drive's 700
+  GiB cap** for any remote with no explicit `budget_caps` entry — PLAN.md
+  §4.3 says OneDrive's budget should be off (unlimited) by default. New
+  `godwit_budget_cap_bytes()` centralises the fallback: the D12 700 GiB
+  default only for `gdrive` specifically, effectively unlimited
+  (`PHP_INT_MAX`) for any other remote unless configured. An explicit
+  `settings.budget_caps` entry for any remote still always wins.
+- **A brand-new remote (e.g. a just-added OneDrive) logged
+  `operations/list: directory not found` noise to rcd's own log on every
+  godwitd restart**, from the daily version-retention purge listing a
+  `godwit/_versions/<share>` path that had never been created — harmless
+  (godwit's own code already treated it as "absent", not an error) but
+  needless noise. `godwit_run_health_check()` now proactively creates
+  `<remote>:godwit` (`operations/mkdir`, a no-op if it already exists)
+  after every status=ok check, so the base folder exists before a job
+  — share or selective — ever tries to write under it.
+
 ## [0.4.4] - 2026-09-18
 
 ### Fixed

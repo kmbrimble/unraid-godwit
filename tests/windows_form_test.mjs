@@ -18,9 +18,17 @@ if (start === -1 || end === -1) {
 }
 const code = page.slice(start, end);
 
+const treeStart = page.indexOf('// GODWIT_TREE_BEGIN');
+const treeEnd = page.indexOf('// GODWIT_TREE_END');
+if (treeStart === -1 || treeEnd === -1) {
+    throw new Error('GODWIT_TREE_BEGIN/END markers not found in plugin/Godwit.page');
+}
+const treeCode = page.slice(treeStart, treeEnd);
+
 const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox);
+vm.runInContext(treeCode, sandbox);
 
 let passed = 0;
 
@@ -90,4 +98,63 @@ t('godwitValidateRow rejects malformed start/end but accepts start==end', () => 
     assert.equal(sandbox.godwitValidateRow({ days: [0], start: '09:00', end: '09:00', limit_mbit: 100 }), null);
 });
 
-console.log(`\n${passed}/${passed} windows-form checks passed`);
+// --- Phase 4 tri-state tree selection (godwitTreeToggle etc.) --------------
+
+t('a fresh, unticked node with no included ancestor becomes its own include root on check', () => {
+    const r = sandbox.godwitTreeToggle({ path: 'Documents', is_dir: true }, [], []);
+    assert.equal(JSON.stringify(r.included), JSON.stringify([{ path: 'Documents', is_dir: true }]));
+    assert.equal(r.excluded.length, 0);
+});
+
+t('un-ticking an explicitly included node removes it from included, not adds it to excluded', () => {
+    const included = [{ path: 'Documents', is_dir: true }];
+    const r = sandbox.godwitTreeToggle({ path: 'Documents', is_dir: true }, included, []);
+    assert.equal(r.included.length, 0);
+    assert.equal(r.excluded.length, 0);
+});
+
+t('un-ticking a child of an included folder adds it to excluded, leaves the parent include intact', () => {
+    const included = [{ path: 'Documents', is_dir: true }];
+    const r = sandbox.godwitTreeToggle({ path: 'Documents/Drafts', is_dir: true }, included, []);
+    assert.equal(JSON.stringify(r.included), JSON.stringify(included));
+    assert.equal(JSON.stringify(r.excluded), JSON.stringify([{ path: 'Documents/Drafts', is_dir: true }]));
+});
+
+t('re-ticking a previously excluded child removes it from excluded (falls back to the ancestor include)', () => {
+    const included = [{ path: 'Documents', is_dir: true }];
+    const excluded = [{ path: 'Documents/Drafts', is_dir: true }];
+    const r = sandbox.godwitTreeToggle({ path: 'Documents/Drafts', is_dir: true }, included, excluded);
+    assert.equal(r.excluded.length, 0);
+    assert.equal(JSON.stringify(r.included), JSON.stringify(included));
+});
+
+t('removing an included root drops any exclusions nested under it — they would otherwise dangle, matching the server-side validation rule', () => {
+    const included = [{ path: 'Documents', is_dir: true }];
+    const excluded = [{ path: 'Documents/Drafts', is_dir: true }];
+    const r = sandbox.godwitTreeToggle({ path: 'Documents', is_dir: true }, included, excluded);
+    assert.equal(r.included.length, 0);
+    assert.equal(r.excluded.length, 0, 'dangling exclusion under a removed include must be dropped, not left orphaned');
+});
+
+t('godwitTreeNodeChecked: false with no ancestor and not itself included', () => {
+    assert.equal(sandbox.godwitTreeNodeChecked('Pictures', [{ path: 'Documents', is_dir: true }], []), false);
+});
+
+t('godwitTreeNodeChecked: true for a node implied by an included ancestor', () => {
+    assert.equal(sandbox.godwitTreeNodeChecked('Documents/Taxes/2025.pdf', [{ path: 'Documents', is_dir: true }], []), true);
+});
+
+t('godwitTreeNodeChecked: false for an explicitly excluded child of an included ancestor', () => {
+    const included = [{ path: 'Documents', is_dir: true }];
+    const excluded = [{ path: 'Documents/Drafts', is_dir: true }];
+    assert.equal(sandbox.godwitTreeNodeChecked('Documents/Drafts', included, excluded), false);
+    assert.equal(sandbox.godwitTreeNodeChecked('Documents/Drafts/todo.txt', included, excluded), false);
+});
+
+t('a sibling folder is unaffected by an unrelated include/exclude pair', () => {
+    const included = [{ path: 'Documents', is_dir: true }];
+    const excluded = [{ path: 'Documents/Drafts', is_dir: true }];
+    assert.equal(sandbox.godwitTreeNodeChecked('Pictures/holiday.jpg', included, excluded), false);
+});
+
+console.log(`\n${passed}/${passed} windows-form + tree-selection checks passed`);
