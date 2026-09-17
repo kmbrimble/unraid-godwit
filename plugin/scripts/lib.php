@@ -10,11 +10,23 @@ declare(strict_types=1);
  * Appends a timestamped line to godwitd's log file, redacted unconditionally
  * — not just at call sites that happen to carry secret-shaped data today. A
  * future call site that logs an rc response verbatim (e.g. a health-check
- * error message) must not have to remember to redact first.
+ * error message) must not have to remember to redact first. Control
+ * characters (newlines above all) are stripped for the same reason: a
+ * user-supplied remote name reaches here before godwit_validate_remote_name()
+ * has had a chance to reject it (e.g. the empty-name and unknown-remote
+ * branches of godwit_handle_remote_action()), so a name containing "\n[fake
+ * timestamp] ..." must not be able to forge what looks like a second, distinct
+ * log line.
  */
 function godwit_log(string $logFile, string $message): void
 {
-    $line = sprintf('[%s] %s%s', date('Y-m-d H:i:s'), godwit_redact($message), PHP_EOL);
+    // Redact first (its ini-shape pattern relies on real \r\n as a line
+    // boundary to redact a multi-line config dump), then collapse any
+    // remaining control characters so nothing in the message can forge what
+    // looks like a second, separately-timestamped log line.
+    $redacted = godwit_redact($message);
+    $sanitized = preg_replace('/[\x00-\x1F\x7F]+/', ' ', $redacted);
+    $line = sprintf('[%s] %s%s', date('Y-m-d H:i:s'), $sanitized, PHP_EOL);
     file_put_contents($logFile, $line, FILE_APPEND);
 }
 
@@ -628,9 +640,9 @@ function godwit_check_remote_about(array $listener, string $remoteName, int $tim
 /**
  * Decides which Unraid notifications to send for a remote's new health
  * result, given its previously stored row (null if never checked before).
- * "error" is treated as possibly transient (nginx's fastcgi_read_timeout is
- * 640s but a single rcd hiccup shouldn't page anyone): it notifies only on
- * the 2nd *consecutive* error, tracked via the returned 'fail_count', and
+ * "error" is treated as possibly transient (one rcd hiccup shouldn't page
+ * anyone): it notifies only on the 2nd *consecutive* error, tracked via the
+ * returned 'fail_count', and
  * recovery only notifies if a failure was actually reported (fail_count
  * reached 2, or the status was auth-expired). "auth-expired" is treated as
  * decisive and notifies on the very first occurrence. Never notifies on
@@ -884,20 +896,24 @@ function godwit_handle_remote_action(string $action, array $post, string $dbPath
         $type = $action === 'remotes_add_drive' ? 'drive' : 'onedrive';
         $name = (string) ($post['name'] ?? '');
         $rawToken = (string) ($post['token'] ?? '');
-        $extracted = godwit_extract_token_json($rawToken);
-        if ($extracted === null) {
-            $log("remote add $type: failed validation: no JSON object found in the pasted token");
-            return ['error' => 'no JSON object found in the pasted text — paste the whole blob rclone authorize printed'];
-        }
-        $tokenJson = $extracted;
+
+        // Name checked first (even though the token is parsed for the calls
+        // below) so a blank name is reported as the actual problem instead of
+        // being hidden behind an unrelated token error.
         $existing = godwit_list_remotes($listener) ?? [];
         $existingNames = array_map(fn ($r) => $r['name'], $existing);
-
         $nameError = godwit_validate_remote_name($name, $existingNames);
         if ($nameError !== null) {
             $log("remote add $type" . ($name !== '' ? " $name" : '') . ": failed validation: $nameError");
             return ['error' => $nameError];
         }
+
+        $extracted = godwit_extract_token_json($rawToken);
+        if ($extracted === null) {
+            $log("remote add $type $name: failed validation: no JSON object found in the pasted token");
+            return ['error' => 'no JSON object found in the pasted text — paste the whole blob rclone authorize printed'];
+        }
+        $tokenJson = $extracted;
         $tokenError = godwit_validate_token_json($tokenJson);
         if ($tokenError !== null) {
             $log("remote add $type $name: failed validation: $tokenError");

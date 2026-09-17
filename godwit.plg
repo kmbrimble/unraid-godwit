@@ -32,7 +32,8 @@
   auth-expired still notifies immediately.
 - On-demand checks and add/reauth/delete actions are now logged to
   /var/log/godwit.log, success or failure, so a "nothing happens" report
-  leaves a trace.
+  leaves a trace. Log lines now strip control characters, so a remote name
+  can't forge a fake second log entry.
 ###0.2.1
 - Found live on the host during 0.2.0's own verification (not caught by
   code review, which doesn't run `ps aux`): rcd's generated `--rc-user`/

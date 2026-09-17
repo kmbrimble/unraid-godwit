@@ -736,6 +736,16 @@ t('godwit_log: redacts secret-shaped content before it ever reaches the log file
     unlink($tmp);
 });
 
+t('godwit_log: strips control characters so a user-supplied value cannot forge a fake log line', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-log-inject-' . bin2hex(random_bytes(4)) . '.log';
+    $forgedName = "evil\n[2026-01-01 00:00:00] remote add drive backdoor: ok";
+    godwit_log($tmp, "remote add drive $forgedName: failed validation: name is required");
+    $logged = file_get_contents($tmp);
+    assert_eq(1, substr_count($logged, "\n"), 'the whole entry must stay one line — a forged newline must not produce a second log line');
+    assert_true(!str_contains($logged, "\nevil") && !str_contains($logged, "evil\n"), 'the raw newline must not survive into the log file');
+    unlink($tmp);
+});
+
 // --- godwit_validate_remote_name() -----------------------------------------
 
 t('godwit_validate_remote_name: accepts a normal name', function () {
@@ -1110,16 +1120,17 @@ t('godwit_handle_remote_action: add drive -> list (no secrets in response) -> de
         godwit_open_db($dbPath);
         godwit_write_rc_credentials($runDir, $listener);
 
+        $logFile = $tmp . '/godwit.log';
         $tokenJson = json_encode(['access_token' => 'fake-access', 'refresh_token' => 'fake-refresh', 'expiry' => '2026-01-01T00:00:00Z']);
         $addResult = godwit_handle_remote_action('remotes_add_drive', [
             'name' => 'gdrive-test',
             'client_id' => 'fake-client-id.apps.googleusercontent.com',
             'client_secret' => 'fake-client-secret-value',
             'token' => $tokenJson,
-        ], $dbPath, $runDir);
+        ], $dbPath, $runDir, $logFile);
         assert_true(($addResult['ok'] ?? false) === true, 'add drive should succeed against a real rcd with a syntactically-valid fake token: ' . json_encode($addResult));
 
-        $listResult = godwit_handle_remote_action('remotes_list', [], $dbPath, $runDir);
+        $listResult = godwit_handle_remote_action('remotes_list', [], $dbPath, $runDir, $logFile);
         $encoded = json_encode($listResult);
         foreach (['fake-client-secret-value', 'fake-access', 'fake-refresh', 'fake-client-id'] as $secret) {
             assert_true(!str_contains($encoded, $secret), "remotes_list response must never contain $secret: $encoded");
@@ -1127,15 +1138,43 @@ t('godwit_handle_remote_action: add drive -> list (no secrets in response) -> de
         $names = array_column($listResult['remotes'], 'name');
         assert_true(in_array('gdrive-test', $names, true), 'newly added remote must appear in the list');
 
-        $deleteResult = godwit_handle_remote_action('remotes_delete', ['name' => 'gdrive-test', 'confirm' => '1'], $dbPath, $runDir);
+        $deleteResult = godwit_handle_remote_action('remotes_delete', ['name' => 'gdrive-test', 'confirm' => '1'], $dbPath, $runDir, $logFile);
         assert_true(($deleteResult['ok'] ?? false) === true, 'delete should succeed: ' . json_encode($deleteResult));
-        $listAfterDelete = godwit_handle_remote_action('remotes_list', [], $dbPath, $runDir);
+        $listAfterDelete = godwit_handle_remote_action('remotes_list', [], $dbPath, $runDir, $logFile);
         assert_true(!in_array('gdrive-test', array_column($listAfterDelete['remotes'], 'name'), true), 'deleted remote must no longer be listed');
     } finally {
         proc_terminate($proc);
         proc_close($proc);
         exec('rm -rf ' . escapeshellarg($tmp));
     }
+});
+
+// --- plugin/Godwit.page: source-shape regression guard -----------------
+//
+// The page's JS has no execution harness. This is not a behaviour test — it
+// can't run the JS — but it's a cheap guard against the exact regression
+// this feature fixes: godwitRemotesRefresh() (the silent background/30s-tick
+// refresh) touching #godwit-remotes-message, which is what wiped every
+// Test/Add/Reauth/Delete result before the user could read it. Verified by
+// reading the installed page source on the host post-deploy (see CHANGELOG).
+
+t('Godwit.page: the background remotes-list refresh never touches #godwit-remotes-message', function () use ($repoRoot) {
+    $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
+    $start = strpos($page, 'function godwitRemotesRefresh()');
+    assert_true($start !== false, 'expected to find function godwitRemotesRefresh()');
+    $end = strpos($page, "\nfunction ", $start + 1);
+    assert_true($end !== false, 'expected another top-level function after godwitRemotesRefresh()');
+    $body = substr($page, $start, $end - $start);
+    assert_true(!str_contains($body, 'godwit-remotes-message'), 'godwitRemotesRefresh() must never reference the action-message div: ' . $body);
+});
+
+t('Godwit.page: the message div sits right under the remotes table, before the Add forms', function () use ($repoRoot) {
+    $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
+    $listPos = strpos($page, 'id="godwit-remotes-list"');
+    $msgPos = strpos($page, 'id="godwit-remotes-message"');
+    $driveFormPos = strpos($page, '<h3>Add Google Drive');
+    assert_true($listPos !== false && $msgPos !== false && $driveFormPos !== false, 'expected to find all three markers');
+    assert_true($listPos < $msgPos && $msgPos < $driveFormPos, 'the message div must appear between the remotes table and the Add forms');
 });
 
 // --- godwit_extract_token_json(): tolerates the rclone authorize paste wrapper ---

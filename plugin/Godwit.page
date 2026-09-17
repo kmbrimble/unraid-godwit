@@ -109,7 +109,16 @@ function godwitPoll(action) {
 // belongs to the most recent user action (Test/Add/Reauth/Delete) and must
 // keep showing its result until the user does something else — this refresh
 // runs after every action and every 30s regardless.
+//
+// Skipped while an action is in flight (godwitActionPending): the table row
+// buttons live inside the HTML this rebuilds, so a 30s tick landing mid-Test
+// (up to 60s) or mid-Reauth (a Graph round trip) would replace the disabled
+// "Testing gdrive…" button with a fresh enabled one, letting a second click
+// fire the same action twice.
+var godwitActionPending = false;
+
 function godwitRemotesRefresh() {
+    if (godwitActionPending) { return; }
     godwitApiCall('remotes_list', {})
         .done(function (data) {
             var el = document.getElementById('godwit-remotes-list');
@@ -179,6 +188,7 @@ function godwitRunAction(action, params, controls, pendingLabel, onResult) {
     var originalLabel = button.textContent;
     list.forEach(function (c) { c.disabled = true; });
     button.textContent = pendingLabel;
+    godwitActionPending = true;
 
     godwitApiCall(action, params)
         .done(function (data) {
@@ -190,6 +200,7 @@ function godwitRunAction(action, params, controls, pendingLabel, onResult) {
         .always(function () {
             list.forEach(function (c) { c.disabled = false; });
             button.textContent = originalLabel;
+            godwitActionPending = false;
             godwitRemotesRefresh();
         });
 }

@@ -37,18 +37,32 @@ Fix, in `plugin/Godwit.page` and `plugin/scripts/lib.php`:
   set by `remotes_list` for a remote with no health row yet. Timeout raised
   to 60s for `operations/about` and the config walk.
 - `godwit_health_notifications()` gains a consecutive-failure counter:
-  ok→error notifies only on the 2nd consecutive failure, auth-expired still
-  notifies immediately, matching nginx's generous `fastcgi_read_timeout`.
+  ok→error notifies only on the 2nd consecutive failure (one rcd hiccup
+  shouldn't page anyone), auth-expired still notifies immediately.
 - `godwit_handle_remote_action()` logs every on-demand test/add/reauth/delete
   (redacted) to `/var/log/godwit.log`, and touches the existing (previously
   unwired) `check-now` marker after a successful add so the new remote gets
   checked within a second instead of waiting up to an hour.
+- `godwit_log()` now strips control characters (not just secret-shaped text)
+  from every message before writing it — found by this feature's own review
+  pipeline: a remote name reaches `godwit_log()` before
+  `godwit_validate_remote_name()` gets a chance to reject it in a couple of
+  branches, so an unsanitised name containing a newline plus a fake
+  `[timestamp] ...` prefix could forge what looked like a second, distinct
+  log line in `/var/log/godwit.log`.
+- The Add form now checks the remote name before parsing the pasted token,
+  so a blank name is reported as the actual problem instead of being
+  hidden behind an unrelated token error.
 
 Tests added to `tests/run.php` for: token extraction (incl. the exact
 `--->`/`<---End paste` wrapper), timeout classification (via dependency
-injection, same pattern as `godwit_walk_config_state`), the notify rule, and
-the new log lines. The page JS itself has no harness — verified instead by
-reading the installed page source on the host post-deploy.
+injection, same pattern as `godwit_walk_config_state`), the notify rule, the
+new log lines, and the log-injection fix. Two source-shape checks (not
+behaviour tests — the page JS has no execution harness) guard against this
+exact regression recurring: the background remotes-list refresh must never
+reference `#godwit-remotes-message`, and the message div must sit between
+the remotes table and the Add forms. Also verified by reading the installed
+page source on the host post-deploy.
 
 ## [0.2.1] - 2026-09-17
 
