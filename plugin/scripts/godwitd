@@ -199,7 +199,16 @@ $lastJobsReload = time();
 $lastRetention = 0;
 $lastLedgerTrim = 0;
 $currentBwlimitMbit = null;
-$activeJobs = []; // jobName => ['jobid','remote','run_id','started_ts','group','last_bytes']
+$activeJobs = []; // jobName => ['jobid','remote','run_id','started_ts','group','last_bytes','stop_reason']
+// Marks when the current window (or "Run now" override) began — reset
+// whenever start-gating transitions from closed to open. godwit_select_next_jobs()
+// uses this to tell "already finished this session, don't re-select it" apart
+// from "never run" — without it, a job that just completed and dropped out of
+// $activeJobs looks identical to one that never started, and the queue would
+// loop on whichever job sorts first for its remote (Filing Cabinet, always)
+// instead of ever advancing to the next one.
+$sessionStartTs = 0;
+$startGateWasOpen = false;
 
 while ($running) {
     sleep(1);
@@ -229,6 +238,12 @@ while ($running) {
                 }
                 $activeJobs = [];
             }
+            // The fresh rcd process starts with no bwlimit applied at all —
+            // without resetting this, "only re-issue on change" below would
+            // never re-apply it (the in-memory value hasn't changed), so a
+            // crash mid-window would silently go back to unlimited upload
+            // until the next window transition.
+            $currentBwlimitMbit = null;
             sleep($backoffSeconds);
             $backoffSeconds = min($backoffSeconds * 2, 60);
         } elseif ($now - $rcdStartedAt > 60) {
@@ -319,13 +334,23 @@ while ($running) {
             $currentBwlimitMbit = $desiredBwlimitMbit;
         }
 
+        $startGateOpen = $window !== null || $runNow;
+        if ($startGateOpen && !$startGateWasOpen) {
+            $sessionStartTs = $now;
+        }
+        $startGateWasOpen = $startGateOpen;
+
         // --- Start new jobs: only inside a window, or under the "Run now"
         // override (D15), never both gates bypassed at once by accident —
         // $runNow only widens *when* jobs may start, budget/throttle/overlap
         // guards below are identical either way.
-        if (!$paused && ($window !== null || $runNow)) {
+        if (!$paused && $startGateOpen) {
             $activeRemotes = array_values(array_unique(array_map(fn ($aj) => $aj['remote'], $activeJobs)));
-            $candidates = godwit_select_next_jobs($jobs, $activeRemotes);
+            $lastRuns = [];
+            foreach ($jobs as $job) {
+                $lastRuns[$job['name']] = godwit_last_job_run($db, $job['name']);
+            }
+            $candidates = godwit_select_next_jobs($jobs, $activeRemotes, $lastRuns, $sessionStartTs);
             foreach ($candidates as $job) {
                 $remote = $job['remote'];
                 if (godwit_throttled_until($db, $remote, $now) !== null) {
@@ -378,6 +403,7 @@ while ($running) {
                     'started_ts' => $now,
                     'group' => 'job/' . $jobid,
                     'last_bytes' => 0,
+                    'stop_reason' => null,
                 ];
                 godwit_log($logFile, "job started: {$job['name']} -> {$fs['dstFs']} (rc jobid $jobid, remaining budget $remaining bytes)");
             }
@@ -412,6 +438,7 @@ while ($running) {
                 $cap = (int) ($settings['budget_caps'][$aj['remote']] ?? godwit_default_budget_cap_bytes());
                 if (godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $aj['remote'], $now)) <= 0) {
                     godwit_rc_call_params($rcd['listener'], 'job/stop', ['jobid' => $aj['jobid']], 15);
+                    $activeJobs[$name]['stop_reason'] = 'budget';
                     godwit_log($logFile, "job \"$name\" stopped mid-run — {$aj['remote']}'s daily budget was reached");
                 }
                 continue;
@@ -419,34 +446,25 @@ while ($running) {
             $errorMsg = trim((string) ($status['error'] ?? ''));
             $files = (int) ($stats['transfers'] ?? 0);
             $errors = (int) ($stats['errors'] ?? 0);
-            $outcome = 'completed';
-            if ($errorMsg !== '') {
-                if (godwit_is_upload_limit_error($errorMsg)) {
-                    $outcome = 'throttled';
-                    $wasThrottled = godwit_throttled_until($db, $aj['remote'], $now) !== null;
-                    godwit_mark_throttled($db, $aj['remote'], $now + 86400);
-                    $n = godwit_throttled_notification($aj['remote'], $wasThrottled);
-                    if ($n !== null) {
-                        godwit_notify($n['subject'], $n['description'], $n['importance']);
-                    }
-                } elseif (godwit_classify_error($errorMsg) === 'auth-expired') {
-                    $outcome = 'auth';
-                } else {
-                    $outcome = 'error';
-                    $n = godwit_job_error_notification($name, $errorMsg);
+            // godwit_classify_job_outcome() reads rclone's own fixed cutoff
+            // error text (ground-truthed against the bundled binary) rather
+            // than inferring the reason from whatever the scheduler happens
+            // to be doing at poll time — an earlier version guessed "window"
+            // whenever no window was active the moment the finish was
+            // observed, which misclassified (and alerted on) a job that
+            // simply finished a few seconds after its window closed.
+            $stoppedForBudget = ($aj['stop_reason'] ?? null) === 'budget';
+            $outcome = godwit_classify_job_outcome($errorMsg, $stoppedForBudget);
+            if ($outcome === 'throttled') {
+                $wasThrottled = godwit_throttled_until($db, $aj['remote'], $now) !== null;
+                godwit_mark_throttled($db, $aj['remote'], $now + 86400);
+                $n = godwit_throttled_notification($aj['remote'], $wasThrottled);
+                if ($n !== null) {
                     godwit_notify($n['subject'], $n['description'], $n['importance']);
                 }
-            } elseif ($window === null && !$runNow) {
-                // Finished cleanly but the window closed while it was
-                // wrapping up (its own MaxDuration already let in-flight
-                // transfers complete) — recorded distinctly from a plain
-                // 'completed' run so the status page can show why it stopped.
-                $outcome = 'window';
-            } else {
-                $cap = (int) ($settings['budget_caps'][$aj['remote']] ?? godwit_default_budget_cap_bytes());
-                if (godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $aj['remote'], $now)) <= 0) {
-                    $outcome = 'budget';
-                }
+            } elseif ($outcome === 'error') {
+                $n = godwit_job_error_notification($name, $errorMsg);
+                godwit_notify($n['subject'], $n['description'], $n['importance']);
             }
             godwit_finish_job_run($db, $aj['run_id'], $now, $bytes, $files, $errors, $outcome);
             if ($outcome === 'completed') {

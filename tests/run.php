@@ -2116,6 +2116,79 @@ t('godwit_select_next_jobs: disabled jobs never get selected', function () {
     assert_eq(0, count(godwit_select_next_jobs($jobs, [])), 'disabled job must not start');
 });
 
+// --- Session-aware queue advancement (the bug where the queue looped on ---
+// --- Filing Cabinet forever, found by advisor before the first host push) ---
+
+t('godwit_select_next_jobs: once Filing Cabinet has completed this session, the next tick advances to Kieren, not FC again', function () {
+    $jobs = godwit_default_jobs();
+    $sessionStart = 1000;
+    $lastRuns = ['Filing Cabinet' => ['ended_ts' => 1500, 'outcome' => 'completed']];
+    // FC just finished and dropped out of $activeJobs — without session
+    // awareness this reproduces exactly as it did on the host: FC (index 0
+    // for gdrive) gets selected again instead of Kieren.
+    $selected = godwit_select_next_jobs($jobs, [], $lastRuns, $sessionStart);
+    assert_eq(1, count($selected), 'one job should be selected');
+    assert_eq('Kieren', $selected[0]['name'], 'must advance to Kieren, not loop back to Filing Cabinet');
+});
+
+t('godwit_select_next_jobs: once every job has completed this session, the queue is empty (drives "Run now" clearing itself)', function () {
+    $sessionStart = 1000;
+    $lastRuns = [];
+    foreach (godwit_default_jobs() as $job) {
+        $lastRuns[$job['name']] = ['ended_ts' => 1500, 'outcome' => 'completed'];
+    }
+    $selected = godwit_select_next_jobs(godwit_default_jobs(), [], $lastRuns, $sessionStart);
+    assert_eq(0, count($selected), 'a fully-drained queue must select nothing');
+});
+
+t('godwit_select_next_jobs: a job cut short by budget/window/a restart stays eligible — it must resume, not be skipped', function () {
+    $soloJob = [['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'gdrive', 'enabled' => true]];
+    foreach (['budget', 'window', 'interrupted'] as $outcome) {
+        $lastRuns = ['Kieren' => ['ended_ts' => 1500, 'outcome' => $outcome]];
+        $selected = godwit_select_next_jobs($soloJob, [], $lastRuns, 1000);
+        $names = array_column($selected, 'name');
+        assert_true(in_array('Kieren', $names, true), "Kieren cut short by '$outcome' must remain eligible: " . json_encode($names));
+    }
+});
+
+t('godwit_select_next_jobs: a run that finished BEFORE the current session started does not block re-selection (a new night is a new session)', function () {
+    $lastRuns = ['Filing Cabinet' => ['ended_ts' => 500, 'outcome' => 'completed']]; // last night
+    $selected = godwit_select_next_jobs(godwit_default_jobs(), [], $lastRuns, 1000); // tonight's session started at 1000
+    assert_eq('Filing Cabinet', $selected[0]['name'], 'a completion from a previous session must not carry over');
+});
+
+// --- Outcome classification (rclone's own cutoff error text, ground- ---
+// --- truthed against the bundled v1.75.1 binary) -----------------------
+
+t('godwit_classify_job_outcome: no error text means completed', function () {
+    assert_eq('completed', godwit_classify_job_outcome('', false), 'empty error');
+});
+
+t('godwit_classify_job_outcome: rclone\'s exact --max-transfer cutoff text classifies as budget', function () {
+    assert_eq('budget', godwit_classify_job_outcome('max transfer limit reached as set by --max-transfer', false), 'byte-cap cutoff');
+});
+
+t('godwit_classify_job_outcome: rclone\'s exact --max-duration cutoff text classifies as window', function () {
+    assert_eq('window', godwit_classify_job_outcome('max transfer duration reached as set by --max-duration', false), 'duration cutoff');
+});
+
+t('godwit_classify_job_outcome: godwitd\'s own mid-run job/stop for budget produces a generic "context canceled" — the caller must say so', function () {
+    assert_eq('budget', godwit_classify_job_outcome('context canceled', true), 'stoppedForBudget flag, not the error text, drives this one');
+    assert_eq('error', godwit_classify_job_outcome('context canceled', false), 'without the flag, an unrecognised message is a plain error');
+});
+
+t('godwit_classify_job_outcome: an upload-limit error is throttled even with other error text present', function () {
+    assert_eq('throttled', godwit_classify_job_outcome('googleapi: uploadLimitExceeded', false), 'throttle takes priority');
+});
+
+t('godwit_classify_job_outcome: an auth-expired error is classified as auth', function () {
+    assert_eq('auth', godwit_classify_job_outcome('invalid_grant: token expired', false), 'auth expiry');
+});
+
+t('godwit_classify_job_outcome: an unrecognised error is a plain error', function () {
+    assert_eq('error', godwit_classify_job_outcome('connection reset by peer', false), 'generic error');
+});
+
 // --- Requeue after restart --------------------------------------------------
 
 t('godwit_interrupt_open_runs: closes an in-flight run as interrupted and reports it for requeue', function () {
@@ -2262,6 +2335,182 @@ t('godwit_load_settings / godwit_save_settings: seeds D12 defaults, round-trips,
     godwit_save_settings($tmp, $merged);
     assert_eq('500/50', godwit_load_settings($tmp)['profile'], 'round trip');
     exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+// --- End-to-end: godwit_build_sync_params() -> godwit_rc_call_params() ---
+// --- against a real bundled rcd, proving _config/_filter actually work ---
+// --- as form-encoded JSON over the exact path every job takes (not just ---
+// --- that the filter FILE's contents are right — see the lsf test above) ---
+
+t('godwit_build_sync_params + rc sync/copy: excludes are honoured, budget cutoff produces the exact error string godwit_classify_job_outcome() expects', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return; // not cached locally — covered by host verification instead.
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-sync-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    assert_true(is_file($rclone), 'expected an unzipped rclone binary');
+
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/TestShare';
+    mkdir($src . '/TimeMachine', 0755, true);
+    file_put_contents($src . '/TimeMachine/x', str_repeat('a', 1000));
+    file_put_contents($src . '/keep.txt', str_repeat('b', 1000));
+    $dst = $tmp . '/dst';
+    mkdir($dst, 0755, true);
+
+    $confPath = $tmp . '/rclone.conf';
+    // A plain local backend, addressed as "localdst:<path>" — proves the rc
+    // call chain (godwit_build_sync_params -> godwit_rc_call_params ->
+    // sync/copy _async) with a real remote:path dstFs, not by special-casing
+    // a bare local path.
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $runDir = $tmp . '/run';
+    mkdir($runDir, 0700, true);
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+    assert_true(file_exists($sockPath), 'rcd did not create its unix socket in time');
+
+    try {
+        $job = ['name' => 'TestShare', 'share' => 'TestShare', 'remote' => 'localdst', 'mode' => 'copy', 'transfers' => 2, 'max_delete' => 1000, 'excludes' => ['/TimeMachine/**']];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        $params = godwit_build_sync_params($job, $fs, $filterFile, 10_000_000, null, null, false, $shareRoot);
+
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid back from sync/copy: ' . json_encode($resp));
+        $jobid = $resp['jobid'];
+
+        $status = null;
+        for ($i = 0; $i < 50; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $jobid], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish within 5s: ' . json_encode($status));
+        assert_eq('', trim((string) ($status['error'] ?? '')), 'a plain copy within budget should not error: ' . json_encode($status));
+
+        assert_true(is_file($dst . '/keep.txt'), 'keep.txt should have been copied');
+        assert_true(!file_exists($dst . '/TimeMachine'), 'TimeMachine must have been excluded by _filter, not just present in the filter file');
+
+        // Second run: a MaxTransfer of 1 byte against a file that must
+        // actually transfer proves the exact cutoff string
+        // godwit_classify_job_outcome() matches is real, not assumed.
+        unlink($src . '/keep.txt');
+        file_put_contents($src . '/keep.txt', str_repeat('c', 1000));
+        $cutoffParams = godwit_build_sync_params($job, $fs, $filterFile, 1, null, null, false, $shareRoot);
+        $cutoffResp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $cutoffParams, 15);
+        assert_true(isset($cutoffResp['jobid']), 'expected a jobid: ' . json_encode($cutoffResp));
+        $cutoffStatus = null;
+        for ($i = 0; $i < 50; $i++) {
+            $cutoffStatus = godwit_rc_call_params($listener, 'job/status', ['jobid' => $cutoffResp['jobid']], 15);
+            if (!empty($cutoffStatus['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        $cutoffError = trim((string) ($cutoffStatus['error'] ?? ''));
+        assert_true($cutoffError !== '', 'a 1-byte MaxTransfer against a 1000-byte file should cut off: ' . json_encode($cutoffStatus));
+        assert_eq('budget', godwit_classify_job_outcome($cutoffError, false), 'the real cutoff message must classify as budget: ' . var_export($cutoffError, true));
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
+});
+
+t('godwit_build_sync_params + rc sync/sync with MaxDuration: a job cut off by --max-duration classifies as window (proven against the real binary, not assumed)', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-duration-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/TestShare';
+    mkdir($src, 0755, true);
+    // Several small files so the transfer isn't instantaneous relative to a
+    // near-zero MaxDuration, giving --max-duration a real chance to fire
+    // before everything would have copied anyway.
+    for ($i = 0; $i < 20; $i++) {
+        file_put_contents($src . "/f$i.bin", random_bytes(200000));
+    }
+    $dst = $tmp . '/dst';
+    mkdir($dst, 0755, true);
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+
+    try {
+        $job = ['name' => 'TestShare', 'share' => 'TestShare', 'remote' => 'localdst', 'mode' => 'copy', 'transfers' => 1, 'excludes' => []];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        // A local-disk copy of 4MB finishes far faster than any MaxDuration
+        // worth setting, so core/bwlimit throttles the process globally
+        // first (100 KB/s) — the same call godwitd itself issues per
+        // window — giving MaxDuration=1s a real ~40s transfer to actually
+        // cut off partway through, instead of racing an instant copy.
+        $bwResp = godwit_rc_call_params($listener, 'core/bwlimit', ['rate' => '100000B'], 15);
+        assert_true(is_array($bwResp), 'core/bwlimit should succeed: ' . json_encode($bwResp));
+        $params = godwit_build_sync_params($job, $fs, $filterFile, 10_000_000, null, 1, false, $shareRoot);
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));
+        $status = null;
+        for ($i = 0; $i < 100; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $resp['jobid']], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish (cut off) within 10s: ' . json_encode($status));
+        $errorMsg = trim((string) ($status['error'] ?? ''));
+        assert_true($errorMsg !== '', 'a 0-second MaxDuration should cut the job off: ' . json_encode($status));
+        assert_eq('window', godwit_classify_job_outcome($errorMsg, false), 'the real --max-duration cutoff message must classify as window: ' . var_export($errorMsg, true));
+        // No file should be left half-written (truncated) by the cutoff —
+        // rclone's cutoff lets an in-flight file finish rather than
+        // truncating it mid-transfer; every file present at the destination
+        // must be exactly 200000 bytes, never a partial fragment.
+        foreach (glob($dst . '/*.bin') as $f) {
+            assert_eq(200000, filesize($f), "no partial/truncated file should be left at $f");
+        }
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
 });
 
 // --- godwit_build_jobs_status / godwit_handle_job_action --------------------

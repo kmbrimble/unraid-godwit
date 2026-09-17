@@ -1389,9 +1389,9 @@ function godwit_sync_rc_path(string $mode): string
  * if the window is edited mid-run; the job just runs to MaxDuration as
  * computed at start. Re-evaluated next tick after the job's next start.
  */
-function godwit_build_sync_params(array $job, array $fs, string $filterFile, int $maxTransferBytes, ?string $backupDirFs, ?int $maxDurationSeconds, bool $dryRun = false): array
+function godwit_build_sync_params(array $job, array $fs, string $filterFile, int $maxTransferBytes, ?string $backupDirFs, ?int $maxDurationSeconds, bool $dryRun = false, string $shareRoot = '/mnt/user'): array
 {
-    godwit_assert_job_direction($fs);
+    godwit_assert_job_direction($fs, $shareRoot);
     $config = [
         'Transfers' => (int) ($job['transfers'] ?? 4),
         'MaxDelete' => (int) ($job['max_delete'] ?? 1000),
@@ -1447,6 +1447,12 @@ function godwit_validate_job_destinations(array $jobs): ?string
     return null;
 }
 
+/** Outcomes that mean "this job actually finished, for better or worse" — it must not be selected again this session. budget/window/interrupted mean it was cut short, not finished, so it stays eligible (a budget-stopped job must resume the next night, not be skipped in favour of the next job in the queue). */
+function godwit_terminal_job_outcomes(): array
+{
+    return ['completed', 'error', 'auth', 'throttled'];
+}
+
 /**
  * Picks which enabled, not-already-running jobs to start next: at most one
  * per remote (§4.2), in jobs.json array order (queue order is simply the
@@ -1454,11 +1460,25 @@ function godwit_validate_job_destinations(array $jobs): ?string
  * Photos). $activeRemotes lists remotes with a job already running (from
  * either a previous selection this tick, or one still in flight from a
  * prior tick).
+ *
+ * $lastRuns (job name => ['ended_ts' => ?int, 'outcome' => ?string], as
+ * returned by godwit_last_job_run()) and $sessionStartTs together stop the
+ * queue looping on the same job forever: without this, a job that just
+ * finished and was removed from the daemon's in-memory active-job tracking
+ * looks identical to one that never ran, so the very next tick would
+ * re-select Filing Cabinet (always first for gdrive) instead of advancing
+ * to Kieren — confirmed to reproduce with a two-tick trace before this
+ * fix. A job whose last run both ended at/after $sessionStartTs and
+ * reached a terminal outcome (godwit_terminal_job_outcomes()) is skipped;
+ * everything else (never run, or cut short by budget/window/a restart)
+ * stays eligible. $sessionStartTs is the daemon's own bookkeeping of when
+ * the current window (or "Run now" override) began — see godwitd.
  */
-function godwit_select_next_jobs(array $jobs, array $activeRemotes): array
+function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastRuns = [], int $sessionStartTs = 0): array
 {
     $inUse = $activeRemotes;
     $selected = [];
+    $terminal = godwit_terminal_job_outcomes();
     foreach ($jobs as $job) {
         if (empty($job['enabled'])) {
             continue;
@@ -1466,10 +1486,49 @@ function godwit_select_next_jobs(array $jobs, array $activeRemotes): array
         if (in_array($job['remote'], $inUse, true)) {
             continue;
         }
+        $last = $lastRuns[$job['name']] ?? null;
+        if ($last !== null && $last['ended_ts'] !== null && (int) $last['ended_ts'] >= $sessionStartTs && in_array($last['outcome'], $terminal, true)) {
+            continue;
+        }
         $selected[] = $job;
         $inUse[] = $job['remote'];
     }
     return $selected;
+}
+
+/**
+ * Classifies a finished rc job's outcome from its job/status error text (and
+ * whether godwitd itself issued the mid-run job/stop that caused it — its
+ * own job/stop produces a generic "context canceled", not a distinguishing
+ * message, so the caller must tell us). Strings ground-truthed by grepping
+ * the exact literals out of the bundled rclone v1.75.1 binary: "max
+ * transfer limit reached as set by --max-transfer" (MaxTransfer/budget
+ * cutoff) and "max transfer duration reached as set by --max-duration"
+ * (MaxDuration/window soft-stop cutoff) are rclone's own fixed error text
+ * for those two CutoffMode triggers, not something this codebase invented.
+ * Replaces an earlier, broken heuristic that inferred "window" purely from
+ * whether a window happened to be active at *poll* time — which
+ * misclassified a job that legitimately completed a few seconds after its
+ * window closed, and suppressed its first-seed notification.
+ */
+function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget): string
+{
+    if ($errorMsg === '') {
+        return 'completed';
+    }
+    if (godwit_is_upload_limit_error($errorMsg)) {
+        return 'throttled';
+    }
+    if ($stoppedForBudget || str_contains($errorMsg, 'as set by --max-transfer')) {
+        return 'budget';
+    }
+    if (str_contains($errorMsg, 'as set by --max-duration')) {
+        return 'window';
+    }
+    if (godwit_classify_error($errorMsg) === 'auth-expired') {
+        return 'auth';
+    }
+    return 'error';
 }
 
 // --- Daily budget ledger -----------------------------------------------
