@@ -279,6 +279,123 @@ itself, not only the directory-modtime bug) — confirmed live with a
 local-backend fixture that a truncated run still skips deletion even with
 `NoUpdateDirModTime` set, and needs no fix.
 
+**v0.4.2 (built and offline-verified, 2026-09-18) is a defect fix plus a
+wording fix, prompted by tonight's live budget behaviour: after last
+night's seed used the full 700 GiB between 22:28 and 06:10, the ledger
+trickles back at roughly the window's bwlimit rate, and 0.4.1's "start
+whenever remaining > 0" restarted a resuming job on every trickle,
+re-listing the whole share each time.**
+
+- **Minimum budget threshold (Kieren's call: 20%).** A job whose LAST run
+  ended by hitting the daily cap (`outcome === 'budget'`) — known
+  outstanding work — is now held back from restarting until its remote's
+  remaining rolling-24h budget is at least `GODWIT_MIN_BUDGET_FRACTION`
+  (0.20, a named constant with the reasoning next to it in `lib.php`) of
+  that remote's configured cap; 140 GiB at the live 700 GiB cap. A job
+  whose last run *completed* cleanly is never gated — it has no known
+  outstanding work and may just need a few MB for an incremental sync, so
+  gating it too could stall it a whole night for nothing. Settable per
+  remote via `settings.json`'s `budget_min_fractions` map (no UI, as
+  scoped — `?? GODWIT_MIN_BUDGET_FRACTION` falls back cleanly for every
+  remote that doesn't set one).
+- **Gate placement matters and was gotten wrong once during review, then
+  fixed before merge.** The first design gated inside the candidate-start
+  loop, AFTER `godwit_select_next_jobs()` had already reserved the gated
+  job's remote — which would have stalled every other job on that remote
+  behind it, exactly the completed-job exception this feature exists to
+  protect. Fixed by giving `godwit_select_next_jobs()` a new optional
+  `$gatedJobNames` param: a gated job is skipped WITHOUT reserving its
+  remote, so a sibling job on the same remote still gets picked the same
+  tick. Every enabled job gated is a normal quiet state (tested): the
+  queue selects nothing, does not spin, and does not error.
+  `godwit_budget_reached_notification()` (the "budget reached" alert) no
+  longer fires for a gated job — the cap-stop notification already
+  covered it when the run first hit the cap. The "Run now" override does
+  NOT bypass the threshold gate — a resuming job stays gated even under
+  Run now, since the underlying constraint (Drive API call cost per
+  restart) doesn't go away just because the user asked for an immediate
+  run. godwitd logs the hold-back once per job per gated spell (not once
+  per 15s tick, tracked via `$budgetGateLogged`), found by explicitly
+  testing for a spin/deadlock, not assumed safe.
+- **Human-readable run status.** The raw `outcome` string ("error (669.2
+  GiB) at 18/09/2026, 05:41:51" for a run that behaved exactly as
+  designed) is replaced by a new `godwit_job_status_label()`: `completed`
+  reads as completed; `budget`/`window` read as a calm "paused — …,
+  resumes HH:MM (X uploaded)" using the REAL configured window start
+  (`godwit_next_window_start_label()`, midnight-wrap-safe, picks the
+  earliest of multiple configured windows) rather than a hardcoded
+  "22:00"; a job currently held back by the new threshold reads "waiting
+  for daily cap to free up"; a genuine failure still plainly says `error`
+  (throttled/auth-expired get a more specific "error — …" since those
+  reasons are actually known; a bare `error` has no stored reason text to
+  report beyond pointing at the log, by design — see below).
+  `godwit_build_jobs_status()` computes this server-side into a new
+  `status_text` field per job; `Godwit.page`'s JS now renders it verbatim
+  instead of rebuilding a label from `last_run.outcome` client-side.
+  `godwit_cap_stop_notification()` gained an optional 6th `$resumeLabel`
+  param (backward compatible — every pre-0.4.2 5-arg call site and test
+  still passes) so the notification embeds the same real resume time.
+  Historical `job_runs` rows stored `error` by 0.3.0/0.4.0 — before
+  outcome classification distinguished budget/window from a real failure
+  — are indistinguishable from a genuine error here and are left as
+  `error`; there is no stored error-text column to reclassify them from,
+  and CLAUDE.md's standing rule is no guessed backfill. This is honest by
+  construction: only rows actually classified `budget`/`window` (0.4.1+)
+  get the calm wording; nothing pre-0.4.1 is silently reinterpreted.
+- **A real bug found by the tests themselves, not by review.** The first
+  implementation of both `godwit_next_window_start_label()` and
+  `godwit_job_status_label()`'s "at HH:MM:SS" formatting used PHP's plain
+  `date($format, $ts)`, which formats in the PROCESS's global default
+  timezone, not the timezone of the `DateTimeImmutable $now` object the
+  functions were handed — silently correct in production only because
+  godwitd sets the process default at startup (and godwit-api.php, the
+  web SAPI entry point, now does too — see below), but wrong the moment a
+  caller (a test, or any future consumer) passes a `$now` in a different
+  zone. Caught immediately by 3 of the new tests failing red with values
+  exactly 10 hours off (AEST vs UTC): fixed by reconstructing the label
+  timestamp through `DateTimeImmutable`/`setTimezone($now->getTimezone())`
+  instead of the global-default-dependent `date()` function.
+- **Timezone bootstrap gap closed.** `godwit_build_jobs_status()` is
+  reachable from the web SAPI (`godwit-api.php`), which — unlike godwitd —
+  never called `godwit_resolve_timezone()`; CLAUDE.md already records the
+  host PHP defaults to UTC. Without fixing this, every "resumes HH:MM"
+  label rendered by the settings page would have been computed against a
+  UTC "now" and read hours off from the daemon's own (correctly
+  timezoned) notifications. `godwit-api.php` now calls
+  `date_default_timezone_set(godwit_resolve_timezone(...))` at bootstrap,
+  mirroring godwitd's own startup line exactly.
+- **Page phase label.** `Godwit.page`'s intro no longer says "Phase 3" —
+  phases are a PLAN.md planning concept, not something a user should see.
+  PLAN.md gets a note that the 0.4.x series is UX/defect work sitting
+  between Phase 3 and Phase 4, so the version/phase mismatch doesn't
+  confuse a future session (PLAN.md itself is gitignored, so this note
+  lives only in the working tree, not in any commit).
+- **Review**: 3 passes of `code-diff-reviewer` returned 3× NO FINDINGS
+  (a known failure mode of that reviewer per its own skill doc, not
+  treated as proof of correctness on its own). Escalation score was 5
+  (OWN band: exposure 1, authority 1, data 1, reversibility 1, test gap 0,
+  pattern divergence 0, module spread 1 — no counsel), so only `advisor`
+  ran as a further check; it read the diff directly rather than relying
+  solely on the 0-finding passes and found no blocking issue, but flagged
+  process gaps (this section, the CHANGELOG conversion, and the tag/md5
+  verification below) that are addressed here.
+
+Verified offline (248/248, `php tests/run.php`; 218 pre-existing + 30 new,
+6 genuinely red before the fix — 3 the timezone bug above, 2 test-authoring
+bugs in the new tests themselves caught by running them, 1 consequential
+from the timezone fix). **Not verified this release**: nothing against the
+live Google Drive remote or a real trickle-budget restart scenario on the
+host — this was built read-only against the host (no install, no
+daemon/rcd restart, no mutating rc call; the host was left running
+tonight's live seed the whole session) specifically because the user
+installs this one personally before 22:00 AEST. Tonight's first start of
+each of the four jobs will NOT be gated by the new threshold — their
+current `last_run` rows are all legacy `error` (pre-0.4.1), not `budget`;
+the gate only engages once a job's outcome is actually stored as `budget`,
+which happens from tonight's first budget-triggered stop onward. No live
+browser click-through of the updated status text or phase-free intro
+paragraph — same gap as 0.4.0, unchanged by this release.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

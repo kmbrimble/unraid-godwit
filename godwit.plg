@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.4.1">
+<!ENTITY version   "0.4.2">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,13 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.4.2
+- Godwit no longer restarts a job that hit its daily upload cap on every
+  small trickle of freed budget: it now waits until at least 20% of the
+  remote's cap is free again before resuming a budget-stopped job (a job
+  that completed cleanly last time is unaffected). A budget or window
+  stop now reads as a calm "paused, resumes HH:MM" instead of "error" on
+  the Settings page. The page no longer says "Phase 3".
 ###0.4.1
 - Fixed spurious "run failed" alerts on Kieren/Teegan (2026-09-18): a
   MaxTransfer/daily-cap cutoff always left some destination directories the

@@ -10,41 +10,78 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
-### Plan (v0.4.2 — budget threshold, status wording, phase label)
+## [0.4.2] - 2026-09-18
+
+### Added
 
 - **Minimum budget threshold before resuming a budget-stopped job.** A job
   whose last run ended because it hit its remote's daily cap (`outcome ===
   'budget'`) is not restarted until that remote's remaining rolling-24h
   budget is at least `GODWIT_MIN_BUDGET_FRACTION` (20%, Kieren's call) of
-  its configured cap — otherwise a trickle-refilling budget after last
-  night's full-cap night restarts the job every ~15s tick, each restart
-  re-listing the whole share. A job whose last run *completed* cleanly is
-  never gated (no known outstanding work; may just be a small incremental
-  sync). Gating happens in `godwit_select_next_jobs()` itself (new optional
-  `$gatedJobNames` param) so a gated job is skipped without reserving its
-  remote — the next enabled job on the same remote still gets a turn the
-  same tick, so the queue can't deadlock. godwitd logs the hold-back once
-  per job per gated state, not every tick. The "Run now" queue-drained
-  check does NOT pass gating, so `run-now` stays armed (doesn't self-clear)
-  while a job is genuinely waiting on budget, not just between ticks.
-- **Human-readable run status.** New `godwit_job_status_label()` renders
-  `completed`/`budget`/`window`/gated/`error`/`auth`/`throttled`/never-run
-  into calm, accurate English instead of the raw outcome string (a budget
-  or window stop is not a failure). Uses the real configured window start
-  time (`godwit_next_window_start_label()`), not a hardcoded "22:00", and
-  is midnight-wrap-safe. `godwit_build_jobs_status()` adds a `status_text`
-  field the page renders verbatim; `Godwit.page`'s JS no longer rebuilds
-  the string from `last_run.outcome`. `godwit_cap_stop_notification()`
-  gets an optional 6th param to embed the same real resume time. Legacy
-  `job_runs` rows stored `error` by 0.3.0/0.4.0 stay `error` — no
-  backfill/guessing, per CLAUDE.md.
-- **Page phase label.** `Godwit.page`'s intro drops "Phase 3 —" (a PLAN.md
-  concept, not a user one) for a plain description of what the page does.
-  PLAN.md gets a line noting 0.4.x is UX/defect work between Phase 3 and 4.
-- Known gap, stated not fixed: tonight's first start of each job (all four
-  `last_run` rows are legacy `error`, not `budget`) is not gated — the gate
-  only engages once a job's `outcome` is actually `budget`, which only
-  0.4.1+ writes.
+  its configured cap (140 GiB at the live 700 GiB cap) — otherwise a
+  trickle-refilling budget after last night's full-cap night restarts the
+  job every ~15s tick, each restart re-listing the whole share. A job
+  whose last run *completed* cleanly is never gated (no known outstanding
+  work; may just be a small incremental sync). Settable per remote via
+  `settings.json`'s `budget_min_fractions` map (no UI, as scoped).
+- New `status_text` field in `jobs_status`: a human-readable render of each
+  job's last run, computed server-side by `godwit_job_status_label()`.
+
+### Changed
+
+- **Human-readable run status.** `completed`/`budget`/`window`/gated/
+  `error`/`auth`/`throttled`/never-run now render as calm, accurate English
+  instead of the raw outcome string — "error (669.2 GiB) at …" for a run
+  that hit the daily cap exactly as designed read as alarming and was
+  wrong. Uses the real configured window start time
+  (`godwit_next_window_start_label()`), not a hardcoded "22:00", and is
+  midnight-wrap-safe and multi-window-aware. `Godwit.page`'s JS renders
+  `status_text` verbatim instead of rebuilding a label from
+  `last_run.outcome` client-side. `godwit_cap_stop_notification()` gained
+  an optional 6th `$resumeLabel` param (backward compatible with every
+  existing 5-arg call/test) to embed the same real resume time in the
+  notification text.
+- `godwit_select_next_jobs()` gained a new optional `$gatedJobNames` param:
+  a gated job is skipped WITHOUT reserving its remote, so the next enabled
+  job on the same remote still gets a turn the same tick — a gate placed
+  the ordinary way (after selection) would have stalled every job behind
+  the gated one, the exact scenario the completed-job exception exists to
+  avoid. Every enabled job gated is a normal quiet state: the queue
+  selects nothing, does not spin, does not deadlock. godwitd logs the
+  hold-back once per job per gated spell, not once per 15s tick.
+  `godwit_budget_reached_notification()` no longer fires for a gated job —
+  the cap-stop notification already covered it when the run first hit the
+  cap. The "Run now" override does NOT bypass the threshold gate — a
+  resuming job stays gated even under Run now.
+- `Godwit.page`'s intro drops "Phase 3 —" (a PLAN.md planning concept, not
+  a user concept) for a plain description of what the page does. PLAN.md
+  (gitignored, not part of this or any commit) gets a note that 0.4.x is
+  UX/defect work between Phase 3 and 4.
+- `godwit-api.php` now calls `godwit_resolve_timezone()` at bootstrap,
+  mirroring godwitd's own startup — closes a gap where the web SAPI's
+  "resumes HH:MM" label would otherwise compute against PHP's UTC default
+  instead of the daemon's real local clock.
+
+### Fixed
+
+- A real bug the new tests caught, not review: the first implementation of
+  `godwit_next_window_start_label()`/`godwit_job_status_label()`'s time
+  formatting used PHP's `date($format, $ts)`, which formats in the
+  process's global default timezone rather than the timezone of the
+  `DateTimeImmutable $now` object handed to the function — silently
+  correct only because godwitd (and now godwit-api.php) happen to set the
+  process default at startup, wrong for any other caller. Fixed by
+  formatting through `DateTimeImmutable`/`setTimezone()` instead.
+
+### Known gap
+
+- Tonight's first start of each of the four jobs will NOT be gated by the
+  new threshold — their current `last_run` rows are all legacy `error`
+  (pre-0.4.1), not `budget`; the gate only engages once a job's outcome is
+  actually stored as `budget`, from tonight's first budget-triggered stop
+  onward. Historical `job_runs` rows stored `error` by 0.3.0/0.4.0 stay
+  `error` in status_text too — no backfill/guessing, per CLAUDE.md; only
+  rows classified from 0.4.1 onward get the calm budget/window wording.
 
 ## [0.4.1] - 2026-09-18
 
