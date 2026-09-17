@@ -13,7 +13,7 @@ if (file_exists($pidFile)) {
 }
 ?>
 <h1>Godwit</h1>
-<p>Phase 3 — Google full backup. This page manages rclone remotes, Google backup jobs, the daily upload budget and windows, and shows daemon status.</p>
+<p>Offsite backup for your Unraid shares. This page manages rclone remotes, Google backup jobs, the daily upload budget and windows, and shows daemon status.</p>
 
 <details id="godwit-section-status" open>
 <summary><h2>Status</h2></summary>
@@ -564,9 +564,7 @@ function godwitJobsRefresh() {
                     ? 'running — ' + fmtBytes(j.progress.bytes) + ', ' + j.progress.files + ' files, ' +
                       (j.progress.speed_bps !== null ? fmtBytes(j.progress.speed_bps) + '/s' : 'speed unknown') +
                       ', ETA ' + fmtDuration(j.progress.eta_seconds)
-                    : (j.last_run
-                        ? j.last_run.outcome + ' (' + fmtBytes(j.last_run.bytes) + ') at ' + new Date((j.last_run.ended_ts || j.last_run.started_ts) * 1000).toLocaleString()
-                        : 'never run');
+                    : j.status_text;
                 var queue = j.running ? '-' : (j.queue_position !== null ? j.queue_position : '-');
                 return '<tr data-name="' + esc(j.name) + '" data-share="' + esc(j.share) + '" data-remote="' + esc(j.remote) + '" data-maxdelete="' + j.max_delete + '">' +
                     '<td>' + esc(j.name) + '</td>' +

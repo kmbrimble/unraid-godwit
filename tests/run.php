@@ -1357,6 +1357,21 @@ t('Godwit.page: the background remotes-list refresh never touches #godwit-remote
     assert_true(!str_contains($body, 'godwit-remotes-message'), 'godwitRemotesRefresh() must never reference the action-message div: ' . $body);
 });
 
+t('Godwit.page: the intro no longer names an internal phase number — phases are a PLAN.md concept, not a user one', function () use ($repoRoot) {
+    $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
+    assert_true(!preg_match('/Phase\s*\d/i', $page), 'expected no "Phase N" text anywhere in the user-facing page');
+});
+
+t('Godwit.page: the non-running job status line renders the server-computed status_text, not a client-rebuilt outcome string', function () use ($repoRoot) {
+    $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
+    $start = strpos($page, 'function godwitJobsRefresh()');
+    assert_true($start !== false, 'expected to find function godwitJobsRefresh()');
+    $end = strpos($page, "\nfunction ", $start + 1);
+    $body = substr($page, $start, $end - $start);
+    assert_true(str_contains($body, 'j.status_text'), 'expected the non-running branch to use j.status_text: ' . $body);
+    assert_true(!str_contains($body, 'j.last_run.outcome +'), 'must not rebuild the label from the raw outcome client-side (that is what read as "error" for a budget/window stop): ' . $body);
+});
+
 t('Godwit.page: the OneDrive drive picker markup and wiring are present', function () use ($repoRoot) {
     $page = file_get_contents($repoRoot . '/plugin/Godwit.page');
     foreach (['id="onedrive-picker"', 'id="onedrive-picker-choices"', 'id="onedrive-picker-use"',
@@ -2002,6 +2017,70 @@ t('godwit_default_budget_cap_bytes: matches the D12 700 GiB default', function (
     assert_eq(700 * 1024 * 1024 * 1024, godwit_default_budget_cap_bytes(), '700 GiB in bytes');
 });
 
+// --- v0.4.2 minimum budget threshold (Kieren's call: 20%) ------------------
+
+t('GODWIT_MIN_BUDGET_FRACTION: is 0.20, and the 700 GiB default cap threshold is 140 GiB', function () {
+    assert_eq(0.20, GODWIT_MIN_BUDGET_FRACTION, 'default fraction is 20%');
+    $cap = 700 * 1024 * 1024 * 1024;
+    assert_eq(140 * 1024 * 1024 * 1024, godwit_min_budget_threshold_bytes($cap, GODWIT_MIN_BUDGET_FRACTION), '20% of 700 GiB is 140 GiB');
+});
+
+t('godwit_job_budget_gated: a job resuming a budget stop is gated while remaining is below the threshold', function () {
+    $cap = 700 * 1024 * 1024 * 1024;
+    $last = ['outcome' => 'budget'];
+    assert_true(godwit_job_budget_gated($last, $cap, 100 * 1024 * 1024 * 1024, 0.20), '100 GiB remaining < 140 GiB threshold — gated');
+    assert_true(!godwit_job_budget_gated($last, $cap, 140 * 1024 * 1024 * 1024, 0.20), 'exactly at the threshold is enough — not gated');
+    assert_true(!godwit_job_budget_gated($last, $cap, 200 * 1024 * 1024 * 1024, 0.20), '200 GiB remaining is well above the threshold — not gated');
+});
+
+t('godwit_job_budget_gated: a job that completed cleanly last time is never gated, even with almost no budget left — it may just need a few MB', function () {
+    $cap = 700 * 1024 * 1024 * 1024;
+    $last = ['outcome' => 'completed'];
+    assert_true(!godwit_job_budget_gated($last, $cap, 1024, 0.20), 'completed last run must never be held back by the threshold');
+});
+
+t('godwit_job_budget_gated: window/interrupted/error/auth/throttled outcomes are not gated — only a real budget stop has known outstanding work', function () {
+    $cap = 700 * 1024 * 1024 * 1024;
+    foreach (['window', 'interrupted', 'error', 'auth', 'throttled'] as $outcome) {
+        $last = ['outcome' => $outcome];
+        assert_true(!godwit_job_budget_gated($last, $cap, 1024, 0.20), "outcome '$outcome' must not be gated by the budget threshold");
+    }
+});
+
+t('godwit_job_budget_gated: a job that has never run is not gated', function () {
+    assert_true(!godwit_job_budget_gated(null, 700 * 1024 * 1024 * 1024, 0, 0.20), 'no last run — nothing to resume, nothing to gate');
+});
+
+// --- v0.4.2 gate placement: a gated job must not stall a sibling on the ----
+// --- same remote, and must not deadlock the queue if every job is gated ---
+
+t('godwit_select_next_jobs: a gated job is skipped WITHOUT reserving its remote — the next job on the same remote still gets picked', function () {
+    // Filing Cabinet is first in queue order but gated; Kieren (also gdrive)
+    // must be selected instead, in the SAME tick — this is the stall this
+    // gate exists to avoid, not a two-tick recovery.
+    $selected = godwit_select_next_jobs(godwit_default_jobs(), [], [], 0, ['Filing Cabinet']);
+    $names = array_column($selected, 'name');
+    assert_true(!in_array('Filing Cabinet', $names, true), 'gated job must not be selected: ' . json_encode($names));
+    assert_true(in_array('Kieren', $names, true), 'the next job on the same remote must be selected instead: ' . json_encode($names));
+    assert_eq(1, count($selected), 'still only one job per remote');
+});
+
+t('godwit_select_next_jobs: every enabled job gated is a normal quiet state — selects nothing, does not error', function () {
+    $names = array_column(godwit_default_jobs(), 'name');
+    $selected = godwit_select_next_jobs(godwit_default_jobs(), [], [], 0, $names);
+    assert_eq(0, count($selected), 'every job gated selects nothing (not a crash, not a partial list)');
+});
+
+t('godwit_select_next_jobs: a gated job on an otherwise-idle remote leaves that remote idle, not falsely reserved', function () {
+    $jobs = [
+        ['name' => 'A', 'share' => 'A', 'remote' => 'gdrive', 'enabled' => true],
+        ['name' => 'B', 'share' => 'B', 'remote' => 'onedrive', 'enabled' => true],
+    ];
+    $selected = godwit_select_next_jobs($jobs, [], [], 0, ['A']);
+    $names = array_column($selected, 'name');
+    assert_eq(['B'], $names, 'gdrive stays free (A gated, nothing else queued for it); onedrive proceeds normally');
+});
+
 t('budget ledger: overshoot scenario — MaxTransfer per job can overshoot, the ledger still reflects real usage and zeroes remaining', function () {
     $db = new SQLite3(':memory:');
     godwit_open_budget_table($db);
@@ -2124,6 +2203,45 @@ t('godwit_window_start_ts: the D12 default at 05:00 (spillover) resolves to YEST
     $now = godwit_test_dt('2026-09-18 05:00:00');
     $expected = godwit_test_dt('2026-09-17 22:00:00')->getTimestamp();
     assert_eq($expected, godwit_window_start_ts($w, $now), 'must resolve to the previous day\'s start');
+});
+
+t('godwit_next_window_start_ts: before tonight\'s window opens, the next start is later today', function () {
+    $w = godwit_default_windows()[0];
+    $now = godwit_test_dt('2026-09-17 12:00:00');
+    $expected = godwit_test_dt('2026-09-17 22:00:00')->getTimestamp();
+    assert_eq($expected, godwit_next_window_start_ts($w, $now), 'next start is 22:00 today');
+});
+
+t('godwit_next_window_start_ts: while inside a midnight-wrap window, the next start is tomorrow, not today\'s already-passed one', function () {
+    $w = godwit_default_windows()[0];
+    $now = godwit_test_dt('2026-09-17 23:00:00'); // already inside tonight's window
+    $expected = godwit_test_dt('2026-09-18 22:00:00')->getTimestamp();
+    assert_eq($expected, godwit_next_window_start_ts($w, $now), 'must not report today\'s 22:00, which already passed');
+});
+
+t('godwit_next_window_start_ts: respects the weekday list, skipping ahead to the next matching day', function () {
+    // Window only active Monday (day 1): 2026-09-14 is a Monday, 2026-09-21 the next one.
+    $w = ['days' => [1], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => 100.0];
+    $now = godwit_test_dt('2026-09-15 12:00:00'); // Tuesday
+    $expected = godwit_test_dt('2026-09-21 22:00:00')->getTimestamp();
+    assert_eq($expected, godwit_next_window_start_ts($w, $now), 'must skip ahead to the following Monday');
+});
+
+t('godwit_next_window_start_label: formats as H:i using the real configured start, not a hardcoded 22:00', function () {
+    $w = ['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '23:30', 'end' => '05:00', 'limit_mbit' => 100.0];
+    $now = godwit_test_dt('2026-09-17 12:00:00');
+    assert_eq('23:30', godwit_next_window_start_label([$w], $now), 'must reflect the configured 23:30, not 22:00');
+});
+
+t('godwit_next_window_start_label: with multiple windows, picks the earliest upcoming start', function () {
+    $early = ['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '10:00', 'end' => '11:00', 'limit_mbit' => 100.0];
+    $late = ['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '22:00', 'end' => '23:00', 'limit_mbit' => 100.0];
+    $now = godwit_test_dt('2026-09-17 08:00:00');
+    assert_eq('10:00', godwit_next_window_start_label([$late, $early], $now), 'earliest of the two upcoming starts, regardless of array order');
+});
+
+t('godwit_next_window_start_label: null with no windows configured', function () {
+    assert_eq(null, godwit_next_window_start_label([], godwit_test_dt('2026-09-17 12:00:00')), 'no windows means no resume label');
 });
 
 t('godwit_mbit_to_bytes_per_sec: 250 Mbit/s converts to the exact byte rate (not the M/MiB suffix)', function () {
@@ -2447,6 +2565,83 @@ t('godwit_cap_stop_notification: more than the cutoff\'s own accounted error sur
     assert_true(str_contains($n['description'], '6 errors were also logged'), $n['description']);
     $n2 = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 6, 4);
     assert_true(str_contains($n2['description'], '6 errors were also logged'), 'still above the Transfers=4 baseline: ' . $n2['description']);
+});
+
+t('godwit_cap_stop_notification: an explicit resume label (v0.4.2) is embedded verbatim instead of the generic "the next window"', function () {
+    $n = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 1, 1, '22:00');
+    assert_true(str_contains($n['description'], 'resume at 22:00'), $n['description']);
+    assert_true(!str_contains($n['description'], 'the next window'), 'must not fall back to the generic phrase once a real label is given: ' . $n['description']);
+});
+
+t('godwit_cap_stop_notification: with no resume label (the pre-0.4.2 call shape), still falls back to the generic phrasing', function () {
+    $n = godwit_cap_stop_notification('Kieren', 'budget', 718553336093, 1, 1);
+    assert_true(str_contains($n['description'], 'resume at the next window'), $n['description']);
+});
+
+// --- v0.4.2 byte formatting and human-readable status text -----------------
+
+t('godwit_format_bytes: auto-picks the unit like the page\'s JS fmtBytes()', function () {
+    assert_eq('0.0 B', godwit_format_bytes(0), 'zero');
+    assert_eq('512.0 B', godwit_format_bytes(512), 'sub-KiB stays in bytes');
+    assert_eq('1.0 KiB', godwit_format_bytes(1024), 'exactly 1 KiB');
+    assert_eq('129.5 MiB', godwit_format_bytes((int) round(129.5 * 1024 * 1024)), 'MiB scale, matching the CLAUDE.md example');
+    assert_eq('669.2 GiB', godwit_format_bytes((int) round(669.2 * 1024 * 1024 * 1024)), 'GiB scale, matching the CLAUDE.md example');
+});
+
+t('godwit_job_status_label: gated takes priority over the last outcome — it is the current, more specific reason', function () {
+    $label = godwit_job_status_label(['outcome' => 'budget', 'bytes' => 0, 'ended_ts' => 1000], true, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
+    assert_eq('waiting for daily cap to free up', $label, 'gated overrides the stored outcome');
+});
+
+t('godwit_job_status_label: never run', function () {
+    assert_eq('never run', godwit_job_status_label(null, false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00')), 'no last run at all');
+});
+
+t('godwit_job_status_label: completed reads as completed, plainly, with size and time', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $label = godwit_job_status_label(['outcome' => 'completed', 'bytes' => (int) round(129.5 * 1024 * 1024), 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
+    assert_true(str_starts_with($label, 'completed (129.5 MiB) at'), $label);
+    assert_true(!str_contains(strtolower($label), 'error'), $label);
+});
+
+t('godwit_job_status_label: budget reads as a calm pause with the real resume time, not "error"', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $windows = [['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => 250.0]];
+    $label = godwit_job_status_label(['outcome' => 'budget', 'bytes' => (int) round(669.2 * 1024 * 1024 * 1024), 'ended_ts' => $ts, 'started_ts' => $ts], false, $windows, godwit_test_dt('2026-09-18 12:00:00'));
+    assert_true(!str_contains(strtolower($label), 'error'), $label);
+    assert_true(str_contains($label, 'daily upload cap'), $label);
+    assert_true(str_contains($label, 'resumes 22:00'), $label);
+    assert_true(str_contains($label, '669.2 GiB uploaded'), $label);
+});
+
+t('godwit_job_status_label: budget uses the REAL configured window start, not a hardcoded 22:00', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $windows = [['days' => [0, 1, 2, 3, 4, 5, 6], 'start' => '23:30', 'end' => '07:00', 'limit_mbit' => 250.0]];
+    $label = godwit_job_status_label(['outcome' => 'budget', 'bytes' => 0, 'ended_ts' => $ts, 'started_ts' => $ts], false, $windows, godwit_test_dt('2026-09-18 12:00:00'));
+    assert_true(str_contains($label, 'resumes 23:30'), $label);
+});
+
+t('godwit_job_status_label: window reads as a calm pause distinct from budget', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $windows = godwit_default_windows();
+    $label = godwit_job_status_label(['outcome' => 'window', 'bytes' => (int) round(11.1 * 1024 * 1024 * 1024), 'ended_ts' => $ts, 'started_ts' => $ts], false, $windows, godwit_test_dt('2026-09-18 12:00:00'));
+    assert_true(!str_contains(strtolower($label), 'error'), $label);
+    assert_true(str_contains($label, 'upload window closed'), $label);
+    assert_true(str_contains($label, '11.1 GiB uploaded'), $label);
+});
+
+t('godwit_job_status_label: a genuine failure still plainly says error', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $label = godwit_job_status_label(['outcome' => 'error', 'bytes' => 0, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
+    assert_true(str_starts_with($label, 'error ('), $label);
+});
+
+t('godwit_job_status_label: throttled and auth failures still say error, with the known specific reason', function () {
+    $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
+    $throttled = godwit_job_status_label(['outcome' => 'throttled', 'bytes' => 0, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
+    $auth = godwit_job_status_label(['outcome' => 'auth', 'bytes' => 0, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
+    assert_true(str_starts_with($throttled, 'error'), $throttled);
+    assert_true(str_starts_with($auth, 'error'), $auth);
 });
 
 t('godwit_purge_call_params: builds fs/remote params only after the safety assertion passes', function () {
@@ -3036,6 +3231,50 @@ t('godwit_build_jobs_status: reports per-remote budget usage and throttle state'
     assert_eq(1, count($status['remotes']), 'only gdrive is referenced by the default jobs');
     assert_eq(10_000_000_000, $status['remotes'][0]['used_24h_bytes'], 'used bytes reflects the ledger');
     assert_eq(null, $status['remotes'][0]['throttled_until'], 'not throttled');
+});
+
+t('godwit_build_jobs_status: status_text is completed, plainly, for a clean finish', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    $runId = godwit_start_job_run($db, 'Filing Cabinet', 'gdrive', 1000);
+    godwit_finish_job_run($db, $runId, 1500, (int) round(129.5 * 1024 * 1024), 237, 0, 'completed');
+    $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
+    $fc = null;
+    foreach ($status['jobs'] as $j) { if ($j['name'] === 'Filing Cabinet') { $fc = $j; } }
+    assert_true(str_starts_with($fc['status_text'], 'completed (129.5 MiB) at'), $fc['status_text']);
+});
+
+t('godwit_build_jobs_status: a job resuming a budget stop with too little remaining budget shows the gated waiting text, not "error" or the raw outcome', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    // 700 GiB cap, 590 GiB used -> 110 GiB remaining, below the 140 GiB (20%) threshold.
+    godwit_record_ledger_delta($db, 'gdrive', 1900, 590 * 1024 * 1024 * 1024);
+    $runId = godwit_start_job_run($db, 'Filing Cabinet', 'gdrive', 1000);
+    godwit_finish_job_run($db, $runId, 1500, 669 * 1024 * 1024 * 1024, 100, 0, 'budget');
+    $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
+    $fc = null;
+    foreach ($status['jobs'] as $j) { if ($j['name'] === 'Filing Cabinet') { $fc = $j; } }
+    assert_eq('waiting for daily cap to free up', $fc['status_text'], $fc['status_text']);
+});
+
+t('godwit_build_jobs_status: the same budget-stopped job is NOT gated once enough budget has freed up — shows the calm paused/resumes text instead', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    // 700 GiB cap, only 100 GiB used -> 600 GiB remaining, well above the 140 GiB threshold.
+    godwit_record_ledger_delta($db, 'gdrive', 1900, 100 * 1024 * 1024 * 1024);
+    $runId = godwit_start_job_run($db, 'Filing Cabinet', 'gdrive', 1000);
+    godwit_finish_job_run($db, $runId, 1500, 669 * 1024 * 1024 * 1024, 100, 0, 'budget');
+    $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
+    $fc = null;
+    foreach ($status['jobs'] as $j) { if ($j['name'] === 'Filing Cabinet') { $fc = $j; } }
+    assert_true(str_contains($fc['status_text'], 'daily upload cap reached'), $fc['status_text']);
+    assert_true(!str_contains(strtolower($fc['status_text']), 'error'), $fc['status_text']);
 });
 
 function godwit_test_job_env(): array

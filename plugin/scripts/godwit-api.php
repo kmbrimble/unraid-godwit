@@ -18,6 +18,13 @@ declare(strict_types=1);
 
 require __DIR__ . '/lib.php';
 
+// Matches godwitd's own startup (see lib.php's godwit_resolve_timezone()) —
+// without this, jobs_status's status_text (v0.4.2) would compute "resumes
+// HH:MM" against PHP's UTC default instead of the daemon's real local
+// clock, landing hours off on the host (which has no date.timezone ini
+// setting and defaults to UTC).
+date_default_timezone_set(godwit_resolve_timezone(getenv('GODWIT_TZ') ?: null));
+
 header('Content-Type: application/json');
 
 $pidFile = getenv('GODWIT_PIDFILE') ?: '/var/run/godwit.pid';

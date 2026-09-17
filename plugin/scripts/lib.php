@@ -1481,8 +1481,16 @@ function godwit_terminal_job_outcomes(): array
  * everything else (never run, or cut short by budget/window/a restart)
  * stays eligible. $sessionStartTs is the daemon's own bookkeeping of when
  * the current window (or "Run now" override) began — see godwitd.
+ *
+ * $gatedJobNames (v0.4.2) lists jobs held back by
+ * godwit_job_budget_gated() — a job in this list is skipped WITHOUT
+ * reserving its remote, so the next enabled job on the same remote still
+ * gets a turn this same tick. Gating a job the ordinary way (treating it
+ * like an active job) would reserve its remote and stall every job behind
+ * it in queue order — exactly the exception case a completed job's small
+ * incremental resync exists to avoid.
  */
-function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastRuns = [], int $sessionStartTs = 0): array
+function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastRuns = [], int $sessionStartTs = 0, array $gatedJobNames = []): array
 {
     $inUse = $activeRemotes;
     $selected = [];
@@ -1496,6 +1504,9 @@ function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastR
         }
         $last = $lastRuns[$job['name']] ?? null;
         if ($last !== null && $last['ended_ts'] !== null && (int) $last['ended_ts'] >= $sessionStartTs && in_array($last['outcome'], $terminal, true)) {
+            continue;
+        }
+        if (in_array($job['name'], $gatedJobNames, true)) {
             continue;
         }
         $selected[] = $job;
@@ -1560,6 +1571,64 @@ function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget): 
     return 'error';
 }
 
+/** Auto-unit byte formatter (B/KiB/MiB/.../PiB, one decimal) — mirrors Godwit.page's JS fmtBytes() so the server-rendered status_text and the page's own "running" line read the same way. */
+function godwit_format_bytes(int $bytes): string
+{
+    $units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    $n = (float) $bytes;
+    $i = 0;
+    while ($n >= 1024 && $i < count($units) - 1) {
+        $n /= 1024;
+        $i++;
+    }
+    return sprintf('%.1f %s', $n, $units[$i]);
+}
+
+/**
+ * Human-readable label for a job's last run, for the settings page (v0.4.2)
+ * — a budget or window stop did exactly what it was designed to do and
+ * must not read as "error". $gated means godwit_job_budget_gated() is
+ * currently holding this job back (checked live, not stored), which takes
+ * priority over restating the last outcome since it's the more specific,
+ * current reason nothing is happening right now.
+ *
+ * Legacy job_runs rows written by 0.3.0/0.4.0 (before outcome
+ * classification distinguished budget/window from a real error) are
+ * indistinguishable from a genuine failure here and stay 'error' — there
+ * is no stored error text to reclassify them from, and guessing would be
+ * dishonest (see CLAUDE.md). This is only ever wrong for pre-0.4.1 rows;
+ * every run classified from 0.4.1 onward is accurate.
+ */
+function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \DateTimeImmutable $now): string
+{
+    if ($gated) {
+        return 'waiting for daily cap to free up';
+    }
+    if ($lastRun === null) {
+        return 'never run';
+    }
+    $bytes = godwit_format_bytes((int) $lastRun['bytes']);
+    $whenTs = (int) ($lastRun['ended_ts'] ?? $lastRun['started_ts']);
+    $when = (new \DateTimeImmutable('@' . $whenTs))->setTimezone($now->getTimezone())->format('d/m/Y, H:i:s');
+    $resume = godwit_next_window_start_label($windows, $now) ?? 'the next window';
+    switch ($lastRun['outcome']) {
+        case 'completed':
+            return "completed ($bytes) at $when";
+        case 'budget':
+            return "paused — daily upload cap reached, resumes $resume ($bytes uploaded)";
+        case 'window':
+            return "paused — upload window closed, resumes $resume ($bytes uploaded)";
+        case 'throttled':
+            return "error — Google's daily upload limit reached ($bytes) at $when";
+        case 'auth':
+            return "error — authentication expired ($bytes) at $when";
+        case 'interrupted':
+            return "interrupted (godwitd restarted mid-run, $bytes) at $when";
+        default:
+            return "error ($bytes) at $when — see /var/log/godwit.log";
+    }
+}
+
 // --- Daily budget ledger -----------------------------------------------
 
 function godwit_default_budget_cap_bytes(): int
@@ -1611,6 +1680,44 @@ function godwit_trim_ledger(SQLite3 $db, int $now, int $retainSeconds = 90000): 
 function godwit_remaining_budget(int $capBytes, int $usedBytes): int
 {
     return max(0, $capBytes - $usedBytes);
+}
+
+/**
+ * Default minimum fraction of a remote's daily cap that must be free before
+ * a budget-stopped job is allowed to resume (v0.4.2, Kieren's call: 20%).
+ * Without this, the night after a full-cap night the ledger trickles back
+ * at roughly the window's bwlimit rate (~112 GB/h at 250 Mbit/s) — every
+ * tick's tiny sliver of headroom restarts the job, and every restart
+ * re-lists the whole share (thousands of Drive API calls). Settable per
+ * remote via settings.json's budget_min_fractions (no UI — see
+ * godwit_job_budget_gated()'s caller).
+ */
+const GODWIT_MIN_BUDGET_FRACTION = 0.20;
+
+function godwit_min_budget_threshold_bytes(int $capBytes, float $fraction): int
+{
+    return (int) round($capBytes * $fraction);
+}
+
+/**
+ * Whether a job should be held back from (re)starting because it's
+ * resuming known-outstanding work without enough budget headroom yet.
+ * Only gates a job whose LAST run ended by hitting the budget cap
+ * ($lastRun['outcome'] === 'budget') — that job is known to have more left
+ * to transfer. A job that completed cleanly, was cut short by the window
+ * closing (not budget), was interrupted by a restart, or has never run has
+ * no known-outstanding-work signal, so it is never gated: gating those too
+ * could stall a job needing only a few MB for a whole night, for no
+ * benefit. See godwitd's candidate-selection tick for how this composes
+ * with godwit_select_next_jobs() so a gated job never blocks a sibling job
+ * on the same remote.
+ */
+function godwit_job_budget_gated(?array $lastRun, int $capBytes, int $remainingBytes, float $minFraction): bool
+{
+    if ($lastRun === null || ($lastRun['outcome'] ?? null) !== 'budget') {
+        return false;
+    }
+    return $remainingBytes < godwit_min_budget_threshold_bytes($capBytes, $minFraction);
 }
 
 // --- Throttling (drive_stop_on_upload_limit) ----------------------------
@@ -1749,6 +1856,50 @@ function godwit_seconds_to_window_end(array $window, \DateTimeImmutable $now): i
         $end = $end->modify('+1 day');
     }
     return $end->getTimestamp() - $now->getTimestamp();
+}
+
+/**
+ * The next timestamp (strictly after $now) at which $window opens — walks
+ * forward day by day (bounded to a week, since $window['days'] could in
+ * principle name only one weekday) checking both day-of-week membership
+ * and that today's start time hasn't already passed, so a window that's
+ * active right now (crossing midnight) correctly reports tomorrow's start,
+ * not today's already-passed one.
+ */
+function godwit_next_window_start_ts(array $window, \DateTimeImmutable $now): int
+{
+    [$sh, $sm] = array_map('intval', explode(':', $window['start']));
+    for ($add = 0; $add < 8; $add++) {
+        $candidateDay = $now->modify("+$add day");
+        if (!in_array((int) $candidateDay->format('w'), $window['days'], true)) {
+            continue;
+        }
+        $candidate = $candidateDay->setTime($sh, $sm, 0);
+        if ($candidate > $now) {
+            return $candidate->getTimestamp();
+        }
+    }
+    // No day in the next week matches window['days'] at all (misconfigured
+    // to an empty list) — fall back to today's start time rather than
+    // throwing, since this only feeds a display label, never a scheduling
+    // decision.
+    return $now->setTime($sh, $sm, 0)->getTimestamp();
+}
+
+/** "H:i" label of the earliest upcoming start across every configured window — what a budget/window-paused job's status text tells the user to expect, instead of a hardcoded "22:00". Null if there are no windows at all. Formats in $now's own timezone (via DateTimeImmutable, not the date() function's process-wide default) — plain date($fmt, $ts) would silently render in UTC regardless of what timezone $now was built in. */
+function godwit_next_window_start_label(array $windows, \DateTimeImmutable $now): ?string
+{
+    if (count($windows) === 0) {
+        return null;
+    }
+    $best = null;
+    foreach ($windows as $w) {
+        $ts = godwit_next_window_start_ts($w, $now);
+        if ($best === null || $ts < $best) {
+            $best = $ts;
+        }
+    }
+    return (new \DateTimeImmutable('@' . $best))->setTimezone($now->getTimezone())->format('H:i');
 }
 
 function godwit_line_profiles(): array
@@ -1911,6 +2062,23 @@ function godwit_active_run(SQLite3 $db, string $jobName): ?array
  */
 function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int $now): array
 {
+    // DateTimeImmutable in the process's configured timezone (godwitd and
+    // godwit-api.php both call godwit_resolve_timezone() at startup) rather
+    // than the UTC a naive `@$now` construction would default to — needed
+    // so godwit_next_window_start_label()'s day-of-week/time-of-day
+    // comparisons land on the right calendar day.
+    $nowDt = (new \DateTimeImmutable('@' . $now))->setTimezone(new \DateTimeZone(date_default_timezone_get()));
+
+    // Per-remote cap/remaining, computed once and reused by both the
+    // per-job gating check below and the remotes summary at the bottom —
+    // avoids querying the ledger twice per remote.
+    $remoteBudget = [];
+    foreach (array_values(array_unique(array_column($jobs, 'remote'))) as $remote) {
+        $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
+        $used = godwit_ledger_used_24h($db, $remote, $now);
+        $remoteBudget[$remote] = ['cap' => $cap, 'remaining' => godwit_remaining_budget($cap, $used), 'used' => $used];
+    }
+
     // Queue position = index among this job's own remote's other enabled,
     // not-currently-running jobs, in jobs.json array order — "0" means
     // "starts as soon as whatever's currently using this remote finishes".
@@ -1933,6 +2101,9 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
         $active = godwit_active_run($db, $job['name']);
         $last = godwit_last_job_run($db, $job['name']);
         $pos = $queuePositions[$job['name']] ?? null;
+        $budget = $remoteBudget[$job['remote']] ?? ['cap' => godwit_default_budget_cap_bytes(), 'remaining' => 0];
+        $minFraction = (float) ($settings['budget_min_fractions'][$job['remote']] ?? GODWIT_MIN_BUDGET_FRACTION);
+        $gated = $active === null && godwit_job_budget_gated($last, $budget['cap'], $budget['remaining'], $minFraction);
         $jobsOut[] = [
             'name' => $job['name'],
             'share' => $job['share'],
@@ -1960,19 +2131,17 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
                 'outcome' => $last['outcome'],
             ] : null,
             'queue_position' => $pos,
+            'status_text' => godwit_job_status_label($last, $gated, $settings['windows'] ?? [], $nowDt),
         ];
     }
 
-    $remotes = array_values(array_unique(array_column($jobs, 'remote')));
     $remotesOut = [];
-    foreach ($remotes as $remote) {
-        $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
-        $used = godwit_ledger_used_24h($db, $remote, $now);
+    foreach ($remoteBudget as $remote => $budget) {
         $remotesOut[] = [
             'remote' => $remote,
-            'cap_bytes' => $cap,
-            'used_24h_bytes' => $used,
-            'remaining_bytes' => godwit_remaining_budget($cap, $used),
+            'cap_bytes' => $budget['cap'],
+            'used_24h_bytes' => $budget['used'],
+            'remaining_bytes' => $budget['remaining'],
             'throttled_until' => godwit_throttled_until($db, $remote, $now),
         ];
     }
@@ -2223,12 +2392,13 @@ function godwit_job_error_notification(string $jobName, ?string $errorMessage): 
  * The caller (godwitd) picks 0 for 'window' and the job's Transfers for
  * 'budget'.
  */
-function godwit_cap_stop_notification(string $jobName, string $outcome, int $bytes, int $errorCount, int $baselineErrors): array
+function godwit_cap_stop_notification(string $jobName, string $outcome, int $bytes, int $errorCount, int $baselineErrors, ?string $resumeLabel = null): array
 {
     $gib = $bytes / (1024 ** 3);
     $reason = $outcome === 'window' ? "tonight's backup window" : 'its daily upload cap';
     $subject = $outcome === 'window' ? "Godwit: $jobName stopped for tonight's window" : "Godwit: $jobName stopped at the daily cap";
-    $description = sprintf('%s transferred %.2f GiB before hitting %s — it will resume at the next window.', $jobName, $gib, $reason);
+    $resume = $resumeLabel !== null ? "at $resumeLabel" : 'at the next window';
+    $description = sprintf('%s transferred %.2f GiB before hitting %s — it will resume %s.', $jobName, $gib, $reason, $resume);
     if ($errorCount > $baselineErrors) {
         $description .= " $errorCount errors were also logged this run — check /var/log/godwit.log.";
     }

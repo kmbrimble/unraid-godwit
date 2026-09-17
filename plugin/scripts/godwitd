@@ -200,6 +200,11 @@ $lastRetention = 0;
 $lastLedgerTrim = 0;
 $currentBwlimitMbit = null;
 $activeJobs = []; // jobName => ['jobid','remote','run_id','started_ts','group','last_bytes','stop_reason']
+// jobName => true while godwit_job_budget_gated() holds it back (v0.4.2) —
+// lets the "held back" log line fire once per gated spell instead of once
+// per 15s tick; cleared the moment the job is no longer gated (started, or
+// freed up enough budget).
+$budgetGateLogged = [];
 // Marks when the current window (or "Run now" override) began — reset
 // whenever start-gating transitions from closed to open. godwit_select_next_jobs()
 // uses this to tell "already finished this session, don't re-select it" apart
@@ -369,14 +374,46 @@ while ($running) {
             foreach ($jobs as $job) {
                 $lastRuns[$job['name']] = godwit_last_job_run($db, $job['name']);
             }
-            $candidates = godwit_select_next_jobs($jobs, $activeRemotes, $lastRuns, $sessionStartTs);
+            // Per-remote cap/remaining, computed once up front so the
+            // budget-threshold gate (below) and the actual start loop see
+            // the same numbers, and so the ledger isn't queried twice per
+            // remote per tick.
+            $remoteBudget = [];
+            foreach (array_values(array_unique(array_column($jobs, 'remote'))) as $remote) {
+                $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
+                $remoteBudget[$remote] = ['cap' => $cap, 'remaining' => godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $remote, $now))];
+            }
+            // v0.4.2 minimum-budget-threshold gate: a job resuming known-
+            // outstanding work (its last run ended by hitting the budget
+            // cap) waits for real headroom instead of restarting on every
+            // trickle of freed budget — see godwit_job_budget_gated()'s
+            // docblock. Computed and passed into godwit_select_next_jobs()
+            // itself (not filtered out of $candidates below) so a gated
+            // job never reserves its remote and blocks a sibling job on
+            // the same remote from getting a turn this tick.
+            $gatedJobNames = [];
+            foreach ($jobs as $job) {
+                $budget = $remoteBudget[$job['remote']] ?? ['cap' => 0, 'remaining' => 0];
+                $minFraction = (float) ($settings['budget_min_fractions'][$job['remote']] ?? GODWIT_MIN_BUDGET_FRACTION);
+                if (godwit_job_budget_gated($lastRuns[$job['name']] ?? null, $budget['cap'], $budget['remaining'], $minFraction)) {
+                    $gatedJobNames[] = $job['name'];
+                    if (!isset($budgetGateLogged[$job['name']])) {
+                        $threshold = godwit_min_budget_threshold_bytes($budget['cap'], $minFraction);
+                        godwit_log($logFile, "job \"{$job['name']}\" held back — {$job['remote']}'s remaining budget ({$budget['remaining']} bytes) is below the resume threshold ($threshold bytes) for a job resuming a budget stop");
+                        $budgetGateLogged[$job['name']] = true;
+                    }
+                } else {
+                    unset($budgetGateLogged[$job['name']]);
+                }
+            }
+            $candidates = godwit_select_next_jobs($jobs, $activeRemotes, $lastRuns, $sessionStartTs, $gatedJobNames);
             foreach ($candidates as $job) {
                 $remote = $job['remote'];
                 if (godwit_throttled_until($db, $remote, $now) !== null) {
                     continue;
                 }
-                $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
-                $remaining = godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $remote, $now));
+                $cap = $remoteBudget[$remote]['cap'];
+                $remaining = $remoteBudget[$remote]['remaining'];
                 if ($remaining <= 0) {
                     $n = godwit_budget_reached_notification($db, $remote, date('Y-m-d'));
                     if ($n !== null) {
@@ -495,7 +532,8 @@ while ($running) {
                 // cutoff/cancellation when it next tries to start a file);
                 // MaxDuration's fatal cutoff costs exactly 0.
                 $baselineErrors = $outcome === 'window' ? 0 : $aj['transfers'];
-                $n = godwit_cap_stop_notification($name, $outcome, $bytes, $errors, $baselineErrors);
+                $resumeLabel = godwit_next_window_start_label($settings['windows'], $nowDt);
+                $n = godwit_cap_stop_notification($name, $outcome, $bytes, $errors, $baselineErrors, $resumeLabel);
                 godwit_notify($n['subject'], $n['description'], $n['importance']);
             }
             godwit_finish_job_run($db, $aj['run_id'], $now, $bytes, $files, $errors, $outcome);
