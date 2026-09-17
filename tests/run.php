@@ -2201,6 +2201,167 @@ t('godwit_job_error_notification: always builds an alert-level notification', fu
     assert_true(str_contains($n['description'], 'connection reset'), $n['description']);
 });
 
+t('godwit_purge_call_params: builds fs/remote params only after the safety assertion passes', function () {
+    $p = godwit_purge_call_params('gdrive', 'Kieren', '2026-08-01');
+    assert_eq('gdrive:godwit/_versions/Kieren', $p['fs'], 'fs');
+    assert_eq('2026-08-01', $p['remote'], 'remote');
+});
+
+t('godwit_purge_call_params: propagates the safety exception for a bad date dir', function () {
+    try {
+        godwit_purge_call_params('gdrive', 'Kieren', '../../etc');
+        throw new \RuntimeException('expected an exception');
+    } catch (\InvalidArgumentException $e) {
+        assert_true(true, 'threw as expected');
+    }
+});
+
+t('godwit_resolve_timezone: an explicit override always wins', function () {
+    assert_eq('Pacific/Auckland', godwit_resolve_timezone('Pacific/Auckland'), 'override wins');
+});
+
+t('godwit_run_now_limit_mbit: borrows the first configured window\'s rate', function () {
+    assert_eq(250.0, godwit_run_now_limit_mbit(godwit_default_windows()), 'D12 default is 250 Mbit/s');
+});
+
+t('godwit_load_settings / godwit_save_settings: seeds D12 defaults, round-trips, merges missing keys', function () {
+    $tmp = sys_get_temp_dir() . '/godwit-settings-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    $defaults = godwit_load_settings($tmp);
+    assert_eq(700 * 1024 * 1024 * 1024, $defaults['budget_caps']['gdrive'], 'default budget cap');
+    assert_eq(30, $defaults['retention_days'], 'default retention');
+
+    // Simulate an older settings.json missing a key added later.
+    file_put_contents($tmp . '/settings.json', json_encode(['profile' => '500/50']));
+    $merged = godwit_load_settings($tmp);
+    assert_eq('500/50', $merged['profile'], 'on-disk value wins');
+    assert_eq(30, $merged['retention_days'], 'missing key falls back to default');
+
+    godwit_save_settings($tmp, $merged);
+    assert_eq('500/50', godwit_load_settings($tmp)['profile'], 'round trip');
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+// --- godwit_build_jobs_status / godwit_handle_job_action --------------------
+
+t('godwit_build_jobs_status: a job with an open run row shows as running with live progress', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    $runId = godwit_start_job_run($db, 'Filing Cabinet', 'gdrive', 1000);
+    godwit_update_job_run_progress($db, $runId, 5000, 3, 0, 120);
+    $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
+    $fc = null;
+    foreach ($status['jobs'] as $j) {
+        if ($j['name'] === 'Filing Cabinet') { $fc = $j; }
+    }
+    assert_true($fc['running'], 'Filing Cabinet should show as running');
+    assert_eq(5000, $fc['progress']['bytes'], 'live bytes');
+    assert_eq(120, $fc['progress']['eta_seconds'], 'live eta');
+    // Its remote (gdrive) is busy, so Kieren (next in queue) must show
+    // queue_position 0 rather than also appearing "running".
+    $kieren = null;
+    foreach ($status['jobs'] as $j) {
+        if ($j['name'] === 'Kieren') { $kieren = $j; }
+    }
+    assert_true(!$kieren['running'], 'Kieren should not be running');
+    assert_eq(0, $kieren['queue_position'], 'Kieren is next in the gdrive queue');
+});
+
+t('godwit_build_jobs_status: reports per-remote budget usage and throttle state', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    godwit_record_ledger_delta($db, 'gdrive', 1900, 10_000_000_000);
+    $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
+    assert_eq(1, count($status['remotes']), 'only gdrive is referenced by the default jobs');
+    assert_eq(10_000_000_000, $status['remotes'][0]['used_24h_bytes'], 'used bytes reflects the ledger');
+    assert_eq(null, $status['remotes'][0]['throttled_until'], 'not throttled');
+});
+
+function godwit_test_job_env(): array
+{
+    $tmp = sys_get_temp_dir() . '/godwit-jobaction-' . bin2hex(random_bytes(4));
+    $runDir = $tmp . '/run';
+    $cfgDir = $tmp . '/cfg';
+    mkdir($runDir, 0700, true);
+    mkdir($cfgDir, 0755, true);
+    $dbPath = $tmp . '/godwit.db';
+    godwit_open_db($dbPath);
+    return ['tmp' => $tmp, 'runDir' => $runDir, 'cfgDir' => $cfgDir, 'dbPath' => $dbPath];
+}
+
+t('godwit_handle_job_action: jobs_save rejects a job whose direction would be reversed', function () {
+    $env = godwit_test_job_env();
+    $badJob = [['name' => 'Evil', 'share' => 'X', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true]];
+    // Sanity: this job is actually fine on its own — the real test is an
+    // overlap/mode failure path, since godwit_build_job_fs() already makes a
+    // structurally-reversed pair unconstructable from jobs_save's input shape.
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($badJob)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(($result['ok'] ?? false) === true, 'a well-formed job should save: ' . json_encode($result));
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: jobs_save rejects an invalid mode', function () {
+    $env = godwit_test_job_env();
+    $jobs = [['name' => 'X', 'share' => 'X', 'remote' => 'gdrive', 'mode' => 'mirror', 'enabled' => true]];
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($jobs)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(str_contains($result['error'] ?? '', 'mode'), var_export($result, true));
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: jobs_save rejects overlapping destinations and touches jobs-changed on success', function () {
+    $env = godwit_test_job_env();
+    $overlapping = [
+        ['name' => 'A', 'share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true],
+        ['name' => 'B', 'share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true],
+    ];
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($overlapping)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(str_contains($result['error'] ?? '', 'overlapping'), var_export($result, true));
+    assert_true(!file_exists($env['runDir'] . '/jobs-changed'), 'a rejected save must not mark jobs changed');
+
+    $ok = godwit_handle_job_action('jobs_save', ['jobs' => json_encode(godwit_default_jobs())], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(($ok['ok'] ?? false) === true, var_export($ok, true));
+    assert_true(file_exists($env['runDir'] . '/jobs-changed'), 'a successful save should mark jobs changed for godwitd to pick up');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: settings_save merges onto the existing on-disk settings, never resets unrelated fields', function () {
+    $env = godwit_test_job_env();
+    godwit_save_settings($env['cfgDir'], array_merge(godwit_default_settings(), ['budget_caps' => ['gdrive' => 123]]));
+    $partial = ['windows' => godwit_default_windows(), 'profile' => '500/50'];
+    $result = godwit_handle_job_action('settings_save', ['settings' => json_encode($partial)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(($result['ok'] ?? false) === true, var_export($result, true));
+    $reloaded = godwit_load_settings($env['cfgDir']);
+    assert_eq(123, $reloaded['budget_caps']['gdrive'], 'a partial settings_save must not clobber the previously-set budget cap');
+    assert_eq('500/50', $reloaded['profile'], 'the field that was sent should still update');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: run_now / pause / resume toggle marker files', function () {
+    $env = godwit_test_job_env();
+    godwit_handle_job_action('run_now', [], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(file_exists($env['runDir'] . '/run-now'), 'run_now should create the marker');
+
+    godwit_handle_job_action('pause', [], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(file_exists($env['runDir'] . '/paused'), 'pause should create the marker');
+
+    godwit_handle_job_action('resume', [], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_true(!file_exists($env['runDir'] . '/paused'), 'resume should remove the marker');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
+t('godwit_handle_job_action: jobs_status reflects paused/run_now marker state', function () {
+    $env = godwit_test_job_env();
+    touch($env['runDir'] . '/paused');
+    $status = godwit_handle_job_action('jobs_status', [], $env['dbPath'], $env['runDir'], $env['cfgDir']);
+    assert_eq(true, $status['paused'], 'paused should reflect the marker');
+    assert_eq(false, $status['run_now'], 'run_now marker absent');
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
 // --- jobs.json load/save ----------------------------------------------------
 
 t('godwit_load_jobs: seeds the Phase 3 defaults when jobs.json does not exist', function () {

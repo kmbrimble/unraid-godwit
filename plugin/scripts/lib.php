@@ -111,11 +111,29 @@ function godwit_rcd_argv(string $rcloneBin, string $configPath, array $listener,
  * behaviour, same 401 without them, and `ps aux` on the spawned process
  * shows no credentials at all.
  */
+/**
+ * Phase 3 additions: drive_chunk_size and drive_stop_on_upload_limit are
+ * backend options, not `_config` rc keys, so they're set once for rcd's
+ * whole lifetime via env — rclone's standard RCLONE_<BACKEND>_<FLAG>
+ * convention, ground-truthed against the bundled v1.75.1 binary the same
+ * way RCLONE_RC_USER/PASS was in Phase 2 (`rclone help flags` lists
+ * --drive-chunk-size / --drive-stop-on-upload-limit; the env form follows
+ * directly from rclone's documented convention). 64 MiB chunk size: large
+ * enough to keep per-chunk HTTP overhead low for the multi-GB files in
+ * Teegan (a 134 GB file is ~2100 chunks at 64Mi vs ~16500 at the 8Mi
+ * default) without ballooning per-transfer memory at the default 4
+ * concurrent transfers (4 × 64Mi ≈ 256 MiB, a reasonable ceiling on Unraid
+ * hardware). stop_on_upload_limit=true makes a hit against Google's
+ * undocumented 750 GiB/day cap a classified, loggable job error (§4.3's
+ * last line of defence) instead of an endless retry loop.
+ */
 function godwit_rcd_env(array $listener): array
 {
     return [
         'RCLONE_RC_USER' => $listener['user'],
         'RCLONE_RC_PASS' => $listener['pass'],
+        'RCLONE_DRIVE_CHUNK_SIZE' => '64M',
+        'RCLONE_DRIVE_STOP_ON_UPLOAD_LIMIT' => 'true',
     ];
 }
 
@@ -1713,9 +1731,217 @@ function godwit_open_job_runs_table(SQLite3 $db): void
         bytes INTEGER NOT NULL DEFAULT 0,
         files INTEGER NOT NULL DEFAULT 0,
         errors INTEGER NOT NULL DEFAULT 0,
-        outcome TEXT
+        outcome TEXT,
+        eta_seconds INTEGER
     )');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_job_runs_job_started ON job_runs(job_name, started_ts)');
+}
+
+/** Updates a still-running run row's live progress (bytes/files/errors/eta) — called every daemon tick while a job is active, so the status page reflects the run in progress rather than only its final result. */
+function godwit_update_job_run_progress(SQLite3 $db, int $runId, int $bytes, int $files, int $errors, ?int $etaSeconds): void
+{
+    $stmt = $db->prepare('UPDATE job_runs SET bytes = :bytes, files = :files, errors = :errors, eta_seconds = :eta WHERE id = :id');
+    $stmt->bindValue(':bytes', $bytes, SQLITE3_INTEGER);
+    $stmt->bindValue(':files', $files, SQLITE3_INTEGER);
+    $stmt->bindValue(':errors', $errors, SQLITE3_INTEGER);
+    $stmt->bindValue(':eta', $etaSeconds, SQLITE3_INTEGER);
+    $stmt->bindValue(':id', $runId, SQLITE3_INTEGER);
+    $stmt->execute();
+}
+
+/** The still-open run row for $jobName, if any — "currently running" per the status page is defined as "has a job_runs row with no ended_ts", which is also exactly what godwit_interrupt_open_runs() looks for on restart. */
+function godwit_active_run(SQLite3 $db, string $jobName): ?array
+{
+    $stmt = $db->prepare('SELECT * FROM job_runs WHERE job_name = :job AND ended_ts IS NULL ORDER BY started_ts DESC LIMIT 1');
+    $stmt->bindValue(':job', $jobName, SQLITE3_TEXT);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    return $row === false ? null : $row;
+}
+
+/**
+ * Full status payload for the Jobs page: each job with its enabled/mode/
+ * transfers/excludes config, whether it's currently running (and live
+ * progress if so), its last completed run, and queue position (index among
+ * jobs that would still need to start, per godwit_select_next_jobs() against
+ * remotes already active) — plus a per-remote budget/throttle summary.
+ * Read-only; never mutates anything.
+ */
+function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int $now): array
+{
+    // Queue position = index among this job's own remote's other enabled,
+    // not-currently-running jobs, in jobs.json array order — "0" means
+    // "starts as soon as whatever's currently using this remote finishes".
+    // A running job has no queue position (it IS the one running); a job on
+    // an idle remote still gets 0, since godwitd's next tick will pick it up
+    // immediately regardless.
+    $remoteCounters = [];
+    $queuePositions = [];
+    foreach ($jobs as $job) {
+        if (empty($job['enabled']) || godwit_active_run($db, $job['name']) !== null) {
+            continue;
+        }
+        $remote = $job['remote'];
+        $remoteCounters[$remote] = ($remoteCounters[$remote] ?? -1) + 1;
+        $queuePositions[$job['name']] = $remoteCounters[$remote];
+    }
+
+    $jobsOut = [];
+    foreach ($jobs as $job) {
+        $active = godwit_active_run($db, $job['name']);
+        $last = godwit_last_job_run($db, $job['name']);
+        $pos = $queuePositions[$job['name']] ?? null;
+        $jobsOut[] = [
+            'name' => $job['name'],
+            'share' => $job['share'],
+            'remote' => $job['remote'],
+            'mode' => $job['mode'] ?? 'sync',
+            'enabled' => !empty($job['enabled']),
+            'transfers' => (int) ($job['transfers'] ?? 4),
+            'max_delete' => (int) ($job['max_delete'] ?? 1000),
+            'excludes' => $job['excludes'] ?? [],
+            'running' => $active !== null,
+            'progress' => $active !== null ? [
+                'bytes' => (int) $active['bytes'],
+                'files' => (int) $active['files'],
+                'errors' => (int) $active['errors'],
+                'eta_seconds' => $active['eta_seconds'] !== null ? (int) $active['eta_seconds'] : null,
+                'started_ts' => (int) $active['started_ts'],
+            ] : null,
+            'last_run' => $last !== null ? [
+                'started_ts' => (int) $last['started_ts'],
+                'ended_ts' => $last['ended_ts'] !== null ? (int) $last['ended_ts'] : null,
+                'bytes' => (int) $last['bytes'],
+                'files' => (int) $last['files'],
+                'errors' => (int) $last['errors'],
+                'outcome' => $last['outcome'],
+            ] : null,
+            'queue_position' => $pos,
+        ];
+    }
+
+    $remotes = array_values(array_unique(array_column($jobs, 'remote')));
+    $remotesOut = [];
+    foreach ($remotes as $remote) {
+        $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
+        $used = godwit_ledger_used_24h($db, $remote, $now);
+        $remotesOut[] = [
+            'remote' => $remote,
+            'cap_bytes' => $cap,
+            'used_24h_bytes' => $used,
+            'remaining_bytes' => godwit_remaining_budget($cap, $used),
+            'throttled_until' => godwit_throttled_until($db, $remote, $now),
+        ];
+    }
+
+    return ['jobs' => $jobsOut, 'remotes' => $remotesOut];
+}
+
+/**
+ * All jobs/settings/queue-control actions posted from the page funnel
+ * through here — mirrors godwit_handle_remote_action()'s shape. jobs_save
+ * and settings_save both go through the same validation as the daemon
+ * itself (godwit_validate_job_destinations(), and each job is round-tripped
+ * through godwit_build_job_fs()+godwit_assert_job_direction() before being
+ * accepted) so a bad save can never reach jobs.json in the first place —
+ * the daemon's own per-tick checks are a second line of defence, not the
+ * only one. run_now/pause/resume just drop or remove a marker file in
+ * $runDir; godwitd's tick loop polls for them the same way it already polls
+ * check-now (Phase 2).
+ */
+function godwit_handle_job_action(string $action, array $post, string $dbPath, string $runDir, string $cfgDir): array
+{
+    if ($action === 'jobs_status') {
+        if (!is_file($dbPath)) {
+            return ['error' => 'heartbeat database not found yet — is godwitd running?'];
+        }
+        try {
+            // Not read-only: a fresh install's db has heartbeat/remotes_health
+            // (created by godwit_open_db()) but the Phase 3 tables are only
+            // guaranteed to exist once godwitd's own startup has run at least
+            // once — ensure they're present here too (all idempotent
+            // CREATE TABLE IF NOT EXISTS / ALTER-with-@, same as every other
+            // godwit_open_*_table() call site) rather than 500ing on a
+            // brand-new database before godwitd's first tick.
+            $db = new SQLite3($dbPath);
+            $db->busyTimeout(5000);
+            godwit_open_job_runs_table($db);
+            godwit_open_budget_table($db);
+            godwit_open_throttle_table($db);
+        } catch (\Throwable $e) {
+            return ['error' => 'state database unavailable'];
+        }
+        $jobs = godwit_load_jobs($cfgDir);
+        $settings = godwit_load_settings($cfgDir);
+        $status = godwit_build_jobs_status($db, $jobs, $settings, time());
+        $status['paused'] = file_exists($runDir . '/paused');
+        $status['run_now'] = file_exists($runDir . '/run-now');
+        $status['settings'] = $settings;
+        return $status;
+    }
+
+    if ($action === 'jobs_save') {
+        $raw = (string) ($post['jobs'] ?? '');
+        $jobs = json_decode($raw, true);
+        if (!is_array($jobs)) {
+            return ['error' => 'jobs must be a JSON array'];
+        }
+        foreach ($jobs as $job) {
+            if (!is_array($job) || empty($job['name']) || empty($job['share']) || empty($job['remote'])) {
+                return ['error' => 'every job needs a name, share and remote'];
+            }
+            try {
+                godwit_assert_job_direction(godwit_build_job_fs($job));
+            } catch (\Throwable $e) {
+                return ['error' => "job \"{$job['name']}\": " . $e->getMessage()];
+            }
+            if (!in_array($job['mode'] ?? 'sync', ['sync', 'copy'], true)) {
+                return ['error' => "job \"{$job['name']}\": mode must be sync or copy"];
+            }
+        }
+        $overlapError = godwit_validate_job_destinations($jobs);
+        if ($overlapError !== null) {
+            return ['error' => $overlapError];
+        }
+        godwit_save_jobs($cfgDir, $jobs);
+        @touch($runDir . '/jobs-changed');
+        return ['ok' => true];
+    }
+
+    if ($action === 'settings_save') {
+        $raw = (string) ($post['settings'] ?? '');
+        $settings = json_decode($raw, true);
+        if (!is_array($settings) || !isset($settings['windows']) || !is_array($settings['windows'])) {
+            return ['error' => 'settings must include a windows array'];
+        }
+        foreach ($settings['windows'] as $w) {
+            if (!isset($w['start'], $w['end'], $w['limit_mbit'], $w['days']) || !is_array($w['days'])) {
+                return ['error' => 'each window needs start, end, limit_mbit and a days array'];
+            }
+        }
+        // Merged against what's already on disk, not just the defaults — a
+        // partial save (the page only ever sends windows+profile) must not
+        // silently reset budget_caps/retention_days back to their defaults.
+        godwit_save_settings($cfgDir, array_merge(godwit_load_settings($cfgDir), $settings));
+        @touch($runDir . '/jobs-changed');
+        return ['ok' => true];
+    }
+
+    if ($action === 'run_now') {
+        @touch($runDir . '/run-now');
+        return ['ok' => true];
+    }
+
+    if ($action === 'pause') {
+        @touch($runDir . '/paused');
+        return ['ok' => true];
+    }
+
+    if ($action === 'resume') {
+        @unlink($runDir . '/paused');
+        return ['ok' => true];
+    }
+
+    return ['error' => 'unknown action'];
 }
 
 function godwit_start_job_run(SQLite3 $db, string $jobName, string $remote, int $ts): int
@@ -1830,6 +2056,82 @@ function godwit_throttled_notification(string $remote, bool $wasAlreadyThrottled
         'description' => "$remote hit Google's daily upload limit — no further uploads to $remote until the throttle clears.",
         'importance' => 'alert',
     ];
+}
+
+function godwit_default_settings(): array
+{
+    return [
+        'windows' => godwit_default_windows(),
+        'budget_caps' => ['gdrive' => godwit_default_budget_cap_bytes()],
+        'profile' => '1000/400',
+        'retention_days' => godwit_default_retention_days(),
+    ];
+}
+
+/** Loads settings.json (windows, per-remote budget caps, line profile, retention days), seeding D12 defaults on first run. Missing keys in an on-disk file fall back to their default individually, so a settings.json written by an older Phase 3 build still loads. */
+function godwit_load_settings(string $cfgDir): array
+{
+    $path = $cfgDir . '/settings.json';
+    $defaults = godwit_default_settings();
+    if (!is_file($path)) {
+        return $defaults;
+    }
+    $decoded = json_decode((string) file_get_contents($path), true);
+    if (!is_array($decoded)) {
+        return $defaults;
+    }
+    return array_merge($defaults, $decoded);
+}
+
+function godwit_save_settings(string $cfgDir, array $settings): void
+{
+    if (!is_dir($cfgDir)) {
+        mkdir($cfgDir, 0755, true);
+    }
+    file_put_contents($cfgDir . '/settings.json', json_encode($settings, JSON_PRETTY_PRINT));
+}
+
+/**
+ * Effective timezone for window evaluation. Honours an explicit override
+ * first (GODWIT_TZ, for tests and for Kieren to force it if Unraid's own
+ * setting is ever wrong), then PHP's own date.timezone ini setting if it's
+ * been configured to anything other than the PHP default of UTC, then
+ * /etc/timezone (what `timedatectl`-based distros, including current
+ * Unraid, write). Falls back to Australia/Brisbane (DST-free AEST, matching
+ * D12's plain "22:00-06:00" with no DST adjustment) only if none of those
+ * resolved anything — host verification must confirm this actually matches
+ * Unraid's configured timezone, since a silent UTC daemon would run the
+ * window 10 hours off local time.
+ */
+function godwit_resolve_timezone(?string $override): string
+{
+    if ($override !== null && $override !== '') {
+        return $override;
+    }
+    $ini = date_default_timezone_get();
+    if ($ini !== 'UTC') {
+        return $ini;
+    }
+    if (is_file('/etc/timezone')) {
+        $t = trim((string) @file_get_contents('/etc/timezone'));
+        if ($t !== '') {
+            return $t;
+        }
+    }
+    return 'Australia/Brisbane';
+}
+
+/** Params for `operations/purge` on one version-date directory, after running it through the full godwit_assert_purge_path() safety check — this is the only place allowed to build that rc call. */
+function godwit_purge_call_params(string $remote, string $share, string $dateDir): array
+{
+    godwit_assert_purge_path($remote, $share, $dateDir); // throws on anything unsafe; the return value itself isn't needed here.
+    return ['fs' => $remote . ':godwit/_versions/' . $share, 'remote' => $dateDir];
+}
+
+/** The bwlimit to apply while a "Run now" override (D15) is active — the override still honours the configured speed limit, so it borrows the first configured window's rate rather than running unlimited. */
+function godwit_run_now_limit_mbit(array $windows): float
+{
+    return (float) ($windows[0]['limit_mbit'] ?? 250.0);
 }
 
 /** Notifies once ever per job (persisted in notify_state) the first time it completes a full run with outcome 'completed'. */

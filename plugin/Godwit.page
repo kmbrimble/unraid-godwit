@@ -13,7 +13,7 @@ if (file_exists($pidFile)) {
 }
 ?>
 <h1>Godwit</h1>
-<p>Phase 2 — remotes. Still no jobs, no uploads; this page manages rclone remotes and shows daemon status.</p>
+<p>Phase 3 — Google full backup. This page manages rclone remotes, Google backup jobs, the daily upload budget and windows, and shows daemon status.</p>
 <p>Service status: <b><?= $running ? 'running' : 'stopped' ?></b></p>
 
 <button id="godwit-start" type="button">Start</button>
@@ -57,6 +57,30 @@ account's drive_id/drive_type itself via rclone's own config flow; see CHANGELOG
     <div id="onedrive-picker-choices"></div>
     <button id="onedrive-picker-use" type="button">Use this drive</button>
 </div>
+
+<h2>Jobs</h2>
+<div id="godwit-budget-bars">Loading budget…</div>
+<div id="godwit-jobs-table">Loading jobs…</div>
+<p>
+    <button id="godwit-jobs-save" type="button">Save jobs</button>
+    <button id="godwit-run-now" type="button">Run now</button>
+    <button id="godwit-pause" type="button">Pause all</button>
+    <button id="godwit-resume" type="button">Resume all</button>
+</p>
+<div id="godwit-jobs-message"></div>
+
+<h3>Windows &amp; speed</h3>
+<p>Line profile:
+    <select id="godwit-profile">
+        <option value="1000/400">1000/400</option>
+        <option value="500/50">500/50</option>
+        <option value="custom">custom</option>
+    </select>
+</p>
+<p>Windows — JSON array of <code>{"days":[0-6],"start":"HH:MM","end":"HH:MM","limit_mbit":N}</code> (day 0 = Sunday):<br>
+    <textarea id="godwit-windows" rows="3" cols="80"></textarea></p>
+<div id="godwit-profile-warning"></div>
+<button id="godwit-settings-save" type="button">Save windows/speed</button>
 
 <script>
 function esc(s) {
@@ -178,16 +202,24 @@ function godwitShowMessage(html) {
     document.getElementById('godwit-remotes-message').innerHTML = html;
 }
 
+function godwitShowJobsMessage(html) {
+    document.getElementById('godwit-jobs-message').innerHTML = html;
+}
+
 function godwitErrorHtml(message) {
     return '<p style="color:red">' + esc(message) + '</p>';
 }
 
-// Runs a user-triggered action (Test/Add/Reauth/Delete): disables the
-// triggering control and shows a pending label, then shows the result (or
-// error) in the persistent message div, then refreshes the table silently.
-// $control may be a single button or an array of controls (an Add form's
-// button plus its inputs) to disable together.
-function godwitRunAction(action, params, controls, pendingLabel, onResult) {
+// Runs a user-triggered action (Test/Add/Reauth/Delete, or a Jobs-page
+// action): disables the triggering control and shows a pending label, then
+// shows the result (or error) in the persistent message div, then refreshes
+// silently. $control may be a single button or an array of controls (an Add
+// form's button plus its inputs) to disable together. $showMessage/$refresh
+// default to the Remotes section's own message div and 30s refresh so every
+// existing remotes_* call site is unchanged; jobs actions pass their own.
+function godwitRunAction(action, params, controls, pendingLabel, onResult, showMessage, refresh) {
+    showMessage = showMessage || godwitShowMessage;
+    refresh = refresh || godwitRemotesRefresh;
     var list = Array.isArray(controls) ? controls : [controls];
     var button = list.find(function (c) { return c.tagName === 'BUTTON'; }) || list[0];
     var originalLabel = button.textContent;
@@ -200,13 +232,13 @@ function godwitRunAction(action, params, controls, pendingLabel, onResult) {
             onResult(data);
         })
         .fail(function (xhr) {
-            godwitShowMessage(godwitErrorHtml('Request failed: ' + xhr.status + ' ' + xhr.statusText));
+            showMessage(godwitErrorHtml('Request failed: ' + xhr.status + ' ' + xhr.statusText));
         })
         .always(function () {
             list.forEach(function (c) { c.disabled = false; });
             button.textContent = originalLabel;
             godwitActionPending = false;
-            godwitRemotesRefresh();
+            refresh();
         });
 }
 
@@ -319,6 +351,149 @@ function godwitAdd(type, label, fieldIds, driveId) {
     });
 }
 
+function fmtDuration(s) {
+    if (s === null || s === undefined) { return 'unknown'; }
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    return h + 'h ' + m + 'm';
+}
+
+var godwitProfileUpstream = { '1000/400': 400, '500/50': 50 };
+// Windows/profile fields are only populated from the server on first load —
+// never on a later background refresh, or an in-progress edit would be
+// silently overwritten out from under the user (same reasoning as the
+// action-pending guard on godwitRemotesRefresh()).
+var godwitJobsLoaded = false;
+
+function godwitUpdateProfileWarning() {
+    var upstream = godwitProfileUpstream[document.getElementById('godwit-profile').value];
+    var el = document.getElementById('godwit-profile-warning');
+    if (!upstream) { el.innerHTML = ''; return; }
+    var windows;
+    try { windows = JSON.parse(document.getElementById('godwit-windows').value); } catch (e) { el.innerHTML = ''; return; }
+    var worst = Math.max.apply(null, [0].concat((windows || []).map(function (w) { return w.limit_mbit || 0; })));
+    el.innerHTML = worst >= 0.8 * upstream
+        ? '<p style="color:orange">Window limit ' + worst + ' Mbit/s is at or above 80% of this profile’s ' + upstream + ' Mbit/s upstream — uploads may saturate the line.</p>'
+        : '';
+}
+
+function godwitJobsRefresh() {
+    if (godwitActionPending) { return; }
+    godwitApiCall('jobs_status', {})
+        .done(function (data) {
+            if (data.error) {
+                document.getElementById('godwit-jobs-table').innerHTML = godwitErrorHtml(data.error);
+                return;
+            }
+            var budgetHtml = (data.remotes || []).map(function (r) {
+                var pct = r.cap_bytes > 0 ? Math.min(100, r.used_24h_bytes / r.cap_bytes * 100) : 0;
+                var throttled = r.throttled_until ? ' — throttled until ' + new Date(r.throttled_until * 1000).toLocaleString() : '';
+                return '<p>' + esc(r.remote) + ': ' + fmtBytes(r.used_24h_bytes) + ' / ' + fmtBytes(r.cap_bytes) +
+                    ' (' + pct.toFixed(1) + '%)' + esc(throttled) +
+                    '<br><div style="background:#ddd;width:300px;height:10px;"><div style="background:' +
+                    (pct >= 100 ? '#c00' : '#2a6') + ';width:' + pct.toFixed(1) + '%;height:10px;"></div></div></p>';
+            }).join('');
+            document.getElementById('godwit-budget-bars').innerHTML = budgetHtml || '<p>No remotes configured.</p>';
+
+            var rows = (data.jobs || []).map(function (j) {
+                var state = j.running
+                    ? 'running — ' + fmtBytes(j.progress.bytes) + ', ' + j.progress.files + ' files, ETA ' + fmtDuration(j.progress.eta_seconds)
+                    : (j.last_run
+                        ? j.last_run.outcome + ' (' + fmtBytes(j.last_run.bytes) + ') at ' + new Date((j.last_run.ended_ts || j.last_run.started_ts) * 1000).toLocaleString()
+                        : 'never run');
+                var queue = j.running ? '-' : (j.queue_position !== null ? j.queue_position : '-');
+                return '<tr data-name="' + esc(j.name) + '" data-share="' + esc(j.share) + '" data-remote="' + esc(j.remote) + '" data-maxdelete="' + j.max_delete + '">' +
+                    '<td>' + esc(j.name) + '</td>' +
+                    '<td>' + esc(j.remote) + '</td>' +
+                    '<td><input type="checkbox" class="godwit-job-enabled"' + (j.enabled ? ' checked' : '') + '></td>' +
+                    '<td><select class="godwit-job-mode">' +
+                    '<option value="sync"' + (j.mode === 'sync' ? ' selected' : '') + '>sync</option>' +
+                    '<option value="copy"' + (j.mode === 'copy' ? ' selected' : '') + '>copy</option></select></td>' +
+                    '<td><input type="number" class="godwit-job-transfers" value="' + j.transfers + '" size="3"></td>' +
+                    '<td><input type="text" class="godwit-job-excludes" value="' + esc((j.excludes || []).join(', ')) + '" size="30"></td>' +
+                    '<td>' + esc(state) + '</td>' +
+                    '<td>' + esc(String(queue)) + '</td>' +
+                    '</tr>';
+            }).join('');
+            document.getElementById('godwit-jobs-table').innerHTML =
+                '<table border="1" cellpadding="4"><tr><th>Name</th><th>Remote</th><th>Enabled</th><th>Mode</th>' +
+                '<th>Transfers</th><th>Excludes</th><th>Status</th><th>Queue</th></tr>' + rows + '</table>';
+
+            if (!godwitJobsLoaded) {
+                document.getElementById('godwit-windows').value = JSON.stringify(data.settings.windows);
+                document.getElementById('godwit-profile').value = data.settings.profile;
+                godwitJobsLoaded = true;
+            }
+            godwitUpdateProfileWarning();
+            document.getElementById('godwit-pause').disabled = data.paused;
+            document.getElementById('godwit-resume').disabled = !data.paused;
+            document.getElementById('godwit-run-now').disabled = data.run_now;
+        })
+        .fail(function (xhr) {
+            document.getElementById('godwit-jobs-table').innerHTML =
+                '<p style="color:red">could not refresh jobs: ' + esc(xhr.status) + ' ' + esc(xhr.statusText) + '</p>';
+        });
+}
+
+function godwitJobsSave() {
+    var rows = document.querySelectorAll('#godwit-jobs-table tr[data-name]');
+    var jobs = Array.prototype.map.call(rows, function (tr) {
+        return {
+            name: tr.dataset.name,
+            share: tr.dataset.share,
+            remote: tr.dataset.remote,
+            enabled: tr.querySelector('.godwit-job-enabled').checked,
+            mode: tr.querySelector('.godwit-job-mode').value,
+            transfers: parseInt(tr.querySelector('.godwit-job-transfers').value, 10) || 4,
+            max_delete: parseInt(tr.dataset.maxdelete, 10) || 1000,
+            excludes: tr.querySelector('.godwit-job-excludes').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+        };
+    });
+    var btn = document.getElementById('godwit-jobs-save');
+    godwitRunAction('jobs_save', { jobs: JSON.stringify(jobs) }, btn, 'Saving…', function (data) {
+        if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
+        godwitShowJobsMessage('<p style="color:green">Jobs saved.</p>');
+    }, godwitShowJobsMessage, godwitJobsRefresh);
+}
+
+function godwitSettingsSave() {
+    var windows;
+    try {
+        windows = JSON.parse(document.getElementById('godwit-windows').value);
+    } catch (e) {
+        godwitShowJobsMessage(godwitErrorHtml('Windows must be valid JSON: ' + e.message));
+        return;
+    }
+    var settings = { windows: windows, profile: document.getElementById('godwit-profile').value };
+    var btn = document.getElementById('godwit-settings-save');
+    godwitRunAction('settings_save', { settings: JSON.stringify(settings) }, btn, 'Saving…', function (data) {
+        if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
+        godwitShowJobsMessage('<p style="color:green">Windows/speed saved.</p>');
+    }, godwitShowJobsMessage, godwitJobsRefresh);
+}
+
+document.getElementById('godwit-jobs-save').addEventListener('click', godwitJobsSave);
+document.getElementById('godwit-settings-save').addEventListener('click', godwitSettingsSave);
+document.getElementById('godwit-profile').addEventListener('change', godwitUpdateProfileWarning);
+document.getElementById('godwit-windows').addEventListener('input', godwitUpdateProfileWarning);
+document.getElementById('godwit-run-now').addEventListener('click', function () {
+    godwitRunAction('run_now', {}, document.getElementById('godwit-run-now'), 'Starting…', function (data) {
+        if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
+        godwitShowJobsMessage('<p style="color:green">Run now started — the queue will run regardless of the window until it drains or the budget is hit.</p>');
+    }, godwitShowJobsMessage, godwitJobsRefresh);
+});
+document.getElementById('godwit-pause').addEventListener('click', function () {
+    godwitRunAction('pause', {}, document.getElementById('godwit-pause'), 'Pausing…', function (data) {
+        if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
+        godwitShowJobsMessage('<p>Paused — no new jobs will start.</p>');
+    }, godwitShowJobsMessage, godwitJobsRefresh);
+});
+document.getElementById('godwit-resume').addEventListener('click', function () {
+    godwitRunAction('resume', {}, document.getElementById('godwit-resume'), 'Resuming…', function (data) {
+        if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
+        godwitShowJobsMessage('<p style="color:green">Resumed.</p>');
+    }, godwitShowJobsMessage, godwitJobsRefresh);
+});
+
 document.getElementById('godwit-start').addEventListener('click', function () { godwitPoll('start'); });
 document.getElementById('godwit-stop').addEventListener('click', function () { godwitPoll('stop'); });
 
@@ -347,4 +522,6 @@ godwitPoll();
 setInterval(godwitPoll, 15000);
 godwitRemotesRefresh();
 setInterval(godwitRemotesRefresh, 30000);
+godwitJobsRefresh();
+setInterval(godwitJobsRefresh, 15000);
 </script>

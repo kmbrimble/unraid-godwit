@@ -154,6 +154,27 @@ pcntl_signal(SIGTERM, function () use (&$running) {
     $running = false;
 });
 
+date_default_timezone_set(godwit_resolve_timezone(getenv('GODWIT_TZ') ?: null));
+godwit_log($logFile, 'effective timezone: ' . date_default_timezone_get());
+
+if ($db !== null) {
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    godwit_open_job_runs_table($db);
+    godwit_open_notify_state_table($db);
+    // A restart of godwitd/rcd always loses whatever rc job was in flight —
+    // rcd's job state lives in that process's memory only. Close out any run
+    // row left open by the previous process; nothing further is needed to
+    // "requeue" it, since $activeJobs below starts empty and the normal
+    // selection pass below will pick the job up again on its own (sync is
+    // idempotent — a re-run only transfers what's still actually
+    // missing/changed).
+    $interrupted = godwit_interrupt_open_runs($db, time());
+    foreach ($interrupted as $row) {
+        godwit_log($logFile, "requeue after restart: {$row['job_name']} was interrupted mid-run, will restart");
+    }
+}
+
 $daemonStartTs = time();
 $rcdLogFile = $runDir . '/rcd.log';
 $rcd = godwit_start_rcd($rcloneBin, $configPath, $runDir, $rcdLogFile, $logFile);
@@ -167,6 +188,17 @@ $lastTrim = 0;
 $lastHealthCheck = 0;
 $healthCheckIntervalSeconds = (int) (getenv('GODWIT_HEALTH_INTERVAL') ?: 3600);
 $checkNowMarker = $runDir . '/check-now';
+
+// === Phase 3: Jobs, budget, windows ========================================
+$jobs = godwit_load_jobs($cfgDir);
+$settings = godwit_load_settings($cfgDir);
+$jobsChangedMarker = $runDir . '/jobs-changed';
+$runNowMarker = $runDir . '/run-now';
+$pausedMarker = $runDir . '/paused';
+$lastJobsReload = time();
+$lastRetention = 0;
+$currentBwlimitMbit = null;
+$activeJobs = []; // jobName => ['jobid','remote','run_id','started_ts','group','last_bytes']
 
 while ($running) {
     sleep(1);
@@ -240,6 +272,202 @@ while ($running) {
             }
         }
         $lastHealthCheck = $now;
+    }
+
+    // === Phase 3 tick: reload config, gate on window/pause, poll active jobs, ===
+    // === start new ones within budget, retention purge once a day. ===========
+    if (file_exists($jobsChangedMarker) || $now - $lastJobsReload >= 30) {
+        @unlink($jobsChangedMarker);
+        $jobs = godwit_load_jobs($cfgDir);
+        $settings = godwit_load_settings($cfgDir);
+        $lastJobsReload = $now;
+    }
+
+    if ($db !== null && $rcd !== null) {
+        $paused = file_exists($pausedMarker);
+        $runNow = file_exists($runNowMarker);
+        $nowDt = new \DateTimeImmutable('now');
+        $window = godwit_active_window($settings['windows'], $nowDt);
+
+        // core/bwlimit is process-global (one shared upload pipe, §4.5) — only
+        // re-issued when the desired rate actually changes, not every tick.
+        $desiredBwlimitMbit = $window !== null
+            ? (float) $window['limit_mbit']
+            : ($runNow ? godwit_run_now_limit_mbit($settings['windows']) : null);
+        if ($desiredBwlimitMbit !== null && $desiredBwlimitMbit !== $currentBwlimitMbit) {
+            godwit_rc_call_params($rcd['listener'], 'core/bwlimit', ['rate' => godwit_bwlimit_rc_value($desiredBwlimitMbit)], 15);
+            godwit_log($logFile, 'bwlimit set to ' . godwit_format_mbit_and_mib($desiredBwlimitMbit));
+            $currentBwlimitMbit = $desiredBwlimitMbit;
+        }
+
+        // --- Start new jobs: only inside a window, or under the "Run now"
+        // override (D15), never both gates bypassed at once by accident —
+        // $runNow only widens *when* jobs may start, budget/throttle/overlap
+        // guards below are identical either way.
+        if (!$paused && ($window !== null || $runNow)) {
+            $activeRemotes = array_values(array_unique(array_map(fn ($aj) => $aj['remote'], $activeJobs)));
+            $candidates = godwit_select_next_jobs($jobs, $activeRemotes);
+            foreach ($candidates as $job) {
+                $remote = $job['remote'];
+                if (godwit_throttled_until($db, $remote, $now) !== null) {
+                    continue;
+                }
+                $cap = (int) ($settings['budget_caps'][$remote] ?? godwit_default_budget_cap_bytes());
+                $remaining = godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $remote, $now));
+                if ($remaining <= 0) {
+                    $n = godwit_budget_reached_notification($db, $remote, date('Y-m-d'));
+                    if ($n !== null) {
+                        godwit_notify($n['subject'], $n['description'], $n['importance']);
+                    }
+                    continue;
+                }
+                try {
+                    $fs = godwit_build_job_fs($job);
+                    godwit_assert_job_direction($fs);
+                } catch (\Throwable $e) {
+                    godwit_log($logFile, "job \"{$job['name']}\" refused to start — invalid job definition: " . $e->getMessage());
+                    continue;
+                }
+                $safeName = preg_replace('/[^A-Za-z0-9_-]/', '_', $job['name']);
+                $filterFile = $runDir . '/filter-' . $safeName . '.txt';
+                godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+                $backupDirFs = ($job['mode'] ?? 'sync') === 'sync' ? godwit_backup_dir_fs($job, date('Y-m-d')) : null;
+                // Soft window stop (§4.5): a window-started job gets MaxDuration
+                // set to the seconds left in *this* window, with CutoffMode
+                // CAUTIOUS — rclone itself then stops picking up new files at
+                // the boundary and lets whatever's already in flight finish,
+                // so a 134 GB upload started at 05:00 is never hard-killed at
+                // 06:00. ponytail: MaxDuration is fixed at job start and does
+                // not adapt if the window is edited mid-run; the job just runs
+                // to the duration computed here — acceptable since windows
+                // change rarely and the next tick's start recomputes it fresh.
+                // A "Run now" job gets no MaxDuration — it runs until the
+                // queue drains or the budget is hit, per D15.
+                $maxDuration = ($window !== null && !$runNow) ? godwit_seconds_to_window_end($window, $nowDt) : null;
+                $params = godwit_build_sync_params($job, $fs, $filterFile, $remaining, $backupDirFs, $maxDuration);
+                $resp = godwit_rc_call_params($rcd['listener'], godwit_sync_rc_path($job['mode'] ?? 'sync'), $params, 15);
+                if ($resp === null || !isset($resp['jobid'])) {
+                    godwit_log($logFile, "job \"{$job['name']}\" failed to start — rcd did not answer or returned no jobid");
+                    continue;
+                }
+                $jobid = $resp['jobid'];
+                $runId = godwit_start_job_run($db, $job['name'], $remote, $now);
+                $activeJobs[$job['name']] = [
+                    'jobid' => $jobid,
+                    'remote' => $remote,
+                    'run_id' => $runId,
+                    'started_ts' => $now,
+                    'group' => 'job/' . $jobid,
+                    'last_bytes' => 0,
+                ];
+                godwit_log($logFile, "job started: {$job['name']} -> {$fs['dstFs']} (rc jobid $jobid, remaining budget $remaining bytes)");
+            }
+        }
+
+        // --- Poll active jobs: job/status (finished/error) + core/stats
+        // (bytes/files/errors), every tick.
+        foreach ($activeJobs as $name => $aj) {
+            $status = godwit_rc_call_params($rcd['listener'], 'job/status', ['jobid' => $aj['jobid']], 15);
+            $stats = godwit_rc_call_params($rcd['listener'], 'core/stats', ['group' => $aj['group']], 15);
+            $bytes = (int) ($stats['bytes'] ?? $aj['last_bytes']);
+            $delta = $bytes - $aj['last_bytes'];
+            if ($delta > 0) {
+                godwit_record_ledger_delta($db, $aj['remote'], $now, $delta);
+            }
+            $activeJobs[$name]['last_bytes'] = $bytes;
+            $etaSeconds = isset($stats['eta']) && is_numeric($stats['eta']) ? (int) $stats['eta'] : null;
+            godwit_update_job_run_progress($db, $aj['run_id'], $bytes, (int) ($stats['transfers'] ?? 0), (int) ($stats['errors'] ?? 0), $etaSeconds);
+
+            if ($status === null || empty($status['finished'])) {
+                continue;
+            }
+            $errorMsg = trim((string) ($status['error'] ?? ''));
+            $files = (int) ($stats['transfers'] ?? 0);
+            $errors = (int) ($stats['errors'] ?? 0);
+            $outcome = 'completed';
+            if ($errorMsg !== '') {
+                if (godwit_is_upload_limit_error($errorMsg)) {
+                    $outcome = 'throttled';
+                    $wasThrottled = godwit_throttled_until($db, $aj['remote'], $now) !== null;
+                    godwit_mark_throttled($db, $aj['remote'], $now + 86400);
+                    $n = godwit_throttled_notification($aj['remote'], $wasThrottled);
+                    if ($n !== null) {
+                        godwit_notify($n['subject'], $n['description'], $n['importance']);
+                    }
+                } elseif (godwit_classify_error($errorMsg) === 'auth-expired') {
+                    $outcome = 'auth';
+                } else {
+                    $outcome = 'error';
+                    $n = godwit_job_error_notification($name, $errorMsg);
+                    godwit_notify($n['subject'], $n['description'], $n['importance']);
+                }
+            } elseif ($window === null && !$runNow) {
+                // Finished cleanly but the window closed while it was
+                // wrapping up (its own MaxDuration already let in-flight
+                // transfers complete) — recorded distinctly from a plain
+                // 'completed' run so the status page can show why it stopped.
+                $outcome = 'window';
+            } else {
+                $cap = (int) ($settings['budget_caps'][$aj['remote']] ?? godwit_default_budget_cap_bytes());
+                if (godwit_remaining_budget($cap, godwit_ledger_used_24h($db, $aj['remote'], $now)) <= 0) {
+                    $outcome = 'budget';
+                }
+            }
+            godwit_finish_job_run($db, $aj['run_id'], $now, $bytes, $files, $errors, $outcome);
+            if ($outcome === 'completed') {
+                $n = godwit_first_seed_notification($db, $name);
+                if ($n !== null) {
+                    godwit_notify($n['subject'], $n['description'], $n['importance']);
+                }
+            }
+            godwit_log($logFile, "job finished: $name -> $outcome ($bytes bytes, $files files, $errors errors)");
+            unset($activeJobs[$name]);
+        }
+
+        // --- "Run now" clears itself once the queue has drained (nothing
+        // active and nothing left eligible to start) — scheduled runs
+        // thereafter follow the normal window (D15).
+        if ($runNow && count($activeJobs) === 0) {
+            $stillEligible = godwit_select_next_jobs($jobs, []);
+            if (count($stillEligible) === 0) {
+                @unlink($runNowMarker);
+                godwit_log($logFile, '"Run now" queue drained — reverting to the normal window schedule');
+            }
+        }
+
+        // --- Version retention purge (§ item 6): once a day, whole
+        // date directories only, every path re-validated by
+        // godwit_purge_call_params()/godwit_assert_purge_path() immediately
+        // before the rc call — never a hand-built string.
+        if ($now - $lastRetention >= 86400) {
+            $retainDays = (int) ($settings['retention_days'] ?? godwit_default_retention_days());
+            foreach ($jobs as $job) {
+                if (empty($job['enabled'])) {
+                    continue;
+                }
+                $listResp = godwit_rc_call_params($rcd['listener'], 'operations/list', [
+                    'fs' => $job['remote'] . ':godwit/_versions/' . $job['share'],
+                    'opt' => json_encode(['dirsOnly' => true]),
+                ], 30);
+                $dirs = is_array($listResp['list'] ?? null) ? array_map(fn ($e) => (string) ($e['Name'] ?? ''), $listResp['list']) : [];
+                $candidates = godwit_versions_purge_candidates($dirs, $retainDays, $nowDt);
+                foreach ($candidates as $dateDir) {
+                    try {
+                        $purgeParams = godwit_purge_call_params($job['remote'], $job['share'], $dateDir);
+                    } catch (\Throwable $e) {
+                        godwit_log($logFile, 'retention purge refused (safety check failed): ' . $e->getMessage());
+                        continue;
+                    }
+                    godwit_rc_call_params($rcd['listener'], 'operations/purge', $purgeParams, 60);
+                    godwit_log($logFile, "retention purge: {$job['remote']}:godwit/_versions/{$job['share']}/$dateDir");
+                }
+            }
+            $lastRetention = $now;
+        }
+
+        if ($now - $lastTrim >= 3600) {
+            godwit_trim_ledger($db, $now);
+        }
     }
 }
 
