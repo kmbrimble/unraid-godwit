@@ -484,6 +484,9 @@ while ($running) {
             } elseif ($outcome === 'error') {
                 $n = godwit_job_error_notification($name, $errorMsg);
                 godwit_notify($n['subject'], $n['description'], $n['importance']);
+            } elseif ($outcome === 'budget' || $outcome === 'window') {
+                $n = godwit_cap_stop_notification($name, $outcome, $bytes, $errors);
+                godwit_notify($n['subject'], $n['description'], $n['importance']);
             }
             godwit_finish_job_run($db, $aj['run_id'], $now, $bytes, $files, $errors, $outcome);
             if ($outcome === 'completed') {

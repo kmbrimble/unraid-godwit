@@ -10,6 +10,70 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-18
+
+### Fixed
+
+- **Spurious "run failed" alerts on a daily-cap stop.** Diagnosed from the
+  live host's `job_runs`/`rcd.log` on the night of 2026-09-17→18: Kieren
+  and Teegan each hit their MaxTransfer cutoff (derived from the 700 GiB
+  rolling budget) partway through, and every one of the 591/85 logged
+  errors was the same shape — `ERROR : <dir>: Failed to update directory
+  timestamp or metadata: directory not found`. rclone stops **starting**
+  new files at the cutoff, so a directory it never reached was never
+  created at the destination; its end-of-sync directory-modtime pass then
+  fails on every such directory. `job/status`'s returned error is rclone's
+  `currentError()`, which resolves in fixed precedence — fatal error, then
+  a plain error, then a "no-retry" error — and MaxTransfer's CAUTIOUS
+  cutoff is a no-retry error (the *lowest* of the three), so the
+  directory-modtime failures (plain errors) always won and overwrote the
+  real "max transfer limit reached" text before it ever reached
+  `godwit_classify_job_outcome()`. The classifier was never the bug: fed
+  the masked text, `error` was the *correct* read of what it was given.
+  Ground-truthed against the bundled rclone v1.75.1's `options/info` rc
+  call (not guessed from the flag spelling): the fix sets `_config`'s
+  `NoUpdateDirModTime` (the Go struct field name; `_config` takes
+  `fs.ConfigInfo` field names, not `--flag` spellings) to `true` on every
+  sync/copy job in `godwit_build_sync_params()` — directory timestamps have
+  no value for an offsite backup, cost API calls, and can never succeed
+  against a destination directory that doesn't exist yet. Proven end to
+  end against a real local-backend rcd fixture (not just that the call is
+  accepted): a MaxTransfer cutoff that skips an entire subdirectory now
+  produces zero directory-modtime errors and the real, uncontaminated
+  "max transfer limit reached as set by --max-transfer" text, which
+  `godwit_classify_job_outcome()` correctly reads as `budget`.
+- **A cap-stopped run now notifies as a stop, not a failure.** New
+  `godwit_cap_stop_notification()` fires for a `budget`/`window` outcome
+  ("Godwit: `<job>` stopped at the daily cap" / "...stopped for tonight's
+  window") reporting how much transferred and that it resumes at the next
+  window, at `normal` importance — replacing the silent-then-misfired
+  "run failed" alert. **The classification rule, made explicit**: because
+  MaxTransfer's cutoff is the lowest-precedence error kind (see above), a
+  genuine transfer failure occurring in the same run already wins
+  `job/status`'s returned text and is classified `error`, not `budget` —
+  no separate error-count check was needed for that case. MaxDuration's
+  window cutoff is the *opposite* precedence (fatal, the highest), so it
+  cannot be masked by a directory-modtime-style error, but in principle
+  could itself mask a genuine co-occurring failure's text. Accepted, and
+  covered defensively: rclone accounts a bare cutoff as exactly one error
+  in `core/stats` even on an otherwise-clean run (ground-truthed locally);
+  `godwit_cap_stop_notification()` treats any `errorCount` above 1 as
+  something beyond the cutoff itself and appends "N errors were also
+  logged this run — check /var/log/godwit.log" to the notification, so a
+  real failure riding along with either cutoff is never silently dropped.
+- **Skipped delete phase on a truncated run — investigated, not a bug.**
+  The same host log showed `"not deleting files/directories as there were
+  IO errors"` on both truncated jobs. Ground-truthed against rclone's
+  `fs/sync/sync.go`: the delete phase is gated on `currentError() != nil`,
+  and MaxTransfer's own cutoff **is** a `currentError()` (a no-retry
+  error) independent of the directory-modtime bug — confirmed live with a
+  local-backend fixture: even with `NoUpdateDirModTime` set, a cutoff sync
+  still skips deletion and logs the same "not deleting" line, with zero
+  other errors present. This is correct, conservative rclone behaviour
+  (never reconcile deletions against a destination the sync didn't fully
+  reach) and needs no fix — deletion resumes normally on any run that
+  completes a full pass within budget.
+
 ## [0.4.0] - 2026-09-18
 
 ### Fixed

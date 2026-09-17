@@ -1388,6 +1388,13 @@ function godwit_sync_rc_path(string $mode): string
  * while letting an in-flight transfer finish — ponytail: this doesn't adapt
  * if the window is edited mid-run; the job just runs to MaxDuration as
  * computed at start. Re-evaluated next tick after the job's next start.
+ * NoUpdateDirModTime is always on: directory timestamps have no value for
+ * an offsite backup, cost API calls, and — this is the bug it fixes —
+ * cannot succeed for a directory a MaxTransfer/MaxDuration cutoff never
+ * reached on the destination. Ground-truthed against the bundled v1.75.1
+ * binary's `options/info` rc call: the flag's rc `_config` field is
+ * `NoUpdateDirModTime` (Go struct field name, not the `--no-update-dir-
+ * modtime` flag spelling — `_config` takes fs.ConfigInfo field names).
  */
 function godwit_build_sync_params(array $job, array $fs, string $filterFile, int $maxTransferBytes, ?string $backupDirFs, ?int $maxDurationSeconds, bool $dryRun = false, string $shareRoot = '/mnt/user'): array
 {
@@ -1398,6 +1405,7 @@ function godwit_build_sync_params(array $job, array $fs, string $filterFile, int
         'CutoffMode' => 'CAUTIOUS',
         'MaxTransfer' => $maxTransferBytes,
         'DryRun' => $dryRun,
+        'NoUpdateDirModTime' => true,
     ];
     if ($backupDirFs !== null) {
         $config['BackupDir'] = $backupDirFs;
@@ -1510,6 +1518,27 @@ function godwit_select_next_jobs(array $jobs, array $activeRemotes, array $lastR
  * whether a window happened to be active at *poll* time — which
  * misclassified a job that legitimately completed a few seconds after its
  * window closed, and suppressed its first-seed notification.
+ *
+ * Why matching on $errorMsg text is enough to also catch a genuine
+ * transfer failure that happens in the same run, without a separate error
+ * count check here (ground-truthed by reading rclone v1.75.1's
+ * fs/sync/sync.go): job/status's error is `currentError()`, which resolves
+ * in fixed precedence — fatalErr, then a plain err, then noRetryErr.
+ * MaxTransfer's CAUTIOUS/graceful cutoff is a NoRetryError (lowest
+ * precedence), so a real per-file error occurring in the same run (a plain
+ * err) always wins and is what ends up in $errorMsg instead — this
+ * function then falls through to 'error', which is correct: the run
+ * genuinely needs attention beyond "resume next window". A `budget`
+ * result here therefore already means nothing else outranked the cutoff.
+ * MaxDuration's cutoff is a *fatal* error (highest precedence), so it is
+ * immune to being masked by an unrelated plain error the way the old
+ * directory-modtime bug masked MaxTransfer — but the reverse asymmetry
+ * exists in principle: a real error co-occurring with a duration cutoff
+ * could theoretically lose to the fatal error's precedence and be
+ * misread as 'window' from this text alone. Accepted: godwitd still
+ * stores the real core/stats error count on every outcome (see
+ * godwit_cap_stop_notification()), so it's never silently lost — only
+ * the outcome label could, in that rare combination, undersell it.
  */
 function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget): string
 {
@@ -2157,6 +2186,38 @@ function godwit_job_error_notification(string $jobName, ?string $errorMessage): 
         'subject' => "Godwit: $jobName run failed",
         'description' => $errorMessage !== null && $errorMessage !== '' ? "$jobName: $errorMessage" : "$jobName's backup run ended in error",
         'importance' => 'alert',
+    ];
+}
+
+/**
+ * A `budget`/`window` outcome is by design (§4.3/§4.5), not a failure — it
+ * reads as a normal stop that resumes at the next window, never as "run
+ * failed". Notifies every run, same as godwit_job_error_notification(),
+ * since these are already infrequent, discrete events.
+ *
+ * $errorCount > 1 is the signal that something beyond the cutoff itself
+ * also went wrong: rclone accounts the cutoff itself as exactly 1 error in
+ * core/stats even on an otherwise-clean run (ground-truthed locally against
+ * the bundled binary — a bare MaxTransfer cutoff with zero real per-file
+ * failures still reports `"errors": 1`), so anything above that count is a
+ * real error riding along with the cutoff. See godwit_classify_job_outcome()
+ * for why a genuine error usually pre-empts the 'budget'/'window' outcome
+ * entirely rather than reaching here at all — this is the residual case
+ * where it didn't.
+ */
+function godwit_cap_stop_notification(string $jobName, string $outcome, int $bytes, int $errorCount): array
+{
+    $gib = $bytes / (1024 ** 3);
+    $reason = $outcome === 'window' ? "tonight's backup window" : 'its daily upload cap';
+    $subject = $outcome === 'window' ? "Godwit: $jobName stopped for tonight's window" : "Godwit: $jobName stopped at the daily cap";
+    $description = sprintf('%s transferred %.2f GiB before hitting %s — it will resume at the next window.', $jobName, $gib, $reason);
+    if ($errorCount > 1) {
+        $description .= " $errorCount errors were also logged this run — check /var/log/godwit.log.";
+    }
+    return [
+        'subject' => $subject,
+        'description' => $description,
+        'importance' => 'normal',
     ];
 }
 

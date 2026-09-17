@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.4.0">
+<!ENTITY version   "0.4.1">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,21 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.4.1
+- Fixed spurious "run failed" alerts on Kieren/Teegan (2026-09-18): a
+  MaxTransfer/daily-cap cutoff always left some destination directories the
+  cutoff never reached, and rclone's own directory-modtime pass then failed
+  on every one of them with "directory not found" — that masking error, not
+  a real transfer failure, was what got stored and notified as "run
+  failed". Every sync/copy job now sets rclone's NoUpdateDirModTime (no
+  value for an offsite backup, and it can never succeed against a
+  destination directory that doesn't exist yet), so a cap-stopped run's
+  real cutoff message survives uncontaminated.
+- A run that stopped at the daily cap or the nightly window now notifies as
+  a normal stop ("stopped at the daily cap"/"stopped for tonight's window",
+  how much transferred, that it resumes next window) instead of an alert —
+  genuine transfer errors occurring in the same run still surface as
+  errors (see CHANGELOG.md for the exact rule).
 ###0.4.0
 - Fixed: version retention purge never ran (rcd rejected operations/list
   for missing the required remote param, so old Drive versions were never
