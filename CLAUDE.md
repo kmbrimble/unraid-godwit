@@ -81,6 +81,69 @@ genuinely wedged rcd — a known ceiling of this fix, not a regression, since
 the loop already serializes remotes one at a time. The real reboot/
 array-stop test from Phase 1 remains outstanding — unchanged by this
 phase.
+**Phase 3 (Google full backup, v0.3.0) is built and offline-verified, host
+verification in progress as of 2026-09-17.** One job per share (Filing
+Cabinet, Kieren, Teegan, Photos) syncing `/mnt/user/<share>` to
+`gdrive:godwit/<share>` with `--backup-dir` versioning; Kieren excludes
+`/TimeMachine/**` and `/Backup/BombVault/**` (D13/D14); a rolling-24h
+700 GiB budget ledger; a default 22:00–06:00 250 Mbit/s window with a
+"Run now" override (D15); one active job per remote, queued in array
+order; version retention (30 days); a Jobs section on the settings page.
+
+Verified offline (196/196 tests, `php tests/run.php`, 2026-09-17):
+job-direction assertion (including the reversed-direction case), filter
+compilation against the real bundled rclone binary (`lsf -R
+--filter-from`), the full `_config`/`_filter` rc call chain proven against
+a real local-backend `rcd` fixture (not just the filter file's contents —
+the actual form-encoded JSON path every job takes), budget ledger maths,
+window evaluation (midnight wrap, DST-free `Australia/Brisbane`), Mbit→
+bytes/s conversion (`31250000B`, never `31.25M` — that's ~262 Mbit/s),
+queue selection/ordering, retention purge path safety, and notification
+rules. Two facts were ground-truthed against the bundled v1.75.1 binary
+by grepping its exact error strings rather than assumed: rclone's
+`--max-transfer` cutoff text is `"max transfer limit reached as set by
+--max-transfer"` and its `--max-duration` cutoff text is `"max transfer
+duration reached as set by --max-duration"` — `godwit_classify_job_outcome()`
+matches on these literally, and both were exercised live against a real
+rcd (not just asserted) in `tests/run.php`, including proving a
+`--max-duration` cutoff leaves no partially-written file at the
+destination.
+
+**Two pre-push review rounds (6 passes total, `code-diff-reviewer`) plus
+a focused 3-pass round on the fix commit found and fixed 5 issues**,
+the most serious being a confirmed **blocking** bug: `godwit_select_next_jobs()`
+had no concept of "already ran this session", so once Filing Cabinet
+finished and dropped out of the daemon's in-memory active-job tracking,
+the very next tick re-selected Filing Cabinet again (always first in
+queue order) instead of advancing to Kieren — the live seed would have
+looped re-syncing Filing Cabinet forever. Fixed with a `$sessionStartTs`
+the daemon resets on every window/"Run now" open transition (and seeds
+correctly from the window's real start on a mid-window restart) plus
+`godwit_terminal_job_outcomes()`; regression tests reproduce the loop and
+prove the fix. The other four: the budget-ledger trim shared a timer
+variable with the pre-existing heartbeat trim and could never actually
+run; a mid-loop `rcd` crash left in-flight jobs and the process-wide
+bwlimit un-reconciled against the freshly restarted `rcd`; a bare `.`
+share name bypassed the traversal guard; the "Run now" queue-drained
+check wasn't passed the same session-awareness as the real selection.
+`advisor` timed out once during the first review round and was used
+normally thereafter; every finding was independently re-verified by
+direct code reading (and, for the two cutoff strings, against the real
+binary) before being fixed, not applied on trust.
+
+**Not yet verified on host (in progress):** the daemon's effective
+timezone (PHP defaults to UTC unless `date.timezone`/`/etc/timezone` says
+otherwise — a UTC daemon would run the 22:00–06:00 window at 08:00–16:00
+AEST); the Filing Cabinet smoke test (upload, re-run transferring ~0
+bytes, ledger recording); the Kieren exclusion dry-run against the real
+share tree; the live seed's first-5-minutes numbers (bytes flowing,
+bwlimit ≤ ~31 MiB/s, ledger increasing); and — now that the queue-
+advancement bug above is fixed — that the queue genuinely advances
+Filing Cabinet → Kieren → Teegan → Photos on the real host, not just in
+the fixture-driven tests. See the handback for results once this
+verification pass completes; this paragraph should be replaced with
+real evidence at that point, not left as a standing gap.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command
