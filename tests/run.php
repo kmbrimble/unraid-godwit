@@ -1772,6 +1772,28 @@ t('godwit_build_job_fs: builds a plain local-src / remote-dst pair', function ()
     assert_eq('gdrive:godwit/Kieren', $fs['dstFs'], 'dstFs');
 });
 
+t('godwit_build_job_fs: rejects a bare "." or ".." share name (would otherwise resolve to /mnt/user itself or its parent)', function () {
+    foreach (['.', '..'] as $bad) {
+        try {
+            godwit_build_job_fs(['share' => $bad, 'remote' => 'gdrive']);
+            throw new \RuntimeException('expected an exception for share=' . var_export($bad, true));
+        } catch (\InvalidArgumentException $e) {
+            assert_true(true, 'threw as expected for ' . var_export($bad, true));
+        }
+    }
+});
+
+t('godwit_assert_purge_path: rejects a bare "." or ".." share name', function () {
+    foreach (['.', '..'] as $bad) {
+        try {
+            godwit_assert_purge_path('gdrive', $bad, '2026-08-01');
+            throw new \RuntimeException('expected an exception for share=' . var_export($bad, true));
+        } catch (\InvalidArgumentException $e) {
+            assert_true(true, 'threw as expected for ' . var_export($bad, true));
+        }
+    }
+});
+
 t('godwit_build_job_fs: rejects a share name containing a path separator', function () {
     try {
         godwit_build_job_fs(['share' => 'Kieren/../../etc', 'remote' => 'gdrive']);

@@ -1332,7 +1332,7 @@ function godwit_write_filter_file(string $path, array $rules): void
 function godwit_build_job_fs(array $job, string $shareRoot = '/mnt/user'): array
 {
     $share = (string) ($job['share'] ?? '');
-    if ($share === '' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
+    if ($share === '' || $share === '.' || $share === '..' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
         throw new \InvalidArgumentException('invalid share name for job: ' . var_export($share, true));
     }
     $remote = (string) ($job['remote'] ?? '');
@@ -1705,7 +1705,7 @@ function godwit_assert_purge_path(string $remote, string $share, string $dateDir
     if ($remote === '' || strpos($remote, ':') !== false || strpos($remote, '/') !== false) {
         throw new \InvalidArgumentException('invalid remote for purge');
     }
-    if ($share === '' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
+    if ($share === '' || $share === '.' || $share === '..' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
         throw new \InvalidArgumentException('invalid share for purge');
     }
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateDir)) {

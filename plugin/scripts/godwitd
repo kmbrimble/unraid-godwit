@@ -197,6 +197,7 @@ $runNowMarker = $runDir . '/run-now';
 $pausedMarker = $runDir . '/paused';
 $lastJobsReload = time();
 $lastRetention = 0;
+$lastLedgerTrim = 0;
 $currentBwlimitMbit = null;
 $activeJobs = []; // jobName => ['jobid','remote','run_id','started_ts','group','last_bytes']
 
@@ -210,6 +211,24 @@ while ($running) {
             godwit_log($logFile, "rcd exited (pid {$status['pid']}) — restarting in {$backoffSeconds}s");
             proc_close($rcd['proc']);
             $rcd = null;
+            // A mid-loop rcd crash loses any in-flight rc job exactly like a
+            // full godwitd restart does (job state lives in rcd's own
+            // process memory), but without this, $activeJobs would keep
+            // tracking a jobid that no longer means anything to the fresh
+            // rcd about to be spawned — rclone's job IDs are a per-process
+            // counter starting at 1, so the very next job started could be
+            // silently misattributed to the stale entry's remote/run row.
+            // Close out any open run rows and clear the in-memory tracking
+            // the same way startup's godwit_interrupt_open_runs() does, so
+            // the next selection pass just requeues them (sync is
+            // idempotent).
+            if ($db !== null && count($activeJobs) > 0) {
+                $interrupted = godwit_interrupt_open_runs($db, $now);
+                foreach ($interrupted as $row) {
+                    godwit_log($logFile, "requeue after rcd crash: {$row['job_name']} was interrupted mid-run, will restart");
+                }
+                $activeJobs = [];
+            }
             sleep($backoffSeconds);
             $backoffSeconds = min($backoffSeconds * 2, 60);
         } elseif ($now - $rcdStartedAt > 60) {
@@ -465,8 +484,13 @@ while ($running) {
             $lastRetention = $now;
         }
 
-        if ($now - $lastTrim >= 3600) {
+        // Its own counter, deliberately not $lastTrim (shared by the
+        // heartbeat trim above, which runs earlier in this same tick and
+        // always resets $lastTrim = $now first — sharing it here made this
+        // condition permanently false, so the ledger never trimmed).
+        if ($now - $lastLedgerTrim >= 3600) {
             godwit_trim_ledger($db, $now);
+            $lastLedgerTrim = $now;
         }
     }
 }
