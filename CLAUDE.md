@@ -582,6 +582,114 @@ the live Google Drive remote or the host — the user is still verifying
 v0.4.2/v0.4.3 live and explicitly asked for build+release only, no
 install, no daemon/rcd restart, no mutating rc call.
 
+**v0.5.0, Phase 4 (OneDrive selective backup) — built and offline-verified
+2026-09-18, host verification pending — the user installs.** Host state
+at the start of this phase (verified by the user just before handoff):
+v0.4.4 installed and running, both remotes healthy, `kmonedrive` a real
+personal OneDrive (1.005 TiB total / 135.6 GiB used / 893.4 GiB free,
+`kmonedrive:godwit` not yet created), all four existing gdrive jobs
+unchanged. Per the user's explicit instruction this phase was built and
+released without installing anything or restarting `godwitd`/`rcd` — the
+user was deliberately keeping the host clean for tonight's first live
+exercise of the v0.4.4 budget fix.
+
+- **Selective job type.** A job's `type` is now `'share'` (Phase 3,
+  default) or `'selective'` (Phase 4): a browsable, lazy-loaded,
+  tri-state checkbox tree over `/mnt/user/<share>` (Godwit.page → Jobs →
+  Add job → Browse…, or "Browse (N)" on an existing selective job's row).
+  Ticking a folder includes everything below it; an already-included
+  folder's children can be un-ticked to exclude just that subtree — one
+  level of override, matching PLAN.md §4.4's wording exactly (there is no
+  way to re-include something nested under an excluded child; the
+  two-list `included`/`excluded` model can't express that, and nothing in
+  the plan asks for it).
+- **Filter compilation.** `godwit_compile_selective_filter_rules()`
+  branches `godwit_compile_filter_rules()` for `type === 'selective'`:
+  excludes ordered before their including ancestor (rclone matches
+  top-to-bottom, first rule wins, so the more specific rule must come
+  first), global junk excludes still applied, a trailing `- **` since a
+  selective job's default is exclude (a share job's is include). Every
+  path is backslash-escaped for rclone's glob metacharacters
+  (`godwit_escape_filter_pattern()`) before being written into a filter
+  line — real filesystem names are not glob patterns. Both the ordering
+  and the escaping are ground-truthed against the real bundled rclone
+  v1.75.1 binary via `lsf -R` e2e tests, and the actual `sync/sync` data-
+  safety claim (a selective job's filter narrows what sync reconciles, it
+  does not widen `--backup-dir` sync's delete phase to everything outside
+  the selection) is proven against a real rcd process, not just `lsf`.
+- **Tree browsing and on-demand, cached sizing.** `godwit_tree_list()`
+  (plain `scandir`, no recursion — a full walk would wake the pool, per
+  PLAN.md §4.4) and `godwit_tree_node_size()` (SQLite-cached per
+  share+path, computed via `du -sb` — the native tool for a recursive
+  size total, never a hand-rolled PHP walker) back two new
+  `godwit-api.php` actions, `tree_list`/`tree_size`. A selected single
+  file over OneDrive personal's 250 GiB per-file ceiling carries a
+  warning in the `tree_size` response. The tree dialog shows the running
+  selection total against the target remote's free space (from whatever
+  `remotes_list` last returned, not a fresh rc call), with a warning near
+  either the remote's free space or a 2 TiB ceiling, per PLAN.md §4.4.
+- **OneDrive's daily upload budget no longer silently inherits gdrive's
+  700 GiB cap.** `godwit_budget_cap_bytes()` centralises the fallback:
+  the D12 700 GiB default only for `gdrive` specifically, effectively
+  unlimited (`PHP_INT_MAX`) for any other remote unless
+  `settings.budget_caps` configures one — PLAN.md §4.3 says OneDrive's
+  budget should be off by default. The budget bar now shows "no daily cap
+  configured" instead of a meaningless "744.5 MiB / 8.0 EiB (0.0%)".
+- **Retention-purge log noise fix, corrected mid-review (see below).** A
+  brand-new remote with jobs on it logged `operations/list: directory not
+  found` on every godwitd restart, from the daily retention purge listing
+  a `godwit/_versions/<share>` path that had never been created (harmless
+  — already handled as "absent", not an error — but needless noise). The
+  retention loop now `operations/mkdir`s that exact path immediately
+  before listing it.
+- **Review: two rounds of `code-diff-reviewer` (6 passes each, unattended
+  MID band, escalation score 8).** Round 1 was 6× `NO FINDINGS` — a known
+  failure mode of that reviewer per its own skill doc, not evidence of
+  clean code — so `advisor` read the diff directly and found 2 real
+  blocking issues, both fixed before merge: (1) the first version of the
+  log-noise fix mkdir'd `<remote>:godwit` from inside
+  `godwit_run_health_check()` — one directory level too shallow to touch
+  the path that actually produces the log line (the retention loop's own
+  `operations/list` on `_versions/<share>`, not the health check), and
+  reached from the page's "Test connection" action, silently turning a
+  documented never-mutates health check into a write; (2)
+  `godwit_tree_node_filter_line()` didn't escape rclone glob
+  metacharacters, so a folder literally named `Photos [RAW]` would have
+  compiled to a character-class glob and silently skipped the real
+  folder — a silent-omission bug in a backup tool, fixed with
+  `godwit_escape_filter_pattern()` and a dedicated `lsf -R` e2e test.
+  `advisor` also flagged (addressed, non-blocking): the red-before-green
+  baseline hadn't been shown for this phase's own tests (retroactively
+  proven — reverting only `plugin/scripts/{lib.php,godwitd,godwit-api.php}`
+  and `plugin/Godwit.page` while keeping the new tests gave 27 genuinely
+  red, all now green); no real `sync/sync` e2e for a selective job
+  (added, described above); root `README.md` hadn't been updated
+  alongside `plugin/README.md` (fixed); PLAN.md §4.4's free-space display
+  was initially missing (added). Round 2 (on the fix commit) was clean.
+- Verified offline: 287/287 (`php tests/run.php`, `build/` populated and
+  confirmed present, 0 `skipped --` lines) plus 19/19 Node checks
+  (`node tests/windows_form_test.mjs`, extended with the tri-state
+  toggle logic's own tests via a new `GODWIT_TREE_BEGIN`/`END` marker
+  pair, same pattern as the existing windows-form extraction).
+
+**Not verified this release**: nothing against the live host — no
+install, no daemon/rcd restart, no mutating rc call, per the user's
+explicit instruction (they are verifying v0.4.4's live budget fix
+tonight and didn't want a large new feature confounding it). No real
+OneDrive upload of a selective job (the sync/sync data-safety claim
+above is proven against a real rcd with a local backend, exactly like
+every other Phase 3 e2e test, not against `kmonedrive` itself), and no
+live browser click-through of the tree dialog, Add-job dialog or the new
+budget-bar wording. Two deliberately deferred UI gaps, not correctness
+bugs: a folder with some but not all children ticked renders as a plain
+checked checkbox, not an indeterminate one; a checkbox for a node nested
+under an excluded folder is visually clickable but is a documented no-op
+rather than being disabled. `godwit_du_bytes()` has no shell timeout
+(`ponytail:` comment names the upgrade path) — a `du` against a huge,
+cold share could in principle outlast the web request, leaving that
+click's size uncached; the result is cached once it does succeed, so
+this is a one-off cost, not a recurring one.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

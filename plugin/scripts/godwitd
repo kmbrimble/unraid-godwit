@@ -584,6 +584,7 @@ while ($running) {
                     continue;
                 }
                 $versionsFs = $job['remote'] . ':godwit/_versions/' . $job['share'];
+                godwit_ensure_versions_dir($rcd['listener'], $versionsFs);
                 $listResult = godwit_list_versions_dirs($rcd['listener'], $versionsFs);
                 if (isset($listResult['error'])) {
                     godwit_log($logFile, "retention purge: operations/list failed for $versionsFs: {$listResult['error']}");

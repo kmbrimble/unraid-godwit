@@ -110,7 +110,7 @@ if (file_exists($pidFile)) {
 </div>
 
 <div id="tree-dialog" style="display:none">
-    <p>Total selected: <span id="tree-total-size">—</span></p>
+    <p>Total selected: <span id="tree-total-size">—</span><span id="tree-free-space"></span></p>
     <div id="tree-root">Loading…</div>
     <button id="tree-done" type="button">Done</button>
 </div>
@@ -216,6 +216,7 @@ function godwitRemotesRefresh() {
                 return;
             }
             var remotes = data.remotes || [];
+            godwitRemotesCache = remotes;
             var remoteSelect = document.getElementById('job-add-remote');
             var prevRemote = remoteSelect.value;
             remoteSelect.innerHTML = remotes.map(function (r) {
@@ -656,6 +657,8 @@ var godwitPendingNewJobs = []; // jobs added this session, not yet saved
 var godwitTreeIncluded = [];
 var godwitTreeExcluded = [];
 var godwitTreeShare = '';
+var godwitTreeRemote = '';
+var godwitRemotesCache = []; // last remotes_list response, for the tree dialog's free-space comparison
 var godwitTreeTargetName = null; // null = the Add-job dialog's own scratch selection
 var godwitTreeScratch = { included: [], excluded: [] };
 
@@ -688,10 +691,31 @@ function godwitTreeLoad(parentPath, container) {
 
 // Sums each *included root's* on-demand size (never a full-tree walk, per
 // PLAN.md §4.4) rather than every visible node, since an included root's
-// own total already covers everything ticked beneath it.
+// own total already covers everything ticked beneath it. Also compares
+// against the target remote's free space (PLAN.md §4.4: "shown against
+// the OneDrive free space ... with a warning before the 2 TB ceiling") —
+// godwitRemotesCache is populated by godwitRemotesRefresh(), so this is a
+// display-only comparison against whatever it last saw, never a fresh rc
+// call of its own.
+var GODWIT_ONEDRIVE_WARNING_BYTES = 2 * 1024 * 1024 * 1024 * 1024; // 2 TiB, PLAN.md §4.4
+
+function godwitTreeFreeSpaceFor(remote) {
+    var r = (godwitRemotesCache || []).find(function (x) { return x.name === remote; });
+    return r && r.free !== null && r.free !== undefined ? r.free : null;
+}
+
 function godwitTreeUpdateTotal() {
     var totalEl = document.getElementById('tree-total-size');
-    if (godwitTreeIncluded.length === 0) { totalEl.textContent = fmtBytes(0); return; }
+    var freeEl = document.getElementById('tree-free-space');
+    var free = godwitTreeFreeSpaceFor(godwitTreeRemote);
+    var renderFree = function (total) {
+        if (!freeEl) { return; }
+        if (free === null) { freeEl.textContent = ''; return; }
+        var nearCeiling = total > GODWIT_ONEDRIVE_WARNING_BYTES * 0.9 || total > free * 0.9;
+        freeEl.innerHTML = ' — ' + fmtBytes(free) + ' free on ' + esc(godwitTreeRemote) +
+            (nearCeiling ? ' <span style="color:red">— approaching the remote\'s free space or the 2 TiB ceiling</span>' : '');
+    };
+    if (godwitTreeIncluded.length === 0) { totalEl.textContent = fmtBytes(0); renderFree(0); return; }
     totalEl.textContent = 'calculating…';
     var total = 0;
     var pending = godwitTreeIncluded.length;
@@ -700,7 +724,7 @@ function godwitTreeUpdateTotal() {
             total += data.bytes || 0;
         }).always(function () {
             pending--;
-            if (pending === 0) { totalEl.textContent = fmtBytes(total); }
+            if (pending === 0) { totalEl.textContent = fmtBytes(total); renderFree(total); }
         });
     });
 }
@@ -734,8 +758,9 @@ document.getElementById('tree-root').addEventListener('click', function (ev) {
     }
 });
 
-function godwitTreeOpen(share, targetName) {
+function godwitTreeOpen(share, remote, targetName) {
     godwitTreeShare = share;
+    godwitTreeRemote = remote;
     godwitTreeTargetName = targetName;
     var sel = godwitTreeSelectionFor(targetName);
     godwitTreeIncluded = sel.included.slice();
@@ -766,7 +791,7 @@ document.getElementById('job-add-type').addEventListener('change', function () {
 document.getElementById('job-add-browse').addEventListener('click', function () {
     var share = document.getElementById('job-add-share').value.trim();
     if (!share) { document.getElementById('job-add-message').innerHTML = godwitErrorHtml('enter a share name first'); return; }
-    godwitTreeOpen(share, null);
+    godwitTreeOpen(share, document.getElementById('job-add-remote').value, null);
 });
 
 document.getElementById('job-add').addEventListener('click', function () {
@@ -803,7 +828,7 @@ document.getElementById('job-add').addEventListener('click', function () {
 document.getElementById('godwit-jobs-table').addEventListener('click', function (ev) {
     if (ev.target.classList.contains('godwit-job-browse')) {
         var tr = ev.target.closest('tr');
-        godwitTreeOpen(tr.dataset.share, tr.dataset.name);
+        godwitTreeOpen(tr.dataset.share, tr.dataset.remote, tr.dataset.name);
     }
 });
 
@@ -843,6 +868,15 @@ function godwitJobsRefresh() {
                 return;
             }
             var budgetHtml = (data.remotes || []).map(function (r) {
+                // godwit_budget_cap_bytes() returns PHP_INT_MAX for a remote
+                // with no configured cap (PLAN.md: OneDrive is unlimited by
+                // default) — anything past 1e15 bytes (1 PB) is never a real
+                // quota, so show "unlimited" rather than a meaningless
+                // "744.5 MiB / 8.0 EiB (0.0%)".
+                var unlimited = r.cap_bytes > 1e15;
+                if (unlimited) {
+                    return '<p>' + esc(r.remote) + ': ' + fmtBytes(r.used_24h_bytes) + ' used (no daily cap configured)</p>';
+                }
                 var pct = r.cap_bytes > 0 ? Math.min(100, r.used_24h_bytes / r.cap_bytes * 100) : 0;
                 var throttled = r.throttled_until ? ' — throttled until ' + new Date(r.throttled_until * 1000).toLocaleString() : '';
                 return '<p>' + esc(r.remote) + ': ' + fmtBytes(r.used_24h_bytes) + ' / ' + fmtBytes(r.cap_bytes) +

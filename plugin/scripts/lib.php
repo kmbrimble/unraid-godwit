@@ -969,16 +969,6 @@ function godwit_run_health_check(SQLite3 $db, array $listener, string $remoteNam
     godwit_open_remotes_health_table($db);
     $prevRow = godwit_remote_health_row($db, $remoteName);
     $result = godwit_check_remote_about($listener, $remoteName, 60, $call);
-    if ($result['status'] === 'ok') {
-        // Phase 4: guarantees <remote>:godwit exists before any job (share
-        // or selective) ever tries to write under it or list its version
-        // dirs — operations/mkdir is a no-op when the directory already
-        // exists, so this is safe and cheap to run on every check, not
-        // just once. Fixes the "operations/list: directory not found"
-        // noise a brand-new remote (e.g. a just-added OneDrive) used to
-        // generate on every godwitd restart before its first backup ran.
-        godwit_ensure_remote_base_dir($listener, $remoteName, $call);
-    }
     $decision = godwit_health_notifications($remoteName, $prevRow, $result);
     foreach ($decision['notifications'] as $n) {
         godwit_notify($n['subject'], $n['description'], $n['importance']);
@@ -986,13 +976,6 @@ function godwit_run_health_check(SQLite3 $db, array $listener, string $remoteNam
     $ts = time();
     godwit_store_remote_health($db, $remoteName, $ts, $result, $decision['quota_alerted'], $decision['fail_count']);
     return $result + ['checked_ts' => $ts];
-}
-
-/** Idempotently creates <remote>:godwit (operations/mkdir is a no-op if it already exists) — see godwit_run_health_check()'s docblock for why. $call defaults to godwit_rc_call_params, same injection pattern as godwit_check_remote_about(). */
-function godwit_ensure_remote_base_dir(array $listener, string $remoteName, ?callable $call = null): void
-{
-    $call = $call ?? 'godwit_rc_call_params';
-    $call($listener, 'operations/mkdir', ['fs' => $remoteName . ':godwit', 'remote' => ''], 30);
 }
 
 /** Params for a `config/update` call that replaces an existing remote's token only (re-authorise). Other fields (client_id, scope, drive_type, ...) are left exactly as they are — config/update only touches keys it's given. */
@@ -1338,12 +1321,27 @@ function godwit_compile_filter_rules(array $job): array
     return array_map(fn ($p) => '- ' . $p, $patterns);
 }
 
-/** One rclone filter-file line for a tree node: "$sign /path/**" for a directory (recursive), "$sign /path" for a single file. */
+/**
+ * Escapes rclone filter-pattern glob metacharacters (`* ? [ ] { } \`) in a
+ * real filesystem path so it's matched literally, not as a glob. Tree
+ * selections come from scandir()'d real names — a folder literally named
+ * "Photos [RAW]" would otherwise compile to a character-class glob that
+ * matches "Photos R"/"Photos A"/"Photos W" and silently skips the real
+ * folder, a silent-omission bug in a backup tool. Ground-truthed against
+ * the real bundled rclone binary by the rcd e2e filter test.
+ */
+function godwit_escape_filter_pattern(string $path): string
+{
+    return preg_replace('/([*?\[\]{}\\\\])/', '\\\\$1', $path);
+}
+
+/** One rclone filter-file line for a tree node: "$sign /path/**" for a directory (recursive), "$sign /path" for a single file. The path itself is glob-escaped; the leading "/" and trailing "/**" are intentional filter syntax, never escaped. */
 function godwit_tree_node_filter_line(string $sign, array $node): string
 {
     $path = trim((string) ($node['path'] ?? ''), '/');
+    $escaped = godwit_escape_filter_pattern($path);
     $isDir = $node['is_dir'] ?? true;
-    return $sign . ' /' . $path . ($isDir ? '/**' : '');
+    return $sign . ' /' . $escaped . ($isDir ? '/**' : '');
 }
 
 /**
@@ -1452,7 +1450,21 @@ function godwit_store_node_size(SQLite3 $db, string $share, string $relPath, int
     $stmt->execute();
 }
 
-/** Total size of a path via `du -sb` — the native platform tool for a recursive size sum, not a hand-rolled recursive PHP walker. $run is injected (default: real shell_exec) so tests can fake the output without a real multi-GB tree. */
+/**
+ * Total size of a path via `du -sb` — the native platform tool for a
+ * recursive size sum, not a hand-rolled recursive PHP walker. $run is
+ * injected (default: real shell_exec) so tests can fake the output
+ * without a real multi-GB tree.
+ * ponytail: shell_exec() has no explicit timeout, so a `du` against a
+ * huge, cold (spun-down) share can run long enough to hit the web SAPI's
+ * own request/nginx timeout, leaving that node's size uncached and the
+ * click silently doing nothing. Acceptable for now — result is cached
+ * once it does succeed, and a stuck du is a one-off click, not a
+ * recurring cost. Upgrade path if this is ever observed live: run du
+ * with `timeout Ns` and treat a timeout the same as "could not compute
+ * size", or move size computation into godwitd (which already has no
+ * request-lifetime ceiling) and have the page poll for the cached result.
+ */
 function godwit_du_bytes(string $path, ?callable $run = null): ?int
 {
     $run = $run ?? fn (string $cmd) => shell_exec($cmd);
@@ -2316,6 +2328,23 @@ function godwit_default_retention_days(): int
  *   - ['dirs' => [], 'error' => '...'] on any other failure — the caller
  *     must log this rather than silently proceeding as "nothing to purge".
  */
+/**
+ * Creates $fs (a full "<remote>:godwit/_versions/<share>" path) ahead of
+ * the retention-purge listing, so a share that's never had a versioned
+ * overwrite doesn't make rclone log its own "directory not found" against
+ * that path on every retention tick (found live: a brand-new remote with
+ * no versions yet generated this on every godwitd restart). operations/mkdir
+ * is a no-op when the directory already exists. This targets the exact
+ * path godwit_list_versions_dirs() is about to list — earlier code mkdir'd
+ * <remote>:godwit instead, one level too shallow to actually silence the
+ * "directory not found" the retention loop's own operations/list produces.
+ */
+function godwit_ensure_versions_dir(array $listener, string $fs, ?callable $call = null): void
+{
+    $call = $call ?? 'godwit_rc_call_params';
+    $call($listener, 'operations/mkdir', ['fs' => $fs, 'remote' => ''], 30);
+}
+
 function godwit_list_versions_dirs(array $listener, string $fs, ?callable $call = null): array
 {
     $call = $call ?? 'godwit_rc_call_params';
@@ -2634,6 +2663,13 @@ function godwit_handle_job_action(string $action, array $post, string $dbPath, s
     }
 
     if ($action === 'tree_size') {
+        // Mirrors jobs_status's own is_file guard (lib.php godwit_handle_job_action
+        // 'jobs_status' branch) — without it, browsing the tree before godwitd
+        // has ever started would silently create an empty db file at $dbPath
+        // via SQLite3's default open flags.
+        if (!is_file($dbPath)) {
+            return ['error' => 'heartbeat database not found yet — is godwitd running?'];
+        }
         try {
             $db = new SQLite3($dbPath);
             $db->busyTimeout(5000);

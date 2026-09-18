@@ -43,6 +43,24 @@ sort *before* `1.0.9`.
   filter and is almost certainly a client bug) — enforced server-side in
   `jobs_save`, the same defence-in-depth pattern as the existing
   direction/overlap checks.
+- The tree dialog now shows the target remote's free space alongside the
+  running selection total (PLAN.md §4.4), with a warning once the
+  selection approaches either the remote's free space or a 2 TiB ceiling,
+  reusing whatever `remotes_list` last returned rather than an extra rc
+  call of its own.
+- **Data safety, proven against a real rcd in `sync` mode (not just
+  `lsf`)**: a new end-to-end test pre-seeds the destination with content
+  that sits outside a selective job's filter, runs a real `sync/sync`,
+  and asserts that content survives — a selective job's filter narrows
+  what sync reconciles, it does not widen `--backup-dir` sync's delete
+  phase to everything outside the selection.
+- Two selective jobs (or a selective and a share job) on the same
+  share+remote are rejected by the existing overlap check, since a
+  selective job's destination is still `remote:godwit/<share>` — the
+  same path a share job on that share+remote would use. This is
+  intentional and conservative, not a bug: it is the same "one
+  destination, one job" invariant `godwit_validate_job_destinations()`
+  already enforces for share jobs.
 
 ### Fixed
 
@@ -53,15 +71,69 @@ sort *before* `1.0.9`.
   default only for `gdrive` specifically, effectively unlimited
   (`PHP_INT_MAX`) for any other remote unless configured. An explicit
   `settings.budget_caps` entry for any remote still always wins.
-- **A brand-new remote (e.g. a just-added OneDrive) logged
-  `operations/list: directory not found` noise to rcd's own log on every
-  godwitd restart**, from the daily version-retention purge listing a
-  `godwit/_versions/<share>` path that had never been created — harmless
-  (godwit's own code already treated it as "absent", not an error) but
-  needless noise. `godwit_run_health_check()` now proactively creates
-  `<remote>:godwit` (`operations/mkdir`, a no-op if it already exists)
-  after every status=ok check, so the base folder exists before a job
-  — share or selective — ever tries to write under it.
+- **A brand-new remote logged `operations/list: directory not found`
+  noise to rcd's own log on every godwitd restart**, from the daily
+  version-retention purge listing a `godwit/_versions/<share>` path that
+  had never been created — harmless (godwit's own code already treated
+  it as "absent", not an error) but needless noise. The retention loop
+  now `operations/mkdir`s that exact path (a no-op if it already exists)
+  immediately before listing it, once a day, only for enabled jobs.
+  **Correction from this release's own first review round**: the first
+  version of this fix mkdir'd `<remote>:godwit` from inside
+  `godwit_run_health_check()` instead — one directory level too shallow
+  to touch the path that actually produced the log line, and reached from
+  the page's "Test connection" action, which silently turned a
+  documented never-mutates health check into a write. Caught by
+  `advisor` reading the diff directly (6× `code-diff-reviewer` passes on
+  this change were all `NO FINDINGS`, a known failure mode, not evidence
+  of correctness) before merge, not live.
+- **Selective-job filter compilation didn't escape rclone glob
+  metacharacters** (`* ? [ ] { } \`) in real folder/file names — a
+  folder literally named `Photos [RAW]` compiled to `+ /Photos [RAW]/**`,
+  a character class that also matches `Photos R`/`Photos A`/`Photos W`
+  and would silently skip the real folder, a silent-omission bug in a
+  backup tool. `godwit_escape_filter_pattern()` now backslash-escapes the
+  path before it's ever written into a filter line — ground-truthed
+  against the real bundled binary with a dedicated `lsf -R` e2e test that
+  proves both halves (the bracketed folder survives, the glob-only
+  siblings that would prove a missing escape do not appear). Also found
+  by the same pre-merge review round.
+
+### Review
+
+Two rounds of `code-diff-reviewer` (6 passes each, unattended MID band —
+escalation score 8: exposure 1, authority 1, data 1, reversibility 1,
+test gap 2, pattern divergence 0, module spread 1). Round 1: 6× `NO
+FINDINGS` (a known failure mode of that reviewer, not evidence of
+correctness on its own) — `advisor` read the diff directly instead and
+found 2 real blocking issues (the mkdir-wrong-path and glob-escaping bugs
+above) plus several should-fix/non-blocking items, all addressed before
+merge. Round 2 (on the fix commit) verified the fixes.
+
+### Not verified this release
+
+Nothing against the live host — built and tested entirely offline
+(`php tests/run.php`, `node tests/windows_form_test.mjs`), per the
+user's explicit instruction not to install, and not to restart godwitd
+or rcd, so tonight's first live exercise of the v0.4.4 budget fix isn't
+confounded by a large new feature landing at the same time. In
+particular: no real OneDrive upload of a selective job (the sync/sync
+data-safety claim above is proven against a real rcd with a local
+backend, exactly like every other Phase 3 e2e test, not against
+`kmonedrive`), no live browser click-through of the new tree dialog,
+Add-job dialog or budget-bar "unlimited" wording. Known, deliberately
+deferred UI gaps (not correctness bugs): a folder with some but not all
+children ticked renders as a plain checked checkbox, not an
+indeterminate one (`cb.indeterminate = true` is a one-line follow-up);
+a checkbox for a node nested under an excluded folder is visually
+clickable but is a no-op (the two-list include/exclude model can't
+express deeper re-inclusion, documented on `godwitTreeToggle()`'s own
+comment) rather than being disabled. `godwit_du_bytes()` has no shell
+timeout (`ponytail:` comment in `lib.php` names the upgrade path) — a
+`du` against a huge cold share could in principle outlast the web
+request, leaving that one click's size uncached; the result is cached
+once it does succeed, so this is a one-off click cost, not a recurring
+one.
 
 ## [0.4.4] - 2026-09-18
 

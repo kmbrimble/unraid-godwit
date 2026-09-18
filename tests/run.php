@@ -2013,6 +2013,18 @@ t('godwit_tree_node_filter_line: a single selected file compiles without the rec
     assert_eq('- /Photos/beach.jpg', godwit_tree_node_filter_line('-', ['path' => '/Photos/beach.jpg/', 'is_dir' => false]), 'exclude line for a file, slashes trimmed');
 });
 
+t('godwit_escape_filter_pattern: backslash-escapes every rclone glob metacharacter, nothing else', function () {
+    assert_eq('Photos \\[RAW\\]', godwit_escape_filter_pattern('Photos [RAW]'), 'brackets escaped');
+    assert_eq('a\\*b\\?c', godwit_escape_filter_pattern('a*b?c'), 'star and question mark escaped');
+    assert_eq('x\\{y\\}', godwit_escape_filter_pattern('x{y}'), 'braces escaped');
+    assert_eq('a\\\\b', godwit_escape_filter_pattern('a\\b'), 'a literal backslash in the real filename is itself escaped');
+    assert_eq('Ordinary Folder Name', godwit_escape_filter_pattern('Ordinary Folder Name'), 'no metacharacters, no change');
+});
+
+t('godwit_tree_node_filter_line: a folder name with glob metacharacters compiles to an escaped literal, not a glob', function () {
+    assert_eq('+ /Photos \\[RAW\\]/**', godwit_tree_node_filter_line('+', ['path' => 'Photos [RAW]', 'is_dir' => true]), 'brackets in a real folder name must not become a glob character class');
+});
+
 t('godwit_compile_selective_filter_rules + rclone lsf -R: only ticked subtrees survive, un-ticked children are excluded, unselected siblings never appear (ground-truthed against the real bundled binary)', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
@@ -2054,6 +2066,129 @@ t('godwit_compile_selective_filter_rules + rclone lsf -R: only ticked subtrees s
     }
     assert_true(str_contains($listed, 'Documents/Taxes/2025.pdf'), "Documents/Taxes/2025.pdf should have survived filtering; lsf output:\n$listed");
     exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+t('godwit_compile_selective_filter_rules + rclone lsf -R: a folder name with rclone glob metacharacters is matched literally, not as a glob (real bundled binary)', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-selective-glob-' . bin2hex(random_bytes(4));
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    assert_true(is_file($rclone), 'expected an unzipped rclone binary');
+
+    $tree = $tmp . '/tree';
+    // "Photos [RAW]" contains an rclone glob character class ([RAW]) — an
+    // unescaped "+ /Photos [RAW]/**" would ALSO match "Photos R", "Photos A"
+    // and "Photos W", any of which existing on disk would prove the escape
+    // is missing (the real folder itself surviving is not sufficient proof,
+    // since an unescaped char class still matches its own literal text).
+    $paths = [
+        'Photos [RAW]/img1.cr2',
+        'Photos R/should-not-match.txt',
+        'Photos A/should-not-match.txt',
+        'Photos W/should-not-match.txt',
+    ];
+    foreach ($paths as $p) {
+        $full = $tree . '/' . $p;
+        @mkdir(dirname($full), 0755, true);
+        file_put_contents($full, 'x');
+    }
+
+    $job = ['included' => [['path' => 'Photos [RAW]', 'is_dir' => true]], 'excluded' => []];
+    $filterFile = $tmp . '/filter.txt';
+    godwit_write_filter_file($filterFile, godwit_compile_selective_filter_rules($job));
+
+    $out = [];
+    exec($rclone . ' lsf -R --filter-from ' . escapeshellarg($filterFile) . ' ' . escapeshellarg($tree), $out);
+    $listed = implode("\n", $out);
+
+    assert_true(str_contains($listed, 'Photos [RAW]/img1.cr2'), "the literally-bracketed folder should have survived filtering; lsf output:\n$listed");
+    foreach (['Photos R/should-not-match.txt', 'Photos A/should-not-match.txt', 'Photos W/should-not-match.txt'] as $mustNotMatch) {
+        assert_true(!str_contains($listed, $mustNotMatch), "$mustNotMatch would only appear if [RAW] were interpreted as an unescaped glob character class; lsf output:\n$listed");
+    }
+    exec('rm -rf ' . escapeshellarg($tmp));
+});
+
+t('godwit_build_sync_params + rc sync/sync with a selective job: only the ticked subtree is transferred, and sync never deletes destination content outside the filter (real rcd, real sync mode — the actual data-safety claim, not just lsf)', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-selective-sync-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    assert_true(is_file($rclone), 'expected an unzipped rclone binary');
+
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/TestShare';
+    mkdir($src . '/Documents/Taxes', 0755, true);
+    mkdir($src . '/Pictures', 0755, true);
+    file_put_contents($src . '/Documents/Taxes/2025.pdf', 'x');
+    file_put_contents($src . '/Pictures/holiday.jpg', 'x'); // never selected — must never reach dst
+
+    $dst = $tmp . '/dst';
+    // Pre-seed destination content OUTSIDE the selective job's filter, exactly
+    // as if a previous backup (or a stray file) already lived there — sync's
+    // own delete phase must never touch it, since a filtered-out path is
+    // outside the sync's view entirely, not "in scope and spared".
+    mkdir($dst . '/Pictures', 0755, true);
+    file_put_contents($dst . '/Pictures/old-holiday.jpg', 'preexisting');
+
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+    assert_true(file_exists($sockPath), 'rcd did not create its unix socket in time');
+
+    try {
+        $job = [
+            'name' => 'TestShare', 'share' => 'TestShare', 'remote' => 'localdst', 'mode' => 'sync',
+            'type' => 'selective', 'transfers' => 2, 'max_delete' => 1000,
+            'included' => [['path' => 'Documents', 'is_dir' => true]], 'excluded' => [],
+        ];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        $params = godwit_build_sync_params($job, $fs, $filterFile, 10_000_000, null, null, false, $shareRoot);
+
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid back from sync/sync: ' . json_encode($resp));
+
+        $status = null;
+        for ($i = 0; $i < 50; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $resp['jobid']], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish within 5s: ' . json_encode($status));
+        assert_eq('', trim((string) ($status['error'] ?? '')), 'a plain selective sync should not error: ' . json_encode($status));
+
+        assert_true(is_file($dst . '/Documents/Taxes/2025.pdf'), 'the ticked subtree must have been transferred');
+        assert_true(!file_exists($dst . '/Pictures/holiday.jpg'), 'the never-selected file must never reach the destination');
+        assert_true(is_file($dst . '/Pictures/old-holiday.jpg'), 'sync must NOT delete pre-existing destination content that sits outside the filter — this is the actual data-safety claim, not just that included files transfer');
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
 });
 
 // --- Phase 4: tree-selection job validation --------------------------------
@@ -2099,6 +2234,25 @@ t('godwit_handle_job_action jobs_save: accepts a valid selective job and round-t
     assert_eq('selective', $saved[0]['type'], 'type round-trips');
     assert_eq('Documents', $saved[0]['included'][0]['path'], 'included path round-trips');
     exec('rm -rf ' . escapeshellarg($cfgDir) . ' ' . escapeshellarg($runDir));
+});
+
+t('godwit_handle_job_action: tree_size returns an error, not a silently-created db file, when godwitd has never run', function () {
+    $missingDb = sys_get_temp_dir() . '/godwit-missing-' . bin2hex(random_bytes(4)) . '.db';
+    $result = godwit_handle_job_action('tree_size', ['share' => 'Kieren', 'path' => ''], $missingDb, sys_get_temp_dir(), sys_get_temp_dir());
+    assert_true(isset($result['error']), 'expected an error, got: ' . var_export($result, true));
+    assert_true(!is_file($missingDb), 'tree_size must not silently create a db file — mirrors the jobs_status guard');
+});
+
+t('godwit_handle_job_action: tree_list dispatches to godwit_tree_list() and needs no database at all', function () {
+    $root = sys_get_temp_dir() . '/godwit-tree-dispatch-' . bin2hex(random_bytes(4));
+    @mkdir($root . '/Share/Documents', 0755, true);
+    // tree_list hard-codes /mnt/user as its share root (matching every
+    // other job path in this codebase), so this only proves dispatch and
+    // JSON shape, not the real host tree — godwit_tree_list() itself is
+    // covered directly against a real root below.
+    $result = godwit_handle_job_action('tree_list', ['share' => 'DoesNotExist', 'path' => ''], '/nonexistent.db', sys_get_temp_dir(), sys_get_temp_dir());
+    assert_true(isset($result['error']), 'a share with no real /mnt/user directory should error, proving no db was required to get there: ' . var_export($result, true));
+    exec('rm -rf ' . escapeshellarg($root));
 });
 
 // --- Phase 4: tree listing (scandir over /mnt/user/<share>) ----------------
@@ -2193,36 +2347,6 @@ t('godwit_budget_cap_bytes: an explicit setting always wins, for any remote', fu
     $settings = ['budget_caps' => ['gdrive' => 123, 'kmonedrive' => 456]];
     assert_eq(123, godwit_budget_cap_bytes('gdrive', $settings), 'explicit gdrive override wins');
     assert_eq(456, godwit_budget_cap_bytes('kmonedrive', $settings), 'explicit kmonedrive override wins');
-});
-
-// --- Phase 4: ensure a remote's base "godwit" dir exists on every healthy check ---
-
-t('godwit_run_health_check: calls operations/mkdir on <remote>:godwit after a status=ok check', function () {
-    $db = new SQLite3(':memory:');
-    $calls = [];
-    $fakeCall = function ($listener, $method, $params, $timeout = 60, &$meta = null) use (&$calls) {
-        $calls[] = $method;
-        if ($method === 'operations/about') {
-            return ['total' => 100, 'used' => 10, 'free' => 90];
-        }
-        return [];
-    };
-    godwit_run_health_check($db, ['type' => 'unix', 'path' => '/x'], 'kmonedrive', $fakeCall);
-    assert_true(in_array('operations/mkdir', $calls, true), 'expected operations/mkdir to have been called, got: ' . implode(',', $calls));
-});
-
-t('godwit_run_health_check: does not call operations/mkdir when the check itself errors', function () {
-    $db = new SQLite3(':memory:');
-    $calls = [];
-    $fakeCall = function ($listener, $method, $params, $timeout = 60, &$meta = null) use (&$calls) {
-        $calls[] = $method;
-        if ($method === 'operations/about') {
-            return ['error' => 'some transport failure'];
-        }
-        return [];
-    };
-    godwit_run_health_check($db, ['type' => 'unix', 'path' => '/x'], 'kmonedrive', $fakeCall);
-    assert_true(!in_array('operations/mkdir', $calls, true), 'operations/mkdir must not run against a remote that just failed its check');
 });
 
 // --- Budget ledger maths --------------------------------------------------
@@ -3622,6 +3746,26 @@ t('godwit_list_versions_dirs: end-to-end against a real rcd — lists real date 
         assert_eq([], $absentResult['dirs'], 'absent means no dirs');
         assert_eq(true, $absentResult['absent'] ?? false, 'a share with no _versions dir yet must be absent, not an error: ' . json_encode($absentResult));
         assert_true(!isset($absentResult['error']), 'absent must not also be an error: ' . json_encode($absentResult));
+
+        // godwit_ensure_versions_dir() against the real rcd: creates the
+        // exact path the retention loop is about to list, so the
+        // subsequent list is a clean empty success, not "directory not
+        // found" — this is what stops that error line appearing in rcd's
+        // own log on every retention tick for a share/remote that's never
+        // had a versioned overwrite.
+        $freshFs = 'localdst:' . $root . '/godwit/_versions/BrandNewShare';
+        godwit_ensure_versions_dir($listener, $freshFs);
+        assert_true(is_dir($root . '/godwit/_versions/BrandNewShare'), 'operations/mkdir must have actually created the directory');
+        $afterMkdir = godwit_list_versions_dirs($listener, $freshFs);
+        assert_eq([], $afterMkdir['dirs'], 'freshly created dir is empty');
+        assert_true(!($afterMkdir['absent'] ?? false), 'no longer absent once created');
+        assert_true(!isset($afterMkdir['error']), 'must not be an error: ' . json_encode($afterMkdir));
+
+        // Idempotent: mkdir-ing an already-populated dir must not disturb it.
+        godwit_ensure_versions_dir($listener, 'localdst:' . $root . '/godwit/_versions/Kieren');
+        $stillThere = godwit_list_versions_dirs($listener, 'localdst:' . $root . '/godwit/_versions/Kieren');
+        sort($stillThere['dirs']);
+        assert_eq(['2026-08-01', '2026-08-02'], $stillThere['dirs'], 're-mkdir must be a no-op on an existing populated dir');
     } finally {
         proc_terminate($proc);
         proc_close($proc);

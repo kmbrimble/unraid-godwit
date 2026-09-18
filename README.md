@@ -6,15 +6,15 @@ Offsite backup for Unraid, built as a GUI over [rclone](https://rclone.org/).
 Named for the bar-tailed godwit, the bird that holds the record for the
 longest non-stop flight of any species and lands in Australia every year.
 
-**Status: Phase 3 shipped.** The plugin installs, runs a supervised daemon
+**Status: Phase 4 shipped.** The plugin installs, runs a supervised daemon
 (`rc.godwit` / `godwitd`) that manages a single bundled `rclone rcd`, and
 Settings → Godwit can add, test, re-authorise and delete Google Drive and
-OneDrive remotes. Godwit now backs up whole shares to Google Drive: one job
-per share (`sync` with `--backup-dir` versioning, or `copy`-only), a
-rolling-24h upload budget, scheduled time windows with a speed limit, a
-"Run now" override, version retention, and a status page showing per-job
-and per-remote progress. OneDrive's selective tree-based backup lands in
-Phase 4.
+OneDrive remotes. Godwit backs up whole shares to Google Drive (one job per
+share, `sync` with `--backup-dir` versioning, or `copy`-only) and now also
+backs up hand-picked folders/files to OneDrive via a browsable, Unbalanced-
+style tri-state tree — both job types share the same rolling-24h upload
+budget, scheduled time windows with a speed limit, "Run now" override,
+version retention, and status page showing per-job and per-remote progress.
 
 ## What it does
 
