@@ -722,6 +722,128 @@ principle outlast the web request, leaving that
 click's size uncached; the result is cached once it does succeed, so
 this is a one-off cost, not a recurring one.
 
+**v0.6.0 (built and offline-verified, 2026-09-18) makes a selective job
+span every share from one job, and replaces the free-text Share field
+with a real picker — both requested directly by Kieren** ("If I want to
+select certain folders for onedrive i dont want to have to create
+multiple jobs one for each share"). Built entirely read-only against the
+host: v0.5.0 stayed installed and undisturbed through tonight's 22:00
+AEST window; no install, no daemon/rcd restart, no mutating rc call was
+made this session.
+
+- **Model.** A selective job's `srcFs` is now the bare share root
+  (`/mnt/user`) instead of one share; the tri-state tree's top level
+  lists every share and expands into them as before, and
+  `included`/`excluded` paths are share-qualified (`Kieren/Documents`).
+  Destination layout: `<remote>:godwit/_selective/<job name>/<share>/
+  <path...>` — `godwit_build_job_fs()` sets `dstFs` to
+  `remote:godwit/_selective/<sanitized job name>` and rclone's own
+  relative-path preservation does the `<share>/<path...>` part for free,
+  no extra code needed. A single new chokepoint,
+  `godwit_job_dest_segment()`, decides "share name" vs
+  "_selective/<job name>" so `godwit_build_job_fs()`,
+  `godwit_backup_dir_fs()`, and godwitd's retention-purge loop can never
+  disagree about a job's destination segment — the exact bug class a
+  hand-duplicated branch would otherwise invite.
+- **Safety guards.** `godwit_sanitize_job_name_segment()` rejects a job
+  name unsafe for path use (empty, `.`/`..`, `/ \ : * ? " < > |`, trailing
+  dot/space); a share job can no longer be named `_selective`
+  (case-insensitive), reserved for the selective namespace.
+  `godwit_validate_job_destinations()` needed no code change for the new
+  `dstFs` shape — its existing prefix comparison already refuses two
+  jobs, share or selective, in either array order, whose destinations
+  equal or nest inside each other — reused as-is and re-proven at the new
+  shape. A new, separate `godwit_validate_selective_job_name_collisions()`
+  additionally rejects two selective jobs on the same remote whose names
+  sanitise to the same segment case-insensitively (OneDrive is
+  case-insensitive), checked across *all* jobs including disabled ones,
+  since the destination guard only checks enabled jobs but a disabled
+  job's reserved name must not silently start colliding once re-enabled.
+  `godwit_assert_purge_path()` — applied to every retention-purge path
+  before the rc call — is extended, not bypassed, to also accept the
+  two-segment `_selective/<job name>` shape, with dedicated tests for the
+  valid form and three rejected malformed ones (`_selective` alone,
+  `_selective/..`, a three-segment form).
+  **Explicitly tested and confirmed as a deliberate, supported case (not
+  an oversight)**: the overlap guard judges *destinations* only — Kieren's
+  real setup deliberately backs up the *same* source content twice, once
+  as a Google full-share job and once as a critical-subset OneDrive
+  selective job, and both must save fine since their destinations
+  (different remotes) never overlap.
+- **`godwit_assert_job_direction()`** now accepts `srcFs === $shareRoot`
+  exactly (a selective job) in addition to the existing "real subpath of
+  `$shareRoot`" case (a share job) — still rejects a same-prefix
+  non-boundary path like `/mnt/user2` or `/mnt/use`.
+- **Back-compat, decided: migrate on load, not reject.** A 0.5.0-shaped
+  selective job (single `share` field, share-relative paths) is migrated
+  automatically by `godwit_load_jobs()` → `godwit_migrate_legacy_selective_job()`,
+  prefixing every included/excluded path with the old share and dropping
+  the field. No selective job existed on the host when this shipped, so
+  there was no real data this could get wrong, and a silent load-time fix
+  is friendlier than forcing a reconfigure of something that never ran.
+- **Share field is now a real picker.** The free-text Share input
+  (`plugin/Godwit.page`, `#job-add-share`) is a `<select>` populated live
+  from a new `shares_list` API action; `godwit_list_shares()` is plain
+  `scandir()` over `/mnt/user` (directories only, dotfiles skipped) —
+  never `ls`, never hardcoded. `appdata`/`system`/`domains` are shown but
+  flagged "⚠ live data — not recommended" in both the share dropdown and
+  the tree's top-level share listing — never hidden, since a user might
+  legitimately want to back one up. `jobs_save` now validates a share
+  job's named share is a real directory under the share root before
+  saving (so a typo fails at save time, not at 22:00), threaded through
+  an optional `$shareRoot` parameter on `godwit_handle_job_action()` /
+  `godwit_validate_job_destinations()` (default `/mnt/user`) so every
+  test exercises this without depending on the real host filesystem.
+- **Answered, not built**: Kieren also asked whether a job could sync all
+  of `/mnt/user` in one go for the Google full backup. No — it would
+  sweep in Movies, Music, Games, Downloads and appdata as well as the
+  four intended shares, and collapse the per-share status/queue-advance
+  behaviour the nightly budget queue depends on (Filing Cabinet → Kieren
+  → Teegan → Photos). Share jobs stay one-per-share.
+- **Review**: 6 `code-diff-reviewer` passes (unattended MID band,
+  escalation score 7: exposure 1, authority 2, data 2, reversibility 1,
+  test gap 0, pattern divergence 0, module spread 1 — no counsel). Two
+  real findings, both fixed: three stray editor crash-recovery files
+  (`.fuse_hidden*`, ~13,500 lines of stale duplicate test-file snapshots
+  from an interrupted edit) had been accidentally committed — caught
+  3/6, removed and `.gitignore`d; and godwitd's daily retention-purge
+  loop called `godwit_job_dest_segment()` unguarded for every enabled
+  job — caught 1/6 but confirmed real (an unsafe job name would throw
+  there uncaught and kill the whole daemon process, unlike the job-start
+  path and the purge call a few lines below, which already wrap the
+  equivalent throwing calls in try/catch-and-log-continue). Fixed the
+  same way; a focused 3-pass round on that fix commit came back 3× `NO
+  FINDINGS`. Per this project's own established convention (see
+  0.4.1/0.4.2), godwitd's inline retention-loop glue is not itself
+  unit-tested, only the pure functions it calls are — this fix's
+  coverage matches every other try/catch already in that loop, not a gap
+  specific to this change. `advisor` read the diff directly and found no
+  correctness blocker; it did flag (fixed here) that the cross-share sync
+  e2e test's "never deletes destination content outside the filter"
+  assertion only proved content outside the job's whole dest tree
+  survives (trivially true) rather than the sharper Phase-4-era claim —
+  strengthened by pre-seeding stale content *inside* the dest root but
+  *outside the current filter* and proving sync doesn't delete it.
+
+Verified offline: 326/326 (`php tests/run.php`, `build/` populated and
+confirmed present, 0 `skipped --` lines — every real-rcd end-to-end test,
+including two new ones covering a job spanning two shares, actually ran)
+plus 19/19 Node checks (`node tests/windows_form_test.mjs`). Red baseline
+confirmed before implementation: 25 genuinely failing (undefined new
+functions, and existing tests asserting the old single-share shape), 1
+test already green (the filter-compilation code was already depth-
+agnostic and needed no change to work one path segment deeper).
+
+**Not verified this release**: nothing against the live host — no
+install, no daemon/rcd restart, no mutating rc call, per the standing
+instruction to leave v0.5.0 undisturbed through tonight's window. No
+real OneDrive upload of a multi-share selective job (the sync/sync
+data-safety claims above are proven against a real rcd with a local
+backend, exactly like every prior phase's e2e tests, not against
+`kmonedrive` itself), and no live browser click-through of the updated
+Share dropdown, the tree's live-data flagging, or the type-toggle
+show/hide behaviour on the Add-job dialog.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

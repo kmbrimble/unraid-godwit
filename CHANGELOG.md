@@ -88,7 +88,7 @@ sort *before* `1.0.9`.
 
 Offline only this release (host untouched — v0.5.0 stays installed and
 undisturbed through tonight's 22:00 AEST window; no install, no
-daemon/rcd restart, no mutating rc call was made). 325/325
+daemon/rcd restart, no mutating rc call was made). 326/326
 (`php tests/run.php`), 0 `skipped --` lines (the bundled rclone v1.75.1
 zip was present, so every real-rcd end-to-end test — including two new
 ones covering a job spanning two shares — actually ran, not silently
@@ -97,7 +97,46 @@ skipped per the v0.4.4 gap). 19/19 Node checks
 implementation: 25 genuinely failing (undefined new functions, and
 existing behaviour asserting the old single-share shape), 1 test already
 green (the filter-compilation code was already depth-agnostic and needed
-no change to work at the new `<share>/<path>` depth).
+no change to work at the new `<share>/<path>` depth). The 326th test,
+added after the first review round, pins that the destination-overlap
+guard judges destinations only — the same source content deliberately
+backed up to two different remotes (Kieren's real setup: a Google
+full-share job and a OneDrive selective subset of the same share) must
+never be rejected as a conflict.
+
+### Review
+
+Six `code-diff-reviewer` passes (unattended MID band, escalation score 7:
+exposure 1, authority 2, data 2, reversibility 1, test gap 0, pattern
+divergence 0, module spread 1 — no counsel). Two real findings, both
+fixed: three stray editor crash-recovery files (`.fuse_hidden*`,
+~13,500 lines of stale duplicate test-file snapshots from an interrupted
+edit) had been accidentally committed — caught 3/6, removed, and
+`.gitignore`d; and godwitd's daily retention-purge loop called
+`godwit_job_dest_segment()` unguarded for every enabled job — caught 1/6
+but confirmed real, since an unsafe job name would throw there uncaught
+and kill the whole daemon process, unlike the job-start path and the
+purge call a few lines below, which already wrap the equivalent throwing
+calls in try/catch-and-log-continue. Fixed the same way; a focused
+3-pass round on that fix commit came back 3× `NO FINDINGS`. `advisor`
+read the diff directly (not just the pass output) and found no
+correctness blocker, only process gaps (this section, the count above,
+and a strengthened e2e assertion below) — all addressed here. Per
+project convention (see 0.4.1/0.4.2's own notes), godwitd's inline
+retention-loop glue is not itself unit-tested — only the pure functions
+it calls are — so this fix's coverage is the same as every other
+try/catch in that loop, not a gap specific to this change.
+
+`advisor` also flagged that the new cross-share sync e2e test's
+"never deletes destination content outside the filter" assertion only
+proved content *outside the job's whole dest tree* survives (trivially
+true), not the sharper Phase-4-era claim: stale content *inside* the
+dest root but *outside the current filter* must also survive a sync.
+Strengthened by pre-seeding `_selective/<job>/Teegan/Downloads/stale.mkv`
+(a file under a sibling folder that's never in the selection) before the
+sync and asserting it's still there after — the actual data-safety claim
+two jobs sharing a remote's `_selective` namespace need, not just that
+sync writes to the right place.
 
 ## [0.5.0] - 2026-09-18
 

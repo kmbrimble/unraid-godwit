@@ -4467,9 +4467,18 @@ t('godwit_build_sync_params + rc sync/sync with a multi-share selective job: src
     file_put_contents($shareRoot . '/Teegan/Downloads/movie.mkv', 'movie-contents');
 
     $dstRoot = $tmp . '/dst';
-    // Pre-existing file outside the job's dest tree — sync must never touch it.
+    // Pre-existing file entirely outside the job's dest tree — sync must never touch it.
     mkdir($dstRoot . '/untouched', 0755, true);
     file_put_contents($dstRoot . '/untouched/keepme.txt', 'must survive');
+    // The sharper claim: stale content INSIDE the job's own dest root but
+    // OUTSIDE the current filter (as if an earlier selection had included
+    // Teegan/Downloads and it was later un-ticked) must also survive —
+    // sync's delete phase must never reach outside what the filter actually
+    // put in scope, the same claim the single-share Phase 4 e2e test proved
+    // one level shallower.
+    $destBase = $dstRoot . '/godwit/_selective/Cross-Share Picks';
+    mkdir($destBase . '/Teegan/Downloads', 0755, true);
+    file_put_contents($destBase . '/Teegan/Downloads/stale.mkv', 'pre-existing, outside the current filter');
 
     $confPath = $tmp . '/rclone.conf';
     file_put_contents($confPath, "[localdst]\ntype = local\n");
@@ -4520,11 +4529,11 @@ t('godwit_build_sync_params + rc sync/sync with a multi-share selective job: src
         assert_true($status !== null && !empty($status['finished']), 'job should finish within 5s: ' . json_encode($status));
         assert_eq('', trim((string) ($status['error'] ?? '')), 'a plain cross-share selective sync should not error: ' . json_encode($status));
 
-        $destBase = $dstRoot . '/godwit/_selective/Cross-Share Picks';
         assert_true(is_file($destBase . '/Kieren/Documents/report.pdf'), 'Kieren\'s file must land at its share-qualified path under the job\'s own dest root');
         assert_true(is_file($destBase . '/Teegan/Homework/essay.docx'), 'Teegan\'s file must land at its share-qualified path under the same dest root — one job, two shares');
-        assert_true(!file_exists($destBase . '/Teegan/Downloads'), 'the never-selected Downloads folder must never reach the destination');
-        assert_true(is_file($dstRoot . '/untouched/keepme.txt'), 'sync must never touch content outside its own dest tree');
+        assert_true(!file_exists($destBase . '/Teegan/Downloads/movie.mkv'), 'the never-selected source file must never reach the destination');
+        assert_true(is_file($destBase . '/Teegan/Downloads/stale.mkv'), 'sync must NOT delete pre-existing destination content that sits outside the current filter — the actual data-safety claim, not just that included files transfer');
+        assert_true(is_file($dstRoot . '/untouched/keepme.txt'), 'sync must never touch content entirely outside its own dest tree either');
     } finally {
         proc_terminate($proc);
         proc_close($proc);

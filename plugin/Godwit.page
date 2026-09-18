@@ -690,7 +690,10 @@ function godwitTreeRenderChildren(container, parentPath, entries) {
 function godwitTreeLoad(parentPath, container) {
     if (parentPath === '') {
         return godwitApiCall('shares_list', {}).done(function (data) {
-            var entries = (data.shares || []).map(function (s) { return { name: s.name, is_dir: true, live: s.live }; });
+            if (data.error) { container.innerHTML = godwitErrorHtml(data.error); return; }
+            var shares = data.shares || [];
+            if (shares.length === 0) { container.innerHTML = 'No shares found — is the array started?'; return; }
+            var entries = shares.map(function (s) { return { name: s.name, is_dir: true, live: s.live }; });
             godwitTreeRenderChildren(container, parentPath, entries);
         });
     }
