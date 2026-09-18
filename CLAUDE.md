@@ -682,7 +682,9 @@ exercise of the v0.4.4 budget fix.
   default with no `MaxTransfer` set is already "no limit" — proven
   end-to-end against a real rcd via the same selective-job `sync/sync`
   fixture already used for the data-safety proof, now run with the
-  sentinel instead of a plain byte count.
+  sentinel instead of a plain byte count. That fix commit got its own
+  focused 3-pass round (3× `NO FINDINGS`) and a third `advisor` pass,
+  which found nothing blocking.
 - Verified offline: 294/294 (`php tests/run.php`, `build/` populated and
   confirmed present, 0 `skipped --` lines) plus 19/19 Node checks
   (`node tests/windows_form_test.mjs`, extended with the tri-state

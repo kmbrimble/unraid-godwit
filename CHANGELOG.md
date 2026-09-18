@@ -128,7 +128,8 @@ own default with no `MaxTransfer` set is already "no limit". Proven
 end-to-end against a real rcd process (not just a unit test asserting
 the key is absent) via the same selective-job `sync/sync` fixture used
 for the data-safety proof above, now run with the sentinel instead of a
-plain byte count.
+plain byte count. That fix commit got its own focused 3-pass round (3×
+`NO FINDINGS`) and a third `advisor` pass, which found nothing blocking.
 
 ### Not verified this release
 
