@@ -588,7 +588,12 @@ while ($running) {
                 if (empty($job['enabled'])) {
                     continue;
                 }
-                $destSegment = godwit_job_dest_segment($job);
+                try {
+                    $destSegment = godwit_job_dest_segment($job);
+                } catch (\Throwable $e) {
+                    godwit_log($logFile, "retention purge: skipping job \"{$job['name']}\" — invalid job definition: " . $e->getMessage());
+                    continue;
+                }
                 $versionsFs = $job['remote'] . ':godwit/_versions/' . $destSegment;
                 godwit_ensure_versions_dir($rcd['listener'], $versionsFs);
                 $listResult = godwit_list_versions_dirs($rcd['listener'], $versionsFs);
