@@ -4214,6 +4214,29 @@ t('godwit_validate_job_destinations: distinct selective jobs on the same remote 
     assert_eq(null, godwit_validate_job_destinations(array_reverse($jobs)), 'order must not matter');
 });
 
+t('godwit_validate_job_destinations: the SAME source paths on TWO DIFFERENT remotes never overlap — the guard is destination-only, source overlap is a deliberate, supported use case', function () {
+    // Kieren's real intended setup: the nightly Google full-share backup
+    // (share job, gdrive:godwit/Kieren) and a second, independent OneDrive
+    // offsite copy of a critical subset of that same share (selective job,
+    // kmonedrive:godwit/_selective/<job>/Kieren/...). Both jobs legitimately
+    // read overlapping source content — that's the whole point of a second
+    // offsite copy — so the guard must judge destinations only, never source
+    // paths, and must not be tempted to "helpfully" flag this as a conflict.
+    $jobs = [
+        ['name' => 'Kieren', 'type' => 'share', 'share' => 'Kieren', 'remote' => 'gdrive', 'enabled' => true],
+        ['name' => 'Kieren Offsite', 'type' => 'selective', 'remote' => 'kmonedrive', 'enabled' => true,
+            'included' => [['path' => 'Kieren/Documents', 'is_dir' => true], ['path' => 'Kieren/Photos', 'is_dir' => true]]],
+    ];
+    assert_eq(null, godwit_validate_job_destinations($jobs), 'same source, different remotes: destinations do not overlap, must be allowed');
+
+    // And the full save path, exactly as the settings page would post it —
+    // not just the pure destination check in isolation.
+    $env = godwit_test_job_env();
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($jobs)], $env['dbPath'], $env['runDir'], $env['cfgDir'], $env['shareRoot']);
+    assert_true(($result['ok'] ?? false) === true, 'both jobs should save fine despite sharing source content: ' . var_export($result, true));
+    exec('rm -rf ' . escapeshellarg($env['tmp']));
+});
+
 t('godwit_validate_job_destinations: two selective jobs with the exact same name on the same remote overlap, in either array order', function () {
     $jobs = [
         ['name' => 'Same', 'type' => 'selective', 'remote' => 'gdrive', 'enabled' => true],
