@@ -3,3 +3,4 @@ PLAN.md
 .scratch/
 dist/
 build/
+.fuse_hidden*
