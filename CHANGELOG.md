@@ -10,6 +10,95 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-18
+
+### Added
+
+- **Selective jobs now span every share from one job**, instead of being
+  locked to a single share. A selective job's `srcFs` is now the bare
+  share root (`/mnt/user`); the tri-state tree's top level lists every
+  share, expanding into them as before, and `included`/`excluded` paths
+  are share-qualified (`Kieren/Documents/...`). Destination layout:
+  `<remote>:godwit/_selective/<job name>/<share>/<path...>` —
+  `godwit_build_job_fs()` sets `dstFs` to
+  `remote:godwit/_selective/<sanitized job name>` and rclone's own
+  relative-path preservation does the `<share>/<path...>` part for free.
+  `godwit_job_dest_segment()` centralises the "share" vs
+  "_selective/<job name>" choice so `godwit_build_job_fs()`,
+  `godwit_backup_dir_fs()`, and godwitd's retention-purge loop can never
+  disagree with each other about a job's destination segment.
+- New `godwit_sanitize_job_name_segment()` rejects a job name unsafe for
+  path use (empty, `.`/`..`, `/ \ : * ? " < > |`, trailing dot/space) —
+  used only for a selective job's destination segment; a share job's
+  segment is still its real share name, unchanged.
+- A share job can no longer be named `_selective` (case-insensitive) —
+  that token is reserved for the selective-job namespace.
+- **Destination-overlap guard** (`godwit_validate_job_destinations()`)
+  needed no code change for the new `dstFs` shape — its existing prefix
+  comparison already refuses two jobs (share or selective, in either
+  array order) whose destinations equal or nest inside each other. A new,
+  separate `godwit_validate_selective_job_name_collisions()` additionally
+  rejects two selective jobs on the same remote whose names sanitise to
+  the same segment case-insensitively (OneDrive is case-insensitive),
+  checked across *all* jobs including disabled ones — the destination
+  guard only checks enabled jobs, but a disabled job's name is still
+  reserved, since enabling it later must not silently start colliding.
+- `godwit_assert_job_direction()` now accepts `srcFs === $shareRoot`
+  exactly (a selective job spanning every share) in addition to the
+  existing "real subpath of `$shareRoot`" case (a share job) — still
+  rejects a same-prefix non-boundary path like `/mnt/user2` or `/mnt/use`.
+- `godwit_assert_purge_path()` — the safety-critical guard applied to
+  every version-retention purge path before the rc call — now also
+  accepts the two-segment `_selective/<job name>` shape, with its own
+  dedicated tests: a valid selective purge path is accepted; a bare
+  `_selective` (no job name), `_selective/..`, and a three-segment form
+  are all still rejected.
+- **Share field is now a real picker.** `plugin/Godwit.page`'s free-text
+  Share input is replaced with a `<select>` populated live from a new
+  `shares_list` API action (`godwit_list_shares()` — `scandir()` over
+  `/mnt/user`, directories only, dotfiles skipped, never `ls`).
+  `appdata`/`system`/`domains` are shown but flagged "⚠ live data — not
+  recommended" in both the share dropdown and the tree's top-level share
+  listing — never hidden, since a user might legitimately want them.
+  `jobs_save` now validates a share job's named share is a real directory
+  under the share root before saving, so a typo fails at save time
+  instead of at 22:00; threaded through an optional `$shareRoot`
+  parameter on `godwit_handle_job_action()`/`godwit_validate_job_destinations()`
+  (default `/mnt/user`) so tests never depend on the real host
+  filesystem.
+- Back-compat: a 0.5.0-shaped selective job (single `share` field,
+  share-relative `included`/`excluded` paths) is migrated automatically
+  on load (`godwit_load_jobs()` → `godwit_migrate_legacy_selective_job()`)
+  by prefixing every path with the old share and dropping the field.
+  Chosen over rejecting the file outright: no selective job existed on
+  the host when this shipped, so there was no real data this could get
+  wrong, and a silent load-time fix is friendlier than forcing a
+  reconfigure.
+
+### Answered, not built
+
+- Kieren asked whether a job could sync all of `/mnt/user` in one go for
+  the Google full backup. No — it would sweep in Movies, Music, Games,
+  Downloads and appdata as well as the four intended shares, and collapse
+  the per-share status/queue-advance behaviour the nightly budget queue
+  depends on (Filing Cabinet → Kieren → Teegan → Photos). Share jobs stay
+  one-per-share.
+
+### Verification
+
+Offline only this release (host untouched — v0.5.0 stays installed and
+undisturbed through tonight's 22:00 AEST window; no install, no
+daemon/rcd restart, no mutating rc call was made). 325/325
+(`php tests/run.php`), 0 `skipped --` lines (the bundled rclone v1.75.1
+zip was present, so every real-rcd end-to-end test — including two new
+ones covering a job spanning two shares — actually ran, not silently
+skipped per the v0.4.4 gap). 19/19 Node checks
+(`node tests/windows_form_test.mjs`). Red baseline confirmed before
+implementation: 25 genuinely failing (undefined new functions, and
+existing behaviour asserting the old single-share shape), 1 test already
+green (the filter-compilation code was already depth-agnostic and needed
+no change to work at the new `<share>/<path>` depth).
+
 ## [0.5.0] - 2026-09-18
 
 ### Added

@@ -93,7 +93,7 @@ if (file_exists($pidFile)) {
 <div id="job-add-dialog" style="display:none">
     <h3>Add job</h3>
     <label>Name <input type="text" id="job-add-name" size="30"></label><br>
-    <label>Share <input type="text" id="job-add-share" size="30"></label><br>
+    <label id="job-add-share-label">Share <select id="job-add-share"></select></label><br>
     <label>Remote <select id="job-add-remote"></select></label><br>
     <label>Type
         <select id="job-add-type">
@@ -656,7 +656,6 @@ var godwitJobSelections = {}; // job name -> {type, included, excluded}, the sou
 var godwitPendingNewJobs = []; // jobs added this session, not yet saved
 var godwitTreeIncluded = [];
 var godwitTreeExcluded = [];
-var godwitTreeShare = '';
 var godwitTreeRemote = '';
 var godwitRemotesCache = []; // last remotes_list response, for the tree dialog's free-space comparison
 var godwitTreeTargetName = null; // null = the Add-job dialog's own scratch selection
@@ -666,7 +665,9 @@ function godwitTreeSelectionFor(name) {
     return name === null ? godwitTreeScratch : (godwitJobSelections[name] || { included: [], excluded: [] });
 }
 
-function godwitTreeNodeLabel(entry) { return entry.name + (entry.is_dir ? '/' : ''); }
+function godwitTreeNodeLabel(entry) {
+    return entry.name + (entry.is_dir ? '/' : '') + (entry.live ? ' ⚠ live data' : '');
+}
 
 function godwitTreeRenderChildren(container, parentPath, entries) {
     container.innerHTML = entries.map(function (e) {
@@ -682,8 +683,19 @@ function godwitTreeRenderChildren(container, parentPath, entries) {
     }).join('');
 }
 
+// The tree's top level (parentPath === '') lists every share (v0.6.0: a
+// selective job spans all of /mnt/user, not one share); everything deeper
+// is a real tree_list()/tree_size() call, share-qualified by splitting the
+// full path on its first '/'.
 function godwitTreeLoad(parentPath, container) {
-    return godwitApiCall('tree_list', { share: godwitTreeShare, path: parentPath }).done(function (data) {
+    if (parentPath === '') {
+        return godwitApiCall('shares_list', {}).done(function (data) {
+            var entries = (data.shares || []).map(function (s) { return { name: s.name, is_dir: true, live: s.live }; });
+            godwitTreeRenderChildren(container, parentPath, entries);
+        });
+    }
+    var split = godwitSplitTreePath(parentPath);
+    return godwitApiCall('tree_list', { share: split.share, path: split.rest }).done(function (data) {
         if (data.error) { container.innerHTML = godwitErrorHtml(data.error); return; }
         godwitTreeRenderChildren(container, parentPath, data.entries || []);
     });
@@ -720,7 +732,8 @@ function godwitTreeUpdateTotal() {
     var total = 0;
     var pending = godwitTreeIncluded.length;
     godwitTreeIncluded.forEach(function (node) {
-        godwitApiCall('tree_size', { share: godwitTreeShare, path: node.path }).done(function (data) {
+        var split = godwitSplitTreePath(node.path);
+        godwitApiCall('tree_size', { share: split.share, path: split.rest }).done(function (data) {
             total += data.bytes || 0;
         }).always(function () {
             pending--;
@@ -758,8 +771,7 @@ document.getElementById('tree-root').addEventListener('click', function (ev) {
     }
 });
 
-function godwitTreeOpen(share, remote, targetName) {
-    godwitTreeShare = share;
+function godwitTreeOpen(remote, targetName) {
     godwitTreeRemote = remote;
     godwitTreeTargetName = targetName;
     var sel = godwitTreeSelectionFor(targetName);
@@ -784,24 +796,44 @@ document.getElementById('tree-done').addEventListener('click', function () {
     $('#tree-dialog').dialog('close');
 });
 
+// Splits a full tree-selection path ("Kieren/Documents/Foo") into its share
+// (top segment) and the rest — the tree spans every share (v0.6.0), but
+// godwit_tree_list()/godwit_tree_node_size() are still per-share calls, so
+// every API call point splits here rather than changing that server shape.
+function godwitSplitTreePath(path) {
+    var i = path.indexOf('/');
+    return i === -1 ? { share: path, rest: '' } : { share: path.slice(0, i), rest: path.slice(i + 1) };
+}
+
+function godwitPopulateShareSelect() {
+    return godwitApiCall('shares_list', {}).done(function (data) {
+        var sel = document.getElementById('job-add-share');
+        var prev = sel.value;
+        sel.innerHTML = (data.shares || []).map(function (s) {
+            return '<option value="' + esc(s.name) + '">' + esc(s.name) + (s.live ? ' ⚠ live data — not recommended' : '') + '</option>';
+        }).join('');
+        if ((data.shares || []).some(function (s) { return s.name === prev; })) { sel.value = prev; }
+    });
+}
+
 document.getElementById('job-add-type').addEventListener('change', function () {
-    document.getElementById('job-add-selective').style.display = this.value === 'selective' ? 'block' : 'none';
+    var isSelective = this.value === 'selective';
+    document.getElementById('job-add-selective').style.display = isSelective ? 'block' : 'none';
+    document.getElementById('job-add-share-label').style.display = isSelective ? 'none' : 'inline';
 });
 
 document.getElementById('job-add-browse').addEventListener('click', function () {
-    var share = document.getElementById('job-add-share').value.trim();
-    if (!share) { document.getElementById('job-add-message').innerHTML = godwitErrorHtml('enter a share name first'); return; }
-    godwitTreeOpen(share, document.getElementById('job-add-remote').value, null);
+    godwitTreeOpen(document.getElementById('job-add-remote').value, null);
 });
 
 document.getElementById('job-add').addEventListener('click', function () {
     var name = document.getElementById('job-add-name').value.trim();
-    var share = document.getElementById('job-add-share').value.trim();
-    var remote = document.getElementById('job-add-remote').value;
     var type = document.getElementById('job-add-type').value;
+    var share = document.getElementById('job-add-share').value;
+    var remote = document.getElementById('job-add-remote').value;
     var msg = document.getElementById('job-add-message');
-    if (!name || !share || !remote) {
-        msg.innerHTML = godwitErrorHtml('name, share and remote are all required');
+    if (!name || !remote || (type === 'share' && !share)) {
+        msg.innerHTML = godwitErrorHtml('name and remote are required' + (type === 'share' ? ', and a share must be selected' : ''));
         return;
     }
     if (name in godwitJobSelections || godwitPendingNewJobs.some(function (j) { return j.name === name; })) {
@@ -812,14 +844,15 @@ document.getElementById('job-add').addEventListener('click', function () {
         msg.innerHTML = godwitErrorHtml('browse and select at least one folder or file first');
         return;
     }
-    godwitPendingNewJobs.push({ name: name, share: share, remote: remote, mode: 'sync', enabled: true, transfers: 4, max_delete: 1000 });
+    var job = { name: name, remote: remote, mode: 'sync', enabled: true, transfers: 4, max_delete: 1000 };
+    if (type === 'share') { job.share = share; }
+    godwitPendingNewJobs.push(job);
     godwitJobSelections[name] = type === 'selective'
         ? { type: 'selective', included: godwitTreeScratch.included, excluded: godwitTreeScratch.excluded }
         : { type: 'share', included: [], excluded: [] };
     godwitTreeScratch = { included: [], excluded: [] };
     document.getElementById('job-add-selection-summary').textContent = '';
     document.getElementById('job-add-name').value = '';
-    document.getElementById('job-add-share').value = '';
     msg.innerHTML = '';
     $('#job-add-dialog').dialog('close');
     godwitJobsRefresh();
@@ -828,7 +861,7 @@ document.getElementById('job-add').addEventListener('click', function () {
 document.getElementById('godwit-jobs-table').addEventListener('click', function (ev) {
     if (ev.target.classList.contains('godwit-job-browse')) {
         var tr = ev.target.closest('tr');
-        godwitTreeOpen(tr.dataset.share, tr.dataset.remote, tr.dataset.name);
+        godwitTreeOpen(tr.dataset.remote, tr.dataset.name);
     }
 });
 
@@ -844,7 +877,7 @@ function godwitJobRowHtml(j) {
     var selectionCell = sel.type === 'selective'
         ? '<button type="button" class="godwit-job-browse" data-name="' + esc(j.name) + '">Browse (' + sel.included.length + ')</button>'
         : '<input type="text" class="godwit-job-excludes" value="' + esc((j.excludes || []).join(', ')) + '" size="30">';
-    return '<tr data-name="' + esc(j.name) + '" data-share="' + esc(j.share) + '" data-remote="' + esc(j.remote) + '" data-maxdelete="' + (j.max_delete || 1000) + '">' +
+    return '<tr data-name="' + esc(j.name) + '" data-share="' + esc(j.share || '') + '" data-remote="' + esc(j.remote) + '" data-maxdelete="' + (j.max_delete || 1000) + '">' +
         '<td>' + esc(j.name) + '</td>' +
         '<td>' + esc(j.remote) + '</td>' +
         '<td>' + esc(sel.type) + '</td>' +
@@ -924,7 +957,6 @@ function godwitJobsSave() {
         var sel = godwitJobSelections[name] || { type: 'share', included: [], excluded: [] };
         var job = {
             name: name,
-            share: tr.dataset.share,
             remote: tr.dataset.remote,
             enabled: tr.querySelector('.godwit-job-enabled').checked,
             mode: tr.querySelector('.godwit-job-mode').value,
@@ -937,6 +969,7 @@ function godwitJobsSave() {
             job.excluded = sel.excluded;
             job.excludes = [];
         } else {
+            job.share = tr.dataset.share;
             job.excludes = tr.querySelector('.godwit-job-excludes').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
         }
         return job;
@@ -1044,7 +1077,7 @@ $('#tree-dialog').dialog({ autoOpen: false, modal: true, width: 500, height: 500
 
 document.getElementById('drive-add-open').addEventListener('click', function () { $('#drive-add-dialog').dialog('open'); });
 document.getElementById('onedrive-add-open').addEventListener('click', function () { $('#onedrive-add-dialog').dialog('open'); });
-document.getElementById('job-add-open').addEventListener('click', function () { $('#job-add-dialog').dialog('open'); });
+document.getElementById('job-add-open').addEventListener('click', function () { godwitPopulateShareSelect(); $('#job-add-dialog').dialog('open'); });
 document.getElementById('onedrive-picker-cancel').addEventListener('click', function () { godwitHideDrivePicker(); });
 
 document.getElementById('drive-add').addEventListener('click', function () {

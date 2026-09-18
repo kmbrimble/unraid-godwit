@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.5.0">
+<!ENTITY version   "0.6.0">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,20 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.6.0
+- A selective job now spans every share from one job instead of being
+  locked to one: the tri-state tree's top level lists all your shares, and
+  ticks anywhere become the job's selection — no more creating one job per
+  share to pick folders across them. Destination layout:
+  remote:godwit/_selective/&lt;job name&gt;/&lt;share&gt;/&lt;path...&gt;. Two selective
+  jobs (or a share job and a selective job) whose destinations would
+  overlap are refused at save time, in either order.
+- The Add job "Share" field is now a dropdown of your real shares instead
+  of free text — a typo can no longer save a job that only fails at
+  22:00. appdata/system/domains are shown, flagged as live data, never
+  hidden.
+- A 0.5.0-shaped selective job (one share, share-relative paths) loads and
+  migrates automatically — no manual fix-up needed.
 ###0.5.0
 - Phase 4: OneDrive selective backup. A new "selective" job type lets you
   hand-pick individual folders/files from a share via a browsable

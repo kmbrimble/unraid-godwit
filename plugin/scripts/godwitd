@@ -588,7 +588,8 @@ while ($running) {
                 if (empty($job['enabled'])) {
                     continue;
                 }
-                $versionsFs = $job['remote'] . ':godwit/_versions/' . $job['share'];
+                $destSegment = godwit_job_dest_segment($job);
+                $versionsFs = $job['remote'] . ':godwit/_versions/' . $destSegment;
                 godwit_ensure_versions_dir($rcd['listener'], $versionsFs);
                 $listResult = godwit_list_versions_dirs($rcd['listener'], $versionsFs);
                 if (isset($listResult['error'])) {
@@ -598,13 +599,13 @@ while ($running) {
                 $candidates = godwit_versions_purge_candidates($listResult['dirs'], $retainDays, $nowDt);
                 foreach ($candidates as $dateDir) {
                     try {
-                        $purgeParams = godwit_purge_call_params($job['remote'], $job['share'], $dateDir);
+                        $purgeParams = godwit_purge_call_params($job['remote'], $destSegment, $dateDir);
                     } catch (\Throwable $e) {
                         godwit_log($logFile, 'retention purge refused (safety check failed): ' . $e->getMessage());
                         continue;
                     }
                     godwit_rc_call_params($rcd['listener'], 'operations/purge', $purgeParams, 60);
-                    godwit_log($logFile, "retention purge: {$job['remote']}:godwit/_versions/{$job['share']}/$dateDir");
+                    godwit_log($logFile, "retention purge: {$job['remote']}:godwit/_versions/$destSegment/$dateDir");
                 }
             }
             $lastRetention = $now;

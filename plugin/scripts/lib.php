@@ -1284,7 +1284,39 @@ function godwit_default_jobs(): array
     ];
 }
 
-/** Loads jobs.json, seeding the Phase 3 defaults on first run (file absent). Never mutates disk itself — callers that seed defaults must save explicitly. */
+/**
+ * v0.5.0 selective jobs were rooted at a single share, so 'included'/
+ * 'excluded' paths were relative to that share (e.g. "Documents/Foo").
+ * v0.6.0 selective jobs root at /mnt/user and share-qualify every path
+ * (e.g. "Kieren/Documents/Foo"). A 0.5.0-shaped job on disk (type=selective
+ * with a non-empty 'share') is migrated in place by prefixing every path
+ * with that share and dropping the field. Chosen over rejecting the file
+ * outright: no selective job existed on the host when this shipped, so
+ * there's no real data this could get wrong, and a silent load-time fix is
+ * friendlier than forcing a reconfigure.
+ */
+function godwit_migrate_legacy_selective_job($job)
+{
+    if (!is_array($job) || ($job['type'] ?? 'share') !== 'selective' || empty($job['share'])) {
+        return $job;
+    }
+    $share = (string) $job['share'];
+    foreach (['included', 'excluded'] as $key) {
+        if (!is_array($job[$key] ?? null)) {
+            continue;
+        }
+        foreach ($job[$key] as &$node) {
+            if (is_array($node) && isset($node['path']) && is_string($node['path'])) {
+                $node['path'] = $share . '/' . ltrim($node['path'], '/');
+            }
+        }
+        unset($node);
+    }
+    unset($job['share']);
+    return $job;
+}
+
+/** Loads jobs.json, seeding the Phase 3 defaults on first run (file absent). Never mutates disk itself — callers that seed defaults must save explicitly. Migrates a 0.5.0-shaped selective job (see godwit_migrate_legacy_selective_job()) so an old jobs.json can never crash a 0.6.0+ load. */
 function godwit_load_jobs(string $cfgDir): array
 {
     $path = $cfgDir . '/jobs.json';
@@ -1292,7 +1324,10 @@ function godwit_load_jobs(string $cfgDir): array
         return godwit_default_jobs();
     }
     $decoded = json_decode((string) file_get_contents($path), true);
-    return is_array($decoded) ? $decoded : [];
+    if (!is_array($decoded)) {
+        return [];
+    }
+    return array_map('godwit_migrate_legacy_selective_job', $decoded);
 }
 
 function godwit_save_jobs(string $cfgDir, array $jobs): void
@@ -1375,6 +1410,35 @@ function godwit_compile_selective_filter_rules(array $job): array
 function godwit_write_filter_file(string $path, array $rules): void
 {
     file_put_contents($path, implode(PHP_EOL, $rules) . PHP_EOL);
+}
+
+/** Shares that hold live container/VM state rather than plain files — a technically-valid but risky backup target as files. Never hidden from a picker, only flagged. */
+const GODWIT_LIVE_DATA_SHARES = ['appdata', 'system', 'domains'];
+
+function godwit_share_is_live_data(string $share): bool
+{
+    return in_array($share, GODWIT_LIVE_DATA_SHARES, true);
+}
+
+/** The real share names under $shareRoot — plain scandir, never `ls` — for the Share dropdown and the selective tree's top level. Directories only, dotfiles skipped, sorted case-insensitively. A missing/unreadable root (array not started) returns an empty list rather than erroring. */
+function godwit_list_shares(string $shareRoot = '/mnt/user'): array
+{
+    $entries = @scandir($shareRoot);
+    if ($entries === false) {
+        return [];
+    }
+    $shares = [];
+    foreach ($entries as $name) {
+        if ($name === '.' || $name === '..' || $name[0] === '.') {
+            continue;
+        }
+        if (!is_dir(rtrim($shareRoot, '/') . '/' . $name)) {
+            continue;
+        }
+        $shares[] = $name;
+    }
+    sort($shares, SORT_NATURAL | SORT_FLAG_CASE);
+    return $shares;
 }
 
 /** Resolves $share/$relPath to a real filesystem path under $shareRoot for the Phase 4 tree picker, rejecting traversal the same way godwit_build_job_fs()'s share check does — no absolute paths, no "..", no empty segments. Returns null on anything unsafe; callers must never build a tree path from unvalidated input themselves. */
@@ -1587,23 +1651,78 @@ function godwit_validate_selective_job(array $job): ?string
 }
 
 /**
+ * Normalises a job name into a single flat path segment safe for use in an
+ * rclone destination path: trims whitespace and trailing dots (the same
+ * shape Windows/OneDrive itself refuses), then rejects anything empty,
+ * "."/"..", or containing a path separator or another character that would
+ * change the meaning of the path it's placed in. Used only for a
+ * *selective* job's destination segment — a share job's destination
+ * segment is its real share name, unchanged (see godwit_job_dest_segment()).
+ */
+function godwit_sanitize_job_name_segment(string $name): string
+{
+    $name = trim($name);
+    if ($name === '' || preg_match('#[/\\\\:*?"<>|]#', $name) || strpos($name, '..') !== false) {
+        throw new \InvalidArgumentException('job name is not safe for use in a path: ' . var_export($name, true));
+    }
+    $name = rtrim($name, " .");
+    if ($name === '' || $name === '.' || $name === '..') {
+        throw new \InvalidArgumentException('job name is not safe for use in a path: ' . var_export($name, true));
+    }
+    return $name;
+}
+
+/**
+ * The path segment a job's data (and its --backup-dir version history)
+ * lives under, independent of remote: a share job uses its real share name
+ * unchanged (Phase 3 layout, "godwit/<share>"); a selective job (Phase 4/5)
+ * uses "_selective/<sanitized job name>" — the exact two-segment layout
+ * PLAN.md's Phase 5 spec asks for ("godwit/_selective/<job name>/<share>/
+ * <path...>"), with rclone's own relative-path preservation doing the
+ * "<share>/<path...>" part for free once srcFs is the bare share root.
+ * Centralising this one branch is what keeps godwit_build_job_fs(),
+ * godwit_backup_dir_fs() and godwitd's retention-purge loop from silently
+ * disagreeing with each other.
+ */
+function godwit_job_dest_segment(array $job): string
+{
+    if (($job['type'] ?? 'share') === 'selective') {
+        return '_selective/' . godwit_sanitize_job_name_segment((string) ($job['name'] ?? ''));
+    }
+    return (string) ($job['share'] ?? '');
+}
+
+/**
  * The two Fs a job builds — kept separate from the rc-call params so
  * godwit_assert_job_direction() can check them before anything is ever sent
- * to rcd. $job['share'] is deliberately rejected if it contains a path
- * separator (no traversal out of /mnt/user/<share>) and dstFs is always the
- * bare "remote:path" form the direction/overlap checks assume — see the
- * RCLONE_DRIVE_* env vars above for why no connection-string params are
- * needed.
+ * to rcd. A share job's $job['share'] is deliberately rejected if it
+ * contains a path separator (no traversal out of /mnt/user/<share>) or is
+ * the "_selective" token reserved for selective jobs' own namespace; a
+ * selective job roots srcFs at the bare $shareRoot itself (Phase 5: one job
+ * spans every share) and destines under godwit/_selective/<job name> via
+ * godwit_job_dest_segment(). dstFs is always the bare "remote:path" form
+ * the direction/overlap checks assume — see the RCLONE_DRIVE_* env vars
+ * above for why no connection-string params are needed.
  */
 function godwit_build_job_fs(array $job, string $shareRoot = '/mnt/user'): array
 {
+    $remote = (string) ($job['remote'] ?? '');
+    if ($remote === '' || strpos($remote, '/') !== false || strpos($remote, ':') !== false) {
+        throw new \InvalidArgumentException('invalid remote name for job: ' . var_export($remote, true));
+    }
+    if (($job['type'] ?? 'share') === 'selective') {
+        $segment = godwit_job_dest_segment($job); // throws on an unsafe job name
+        return [
+            'srcFs' => rtrim($shareRoot, '/'),
+            'dstFs' => $remote . ':godwit/' . $segment,
+        ];
+    }
     $share = (string) ($job['share'] ?? '');
     if ($share === '' || $share === '.' || $share === '..' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
         throw new \InvalidArgumentException('invalid share name for job: ' . var_export($share, true));
     }
-    $remote = (string) ($job['remote'] ?? '');
-    if ($remote === '' || strpos($remote, '/') !== false || strpos($remote, ':') !== false) {
-        throw new \InvalidArgumentException('invalid remote name for job: ' . var_export($remote, true));
+    if (strcasecmp($share, '_selective') === 0) {
+        throw new \InvalidArgumentException('share name "_selective" is reserved for selective jobs');
     }
     return [
         'srcFs' => rtrim($shareRoot, '/') . '/' . $share,
@@ -1614,27 +1733,29 @@ function godwit_build_job_fs(array $job, string $shareRoot = '/mnt/user'): array
 /**
  * Hard assertion (never bypassable by a caller-supplied direction) that a
  * built job's Fs pair can only ever copy from a local share into a remote —
- * srcFs must be a real absolute path under $shareRoot, dstFs must be
- * "remote:path" with no local path shape. Throws on any violation; callers
- * never send Fs pairs to rcd without calling this first.
+ * srcFs must be $shareRoot itself (a selective job, which spans every
+ * share) or a real subpath of it (a share job), dstFs must be "remote:path"
+ * with no local path shape. Throws on any violation; callers never send Fs
+ * pairs to rcd without calling this first.
  */
 function godwit_assert_job_direction(array $fs, string $shareRoot = '/mnt/user'): void
 {
-    $root = rtrim($shareRoot, '/') . '/';
-    if (strpos($fs['srcFs'], $root) !== 0 || strlen($fs['srcFs']) <= strlen($root)) {
+    $root = rtrim($shareRoot, '/');
+    $prefixed = $root . '/';
+    if ($fs['srcFs'] !== $root && (strpos($fs['srcFs'], $prefixed) !== 0 || strlen($fs['srcFs']) <= strlen($prefixed))) {
         throw new \RuntimeException('refusing job: srcFs is not a local path under ' . $shareRoot . ' (' . $fs['srcFs'] . ')');
     }
     if (!preg_match('/^[A-Za-z0-9_.+@ -]+:[^:]*$/', $fs['dstFs'])) {
         throw new \RuntimeException('refusing job: dstFs is not a plain remote:path (' . $fs['dstFs'] . ')');
     }
-    if (strpos($fs['dstFs'], $root) === 0) {
+    if (strpos($fs['dstFs'], $prefixed) === 0 || $fs['dstFs'] === $root) {
         throw new \RuntimeException('refusing job: dstFs looks like a local path (' . $fs['dstFs'] . ')');
     }
 }
 
 function godwit_backup_dir_fs(array $job, string $dateYmd): string
 {
-    return $job['remote'] . ':godwit/_versions/' . $job['share'] . '/' . $dateYmd;
+    return $job['remote'] . ':godwit/_versions/' . godwit_job_dest_segment($job) . '/' . $dateYmd;
 }
 
 function godwit_sync_rc_path(string $mode): string
@@ -1703,14 +1824,14 @@ function godwit_build_sync_params(array $job, array $fs, string $filterFile, int
  * string, or null if the set is safe. Disabled jobs are not checked — they
  * can never run, so an overlap with one is not exploitable.
  */
-function godwit_validate_job_destinations(array $jobs): ?string
+function godwit_validate_job_destinations(array $jobs, string $shareRoot = '/mnt/user'): ?string
 {
     $dests = [];
     foreach ($jobs as $job) {
         if (empty($job['enabled'])) {
             continue;
         }
-        $fs = godwit_build_job_fs($job);
+        $fs = godwit_build_job_fs($job, $shareRoot);
         if (preg_match('#^[^:]+:godwit/_versions(/|$)#', $fs['dstFs'])) {
             return "job \"{$job['name']}\" destination sits under godwit/_versions — not allowed";
         }
@@ -1724,6 +1845,39 @@ function godwit_validate_job_destinations(array $jobs): ?string
                 return "jobs \"{$dests[$i]['name']}\" and \"{$dests[$j]['name']}\" have overlapping destinations";
             }
         }
+    }
+    return null;
+}
+
+/**
+ * A second, independent collision guard that the destination-overlap check
+ * above cannot cover: OneDrive is case-insensitive, so two selective jobs
+ * on the same remote whose names differ only by case or trailing
+ * whitespace would sanitise to the *same* destination segment
+ * (godwit_job_dest_segment()) even though their literal 'share'/'name'
+ * strings differ. Checked across ALL jobs, including disabled ones —
+ * unlike godwit_validate_job_destinations(), a disabled job's name is still
+ * reserved, since job_runs is keyed by job name and enabling it later must
+ * not silently start colliding. A job whose name doesn't even sanitise
+ * (already rejected elsewhere) is skipped here rather than reported twice.
+ */
+function godwit_validate_selective_job_name_collisions(array $jobs): ?string
+{
+    $seen = [];
+    foreach ($jobs as $job) {
+        if (($job['type'] ?? 'share') !== 'selective') {
+            continue;
+        }
+        try {
+            $segment = godwit_sanitize_job_name_segment((string) ($job['name'] ?? ''));
+        } catch (\Throwable $e) {
+            continue;
+        }
+        $key = strtolower($segment) . '@' . strtolower((string) ($job['remote'] ?? ''));
+        if (isset($seen[$key])) {
+            return "jobs \"{$seen[$key]}\" and \"{$job['name']}\" sanitise to the same destination on remote \"{$job['remote']}\" — rename one";
+        }
+        $seen[$key] = $job['name'];
     }
     return null;
 }
@@ -2407,24 +2561,31 @@ function godwit_versions_purge_candidates(array $dateDirs, int $retainDays, \Dat
 
 /**
  * The purge safety guard: throws unless the fully-assembled path is exactly
- * "godwit/_versions/<share>/<YYYY-MM-DD>" with no traversal, no extra
- * segments, nothing that could resolve outside _versions/. This is the only
- * function allowed to build a path for `operations/purge` — callers must
- * never hand rcd a hand-built string.
+ * "godwit/_versions/<share>/<YYYY-MM-DD>" (a share job) or
+ * "godwit/_versions/_selective/<job name>/<YYYY-MM-DD>" (a selective job,
+ * mirroring godwit_job_dest_segment()'s own two-segment shape) — no
+ * traversal, no extra segments, nothing that could resolve outside
+ * _versions/. This is the only function allowed to build a path for
+ * `operations/purge` — callers must never hand rcd a hand-built string.
  */
 function godwit_assert_purge_path(string $remote, string $share, string $dateDir): string
 {
     if ($remote === '' || strpos($remote, ':') !== false || strpos($remote, '/') !== false) {
         throw new \InvalidArgumentException('invalid remote for purge');
     }
-    if ($share === '' || $share === '.' || $share === '..' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
-        throw new \InvalidArgumentException('invalid share for purge');
-    }
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateDir)) {
         throw new \InvalidArgumentException('refusing to purge a non-date path: ' . var_export($dateDir, true));
     }
+    if (preg_match('#^_selective/([^/]+)$#', $share, $m)) {
+        $jobSeg = $m[1];
+        if ($jobSeg === '' || $jobSeg === '.' || $jobSeg === '..' || strpos($jobSeg, '..') !== false) {
+            throw new \InvalidArgumentException('invalid selective job segment for purge');
+        }
+    } elseif ($share === '' || $share === '.' || $share === '..' || $share === '_selective' || strpos($share, '/') !== false || strpos($share, '..') !== false) {
+        throw new \InvalidArgumentException('invalid share for purge');
+    }
     $path = "godwit/_versions/$share/$dateDir";
-    if (!preg_match('#^godwit/_versions/[^/]+/\d{4}-\d{2}-\d{2}$#', $path)) {
+    if (!preg_match('#^godwit/_versions/(?:[^/]+|_selective/[^/]+)/\d{4}-\d{2}-\d{2}$#', $path)) {
         throw new \InvalidArgumentException('purge path failed the safety check: ' . $path);
     }
     return $remote . ':' . $path;
@@ -2526,7 +2687,7 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
         $gated = $active === null && godwit_job_budget_gated($last, $budget['cap'], $budget['remaining'], $minFraction);
         $jobsOut[] = [
             'name' => $job['name'],
-            'share' => $job['share'],
+            'share' => $job['share'] ?? null,
             'remote' => $job['remote'],
             'mode' => $job['mode'] ?? 'sync',
             'enabled' => !empty($job['enabled']),
@@ -2584,7 +2745,7 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
  * $runDir; godwitd's tick loop polls for them the same way it already polls
  * check-now (Phase 2).
  */
-function godwit_handle_job_action(string $action, array $post, string $dbPath, string $runDir, string $cfgDir): array
+function godwit_handle_job_action(string $action, array $post, string $dbPath, string $runDir, string $cfgDir, string $shareRoot = '/mnt/user'): array
 {
     if ($action === 'jobs_status') {
         if (!is_file($dbPath)) {
@@ -2622,28 +2783,42 @@ function godwit_handle_job_action(string $action, array $post, string $dbPath, s
             return ['error' => 'jobs must be a JSON array'];
         }
         foreach ($jobs as $job) {
-            if (!is_array($job) || empty($job['name']) || empty($job['share']) || empty($job['remote'])) {
-                return ['error' => 'every job needs a name, share and remote'];
+            if (!is_array($job) || empty($job['name']) || empty($job['remote'])) {
+                return ['error' => 'every job needs a name and remote'];
+            }
+            $type = $job['type'] ?? 'share';
+            if (!in_array($type, ['share', 'selective'], true)) {
+                return ['error' => "job \"{$job['name']}\": type must be share or selective"];
+            }
+            if ($type === 'share' && empty($job['share'])) {
+                return ['error' => "job \"{$job['name']}\": a share job needs a share"];
             }
             try {
-                godwit_assert_job_direction(godwit_build_job_fs($job));
+                godwit_assert_job_direction(godwit_build_job_fs($job, $shareRoot), $shareRoot);
             } catch (\Throwable $e) {
                 return ['error' => "job \"{$job['name']}\": " . $e->getMessage()];
+            }
+            if ($type === 'share') {
+                $share = (string) $job['share'];
+                if (!is_dir(rtrim($shareRoot, '/') . '/' . $share)) {
+                    return ['error' => "job \"{$job['name']}\": share \"$share\" was not found under $shareRoot — is the array started?"];
+                }
             }
             if (!in_array($job['mode'] ?? 'sync', ['sync', 'copy'], true)) {
                 return ['error' => "job \"{$job['name']}\": mode must be sync or copy"];
             }
-            if (!in_array($job['type'] ?? 'share', ['share', 'selective'], true)) {
-                return ['error' => "job \"{$job['name']}\": type must be share or selective"];
-            }
-            if (($job['type'] ?? 'share') === 'selective') {
+            if ($type === 'selective') {
                 $selectiveError = godwit_validate_selective_job($job);
                 if ($selectiveError !== null) {
                     return ['error' => $selectiveError];
                 }
             }
         }
-        $overlapError = godwit_validate_job_destinations($jobs);
+        $nameCollisionError = godwit_validate_selective_job_name_collisions($jobs);
+        if ($nameCollisionError !== null) {
+            return ['error' => $nameCollisionError];
+        }
+        $overlapError = godwit_validate_job_destinations($jobs, $shareRoot);
         if ($overlapError !== null) {
             return ['error' => $overlapError];
         }
@@ -2686,8 +2861,13 @@ function godwit_handle_job_action(string $action, array $post, string $dbPath, s
         return ['ok' => true];
     }
 
+    if ($action === 'shares_list') {
+        $shares = array_map(fn ($s) => ['name' => $s, 'live' => godwit_share_is_live_data($s)], godwit_list_shares($shareRoot));
+        return ['shares' => $shares];
+    }
+
     if ($action === 'tree_list') {
-        return godwit_tree_list((string) ($post['share'] ?? ''), (string) ($post['path'] ?? ''));
+        return godwit_tree_list((string) ($post['share'] ?? ''), (string) ($post['path'] ?? ''), $shareRoot);
     }
 
     if ($action === 'tree_size') {
@@ -2704,7 +2884,7 @@ function godwit_handle_job_action(string $action, array $post, string $dbPath, s
         } catch (\Throwable $e) {
             return ['error' => 'state database unavailable'];
         }
-        return godwit_tree_node_size($db, (string) ($post['share'] ?? ''), (string) ($post['path'] ?? ''));
+        return godwit_tree_node_size($db, (string) ($post['share'] ?? ''), (string) ($post['path'] ?? ''), $shareRoot);
     }
 
     if ($action === 'run_now') {

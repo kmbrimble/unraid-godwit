@@ -6,21 +6,23 @@ Offsite backup for Unraid, built as a GUI over [rclone](https://rclone.org/).
 Named for the bar-tailed godwit, the bird that holds the record for the
 longest non-stop flight of any species and lands in Australia every year.
 
-**Status: Phase 4 shipped.** The plugin installs, runs a supervised daemon
-(`rc.godwit` / `godwitd`) that manages a single bundled `rclone rcd`, and
-Settings → Godwit can add, test, re-authorise and delete Google Drive and
-OneDrive remotes. Godwit backs up whole shares to Google Drive (one job per
-share, `sync` with `--backup-dir` versioning, or `copy`-only) and now also
-backs up hand-picked folders/files to OneDrive via a browsable, Unbalanced-
-style tri-state tree — both job types share the same rolling-24h upload
-budget, scheduled time windows with a speed limit, "Run now" override,
-version retention, and status page showing per-job and per-remote progress.
+**Status: Phase 4 shipped, plus v0.6.0.** The plugin installs, runs a
+supervised daemon (`rc.godwit` / `godwitd`) that manages a single bundled
+`rclone rcd`, and Settings → Godwit can add, test, re-authorise and delete
+Google Drive and OneDrive remotes. Godwit backs up whole shares to Google
+Drive (one job per share, `sync` with `--backup-dir` versioning, or
+`copy`-only) and also backs up hand-picked folders/files to OneDrive via a
+browsable, Unbalanced-style tri-state tree spanning every share from a
+single job — both job types share the same rolling-24h upload budget,
+scheduled time windows with a speed limit, "Run now" override, version
+retention, and status page showing per-job and per-remote progress.
 
 ## What it does
 
 - **Google Drive:** full backup of whole shares.
 - **OneDrive (personal):** selective backup of folders, subfolders or
-  individual files, picked from an Unbalanced-style tree.
+  individual files across any combination of shares, picked from a single
+  Unbalanced-style tree.
 - **Backup only.** Every job is a one-way `rclone sync` with `--backup-dir`
   versioning — deleted or overwritten files are kept, not lost. There is no
   two-way sync anywhere in this project.

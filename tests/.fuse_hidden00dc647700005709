@@ -2243,15 +2243,14 @@ t('godwit_handle_job_action jobs_save: rejects a selective job with no included 
 
 t('godwit_handle_job_action jobs_save: accepts a valid selective job and round-trips type/included/excluded', function () use ($repoRoot) {
     $cfgDir = sys_get_temp_dir() . '/godwit-cfg-' . bin2hex(random_bytes(4));
-    // v0.6.0 shape: no 'share' field, included/excluded already share-qualified.
-    $jobs = [['name' => 'Selective', 'remote' => 'kmonedrive', 'type' => 'selective', 'mode' => 'sync', 'included' => [['path' => 'Kieren/Documents', 'is_dir' => true]], 'excluded' => []]];
+    $jobs = [['name' => 'Selective', 'share' => 'Kieren', 'remote' => 'kmonedrive', 'type' => 'selective', 'mode' => 'sync', 'included' => [['path' => 'Documents', 'is_dir' => true]], 'excluded' => []]];
     $runDir = sys_get_temp_dir() . '/godwit-run-' . bin2hex(random_bytes(4));
     @mkdir($runDir, 0755, true);
     $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($jobs)], '/nonexistent.db', $runDir, $cfgDir);
     assert_true(($result['ok'] ?? false) === true, 'expected ok=true, got: ' . var_export($result, true));
     $saved = godwit_load_jobs($cfgDir);
     assert_eq('selective', $saved[0]['type'], 'type round-trips');
-    assert_eq('Kieren/Documents', $saved[0]['included'][0]['path'], 'included path round-trips');
+    assert_eq('Documents', $saved[0]['included'][0]['path'], 'included path round-trips');
     exec('rm -rf ' . escapeshellarg($cfgDir) . ' ' . escapeshellarg($runDir));
 });
 
@@ -3953,18 +3952,11 @@ function godwit_test_job_env(): array
     $tmp = sys_get_temp_dir() . '/godwit-jobaction-' . bin2hex(random_bytes(4));
     $runDir = $tmp . '/run';
     $cfgDir = $tmp . '/cfg';
-    $shareRoot = $tmp . '/shares';
     mkdir($runDir, 0700, true);
     mkdir($cfgDir, 0755, true);
-    // Every share name any test in this file saves a job against, so
-    // jobs_save's share-existence check (v0.6.0) has something real to
-    // find without depending on the actual host's /mnt/user.
-    foreach (['X', 'Kieren', 'Filing Cabinet', 'Teegan', 'Photos'] as $share) {
-        mkdir($shareRoot . '/' . $share, 0755, true);
-    }
     $dbPath = $tmp . '/godwit.db';
     godwit_open_db($dbPath);
-    return ['tmp' => $tmp, 'runDir' => $runDir, 'cfgDir' => $cfgDir, 'dbPath' => $dbPath, 'shareRoot' => $shareRoot];
+    return ['tmp' => $tmp, 'runDir' => $runDir, 'cfgDir' => $cfgDir, 'dbPath' => $dbPath];
 }
 
 t('godwit_handle_job_action: jobs_save rejects a job whose direction would be reversed', function () {
@@ -3973,7 +3965,7 @@ t('godwit_handle_job_action: jobs_save rejects a job whose direction would be re
     // Sanity: this job is actually fine on its own — the real test is an
     // overlap/mode failure path, since godwit_build_job_fs() already makes a
     // structurally-reversed pair unconstructable from jobs_save's input shape.
-    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($badJob)], $env['dbPath'], $env['runDir'], $env['cfgDir'], $env['shareRoot']);
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($badJob)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
     assert_true(($result['ok'] ?? false) === true, 'a well-formed job should save: ' . json_encode($result));
     exec('rm -rf ' . escapeshellarg($env['tmp']));
 });
@@ -3981,7 +3973,7 @@ t('godwit_handle_job_action: jobs_save rejects a job whose direction would be re
 t('godwit_handle_job_action: jobs_save rejects an invalid mode', function () {
     $env = godwit_test_job_env();
     $jobs = [['name' => 'X', 'share' => 'X', 'remote' => 'gdrive', 'mode' => 'mirror', 'enabled' => true]];
-    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($jobs)], $env['dbPath'], $env['runDir'], $env['cfgDir'], $env['shareRoot']);
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($jobs)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
     assert_true(str_contains($result['error'] ?? '', 'mode'), var_export($result, true));
     exec('rm -rf ' . escapeshellarg($env['tmp']));
 });
@@ -3992,11 +3984,11 @@ t('godwit_handle_job_action: jobs_save rejects overlapping destinations and touc
         ['name' => 'A', 'share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true],
         ['name' => 'B', 'share' => 'Kieren', 'remote' => 'gdrive', 'mode' => 'sync', 'enabled' => true],
     ];
-    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($overlapping)], $env['dbPath'], $env['runDir'], $env['cfgDir'], $env['shareRoot']);
+    $result = godwit_handle_job_action('jobs_save', ['jobs' => json_encode($overlapping)], $env['dbPath'], $env['runDir'], $env['cfgDir']);
     assert_true(str_contains($result['error'] ?? '', 'overlapping'), var_export($result, true));
     assert_true(!file_exists($env['runDir'] . '/jobs-changed'), 'a rejected save must not mark jobs changed');
 
-    $ok = godwit_handle_job_action('jobs_save', ['jobs' => json_encode(godwit_default_jobs())], $env['dbPath'], $env['runDir'], $env['cfgDir'], $env['shareRoot']);
+    $ok = godwit_handle_job_action('jobs_save', ['jobs' => json_encode(godwit_default_jobs())], $env['dbPath'], $env['runDir'], $env['cfgDir']);
     assert_true(($ok['ok'] ?? false) === true, var_export($ok, true));
     assert_true(file_exists($env['runDir'] . '/jobs-changed'), 'a successful save should mark jobs changed for godwitd to pick up');
     exec('rm -rf ' . escapeshellarg($env['tmp']));
@@ -4225,6 +4217,22 @@ t('godwit_validate_job_destinations: two selective jobs with the exact same name
     assert_true($errB !== null && str_contains($errB, 'overlapping'), 'same overlap must be caught regardless of array order: ' . var_export($errB, true));
 });
 
+t('godwit_validate_job_destinations: a share whose name happens to sit inside the selective namespace nests either way it is ordered', function () {
+    // godwit_build_job_fs() itself refuses to ever build a share job named
+    // "_selective" — this test proves the overlap guard is a real second
+    // line of defence, not decorative, by handing it two already-built raw
+    // job arrays directly (simulating a bug elsewhere that let a share
+    // named "_selective" through some other path).
+    $shareThenSelective = [
+        ['name' => 'Weird', 'type' => 'share', 'share' => '_selective', 'remote' => 'gdrive', 'enabled' => true],
+        ['name' => 'Sel', 'type' => 'selective', 'remote' => 'gdrive', 'enabled' => true],
+    ];
+    $err1 = godwit_validate_job_destinations($shareThenSelective);
+    assert_true($err1 !== null && str_contains($err1, 'overlapping'), 'share-first order must be caught: ' . var_export($err1, true));
+    $err2 = godwit_validate_job_destinations(array_reverse($shareThenSelective));
+    assert_true($err2 !== null && str_contains($err2, 'overlapping'), 'selective-first order must be caught: ' . var_export($err2, true));
+});
+
 t('godwit_validate_selective_job_name_collisions: rejects two selective jobs whose names sanitise to the same segment, case-insensitively, on the same remote', function () {
     $jobs = [
         ['name' => 'Photos', 'type' => 'selective', 'remote' => 'kmonedrive'],
@@ -4423,90 +4431,80 @@ t('godwit_compile_selective_filter_rules + rclone lsf -R: a job spanning two sha
     exec('rm -rf ' . escapeshellarg($tmp));
 });
 
-t('godwit_build_sync_params + rc sync/sync with a multi-share selective job: srcFs is the bare share root, dest nests <job>/<share>/<path>, sync never deletes destination content outside the filter', function () use ($repoRoot) {
+t('godwit_build_sync_params + rc sync/sync with a multi-share selective job: srcFs=/mnt/user-equivalent root, dest nests <job>/<share>/<path>, sync never deletes destination content outside the filter', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
         echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
         return;
     }
     $tmp = sys_get_temp_dir() . '/godwit-selective-e2e-' . bin2hex(random_bytes(4));
-    mkdir($tmp, 0755, true);
     exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
     $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
     assert_true(is_file($rclone), 'expected an unzipped rclone binary');
 
     $shareRoot = $tmp . '/mnt-user';
-    mkdir($shareRoot . '/Kieren/Documents', 0755, true);
+    @mkdir($shareRoot . '/Kieren/Documents', 0755, true);
     file_put_contents($shareRoot . '/Kieren/Documents/report.pdf', 'report-contents');
-    mkdir($shareRoot . '/Teegan/Homework', 0755, true);
+    @mkdir($shareRoot . '/Teegan/Homework', 0755, true);
     file_put_contents($shareRoot . '/Teegan/Homework/essay.docx', 'essay-contents');
-    mkdir($shareRoot . '/Teegan/Downloads', 0755, true); // never selected
+    @mkdir($shareRoot . '/Teegan/Downloads', 0755, true); // never selected
     file_put_contents($shareRoot . '/Teegan/Downloads/movie.mkv', 'movie-contents');
 
     $dstRoot = $tmp . '/dst';
+    @mkdir($dstRoot, 0755, true);
     // Pre-existing file outside the job's dest tree — sync must never touch it.
-    mkdir($dstRoot . '/untouched', 0755, true);
+    @mkdir($dstRoot . '/untouched', 0755, true);
     file_put_contents($dstRoot . '/untouched/keepme.txt', 'must survive');
 
-    $confPath = $tmp . '/rclone.conf';
-    file_put_contents($confPath, "[localdst]\ntype = local\n");
-    $sockPath = $tmp . '/rcd.sock';
-    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
-    $proc = proc_open(
-        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
-        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
-        $pipes,
-        null,
-        array_merge(getenv(), godwit_rcd_env($listener))
-    );
-    fclose($pipes[0]);
-    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
-        usleep(100000);
-    }
-    assert_true(file_exists($sockPath), 'rcd did not create its unix socket in time');
+    $configDir = $tmp . '/rclone-config';
+    @mkdir($configDir, 0755, true);
+    $rcUser = 'u' . bin2hex(random_bytes(4));
+    $rcPass = 'p' . bin2hex(random_bytes(4));
+    $port = 22000 + random_int(0, 3000);
+    $cmd = escapeshellarg($rclone) . ' rcd --rc-addr=127.0.0.1:' . $port . ' --config ' . escapeshellarg($configDir . '/rclone.conf') . ' > ' . escapeshellarg($tmp . '/rcd.log') . ' 2>&1 &';
+    putenv('RCLONE_RC_USER=' . $rcUser);
+    putenv('RCLONE_RC_PASS=' . $rcPass);
+    exec('RCLONE_RC_USER=' . escapeshellarg($rcUser) . ' RCLONE_RC_PASS=' . escapeshellarg($rcPass) . ' ' . $cmd);
+    usleep(700000);
+    $listener = ['url' => 'http://127.0.0.1:' . $port . '/', 'user' => $rcUser, 'pass' => $rcPass];
 
-    try {
-        $job = [
-            'name' => 'Cross-Share Picks', 'type' => 'selective', 'remote' => 'localdst', 'mode' => 'sync', 'transfers' => 2, 'max_delete' => 1000,
-            'included' => [
-                ['path' => 'Kieren/Documents', 'is_dir' => true],
-                ['path' => 'Teegan/Homework', 'is_dir' => true],
-            ],
-            'excluded' => [],
-        ];
-        $fs = godwit_build_job_fs($job, $shareRoot);
-        assert_eq($shareRoot, $fs['srcFs'], 'srcFs is the bare share root, not a single share');
-        assert_eq('localdst:godwit/_selective/Cross-Share Picks', $fs['dstFs'], 'dstFs nests under _selective/<job name>');
-        $fs['dstFs'] = 'localdst:' . $dstRoot . '/godwit/_selective/Cross-Share Picks';
+    $job = [
+        'name' => 'Cross-Share Picks', 'type' => 'selective', 'remote' => 'local', 'mode' => 'sync',
+        'included' => [
+            ['path' => 'Kieren/Documents', 'is_dir' => true],
+            ['path' => 'Teegan/Homework', 'is_dir' => true],
+        ],
+        'excluded' => [],
+    ];
+    $fs = godwit_build_job_fs($job, $shareRoot);
+    assert_eq($shareRoot, $fs['srcFs'], 'srcFs is the fake share root');
+    $localDst = ['srcFs' => $fs['srcFs'], 'dstFs' => $dstRoot . '/godwit/_selective/Cross-Share Picks'];
 
-        $filterFile = $tmp . '/filter.txt';
-        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
-        $params = godwit_build_sync_params($job, $fs, $filterFile, GODWIT_BUDGET_UNLIMITED, null, null, false, $shareRoot);
+    $filterFile = $tmp . '/filter.txt';
+    godwit_write_filter_file($filterFile, godwit_compile_selective_filter_rules($job));
 
-        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
-        assert_true(isset($resp['jobid']), 'expected a jobid back from sync/sync: ' . json_encode($resp));
+    $call = function (array $listener, string $path, array $params, int $timeoutSeconds) {
+        return godwit_rc_call_params($listener, $path, $params, $timeoutSeconds);
+    };
+    $params = [
+        '_config' => json_encode(['Transfers' => 4, 'MaxDelete' => 1000, 'CutoffMode' => 'CAUTIOUS', 'NoUpdateDirModTime' => true]),
+        '_filter' => json_encode(['FilterFrom' => [$filterFile]]),
+        'srcFs' => $localDst['srcFs'],
+        'dstFs' => $localDst['dstFs'],
+    ];
+    $resp = $call($listener, 'sync/sync', $params, 30);
+    assert_true(!isset($resp['error']), 'sync should succeed: ' . json_encode($resp));
 
-        $status = null;
-        for ($i = 0; $i < 50; $i++) {
-            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $resp['jobid']], 15);
-            if (!empty($status['finished'])) {
-                break;
-            }
-            usleep(100000);
-        }
-        assert_true($status !== null && !empty($status['finished']), 'job should finish within 5s: ' . json_encode($status));
-        assert_eq('', trim((string) ($status['error'] ?? '')), 'a plain cross-share selective sync should not error: ' . json_encode($status));
+    $listed = [];
+    exec('find ' . escapeshellarg($dstRoot . '/godwit/_selective/Cross-Share Picks') . ' -type f 2>/dev/null', $listed);
+    $listedStr = implode("\n", $listed);
+    assert_true(str_contains($listedStr, 'Kieren/Documents/report.pdf'), "expected Kieren's file at the share-qualified path, got:\n$listedStr");
+    assert_true(str_contains($listedStr, 'Teegan/Homework/essay.docx'), "expected Teegan's file at the share-qualified path, got:\n$listedStr");
+    assert_true(!str_contains($listedStr, 'movie.mkv'), "the unselected Downloads file must not have synced, got:\n$listedStr");
+    assert_true(is_file($dstRoot . '/untouched/keepme.txt'), 'sync must never touch content outside its own dest tree');
 
-        $destBase = $dstRoot . '/godwit/_selective/Cross-Share Picks';
-        assert_true(is_file($destBase . '/Kieren/Documents/report.pdf'), 'Kieren\'s file must land at its share-qualified path under the job\'s own dest root');
-        assert_true(is_file($destBase . '/Teegan/Homework/essay.docx'), 'Teegan\'s file must land at its share-qualified path under the same dest root — one job, two shares');
-        assert_true(!file_exists($destBase . '/Teegan/Downloads'), 'the never-selected Downloads folder must never reach the destination');
-        assert_true(is_file($dstRoot . '/untouched/keepme.txt'), 'sync must never touch content outside its own dest tree');
-    } finally {
-        proc_terminate($proc);
-        proc_close($proc);
-        exec('rm -rf ' . escapeshellarg($tmp));
-    }
+    exec('pkill -f ' . escapeshellarg($rclone . ' rcd --rc-addr=127.0.0.1:' . $port) . ' 2>/dev/null');
+    exec('rm -rf ' . escapeshellarg($tmp) . ' ' . escapeshellarg($dstRoot));
 });
 
 // --- report ---------------------------------------------------------------
