@@ -101,14 +101,34 @@ sort *before* `1.0.9`.
 
 ### Review
 
-Two rounds of `code-diff-reviewer` (6 passes each, unattended MID band —
-escalation score 8: exposure 1, authority 1, data 1, reversibility 1,
-test gap 2, pattern divergence 0, module spread 1). Round 1: 6× `NO
-FINDINGS` (a known failure mode of that reviewer, not evidence of
-correctness on its own) — `advisor` read the diff directly instead and
-found 2 real blocking issues (the mkdir-wrong-path and glob-escaping bugs
-above) plus several should-fix/non-blocking items, all addressed before
-merge. Round 2 (on the fix commit) verified the fixes.
+Escalation score 8 (unattended MID band: exposure 1, authority 1, data 1,
+reversibility 1, test gap 2, pattern divergence 0, module spread 1) → 6
+`code-diff-reviewer` passes, then `advisor`. All 6 were `NO FINDINGS` (a
+known failure mode of that reviewer, not evidence of correctness on its
+own) — `advisor` read the diff directly instead and found 2 real
+blocking issues (the mkdir-wrong-path and glob-escaping bugs above) plus
+several should-fix/non-blocking items, all addressed in a second commit.
+That fix commit then went through a separate focused 3-pass
+`code-diff-reviewer` round (3× `NO FINDINGS`) followed by a second
+`advisor` call, which found two further real issues before this could
+ship: `godwit.plg`'s own `<CHANGES>` entry (what the Plugins tab shows)
+still described the reverted health-check mkdir instead of the actual
+retention-purge fix, and — the more serious one — a remote with no
+`settings.budget_caps` entry (OneDrive by default) resolves to
+`PHP_INT_MAX` as its cap, and that value had never actually reached
+`godwit_build_sync_params()` end-to-end: sending `PHP_INT_MAX` as
+`MaxTransfer` relies on rclone's own JSON→float64→int64 round-trip
+handling a value that isn't exactly representable as a float64, which is
+not something to ship a flagship feature's upload path on without
+verifying. Fixed by never sending it: `GODWIT_BUDGET_UNLIMITED` is a
+named sentinel `godwit_remaining_budget()` now returns unchanged (not
+cap-minus-used) for an unlimited cap, and `godwit_build_sync_params()`
+omits the `MaxTransfer` key entirely when it sees the sentinel — rclone's
+own default with no `MaxTransfer` set is already "no limit". Proven
+end-to-end against a real rcd process (not just a unit test asserting
+the key is absent) via the same selective-job `sync/sync` fixture used
+for the data-safety proof above, now run with the sentinel instead of a
+plain byte count.
 
 ### Not verified this release
 
@@ -118,22 +138,36 @@ user's explicit instruction not to install, and not to restart godwitd
 or rcd, so tonight's first live exercise of the v0.4.4 budget fix isn't
 confounded by a large new feature landing at the same time. In
 particular: no real OneDrive upload of a selective job (the sync/sync
-data-safety claim above is proven against a real rcd with a local
-backend, exactly like every other Phase 3 e2e test, not against
-`kmonedrive`), no live browser click-through of the new tree dialog,
-Add-job dialog or budget-bar "unlimited" wording. Known, deliberately
-deferred UI gaps (not correctness bugs): a folder with some but not all
-children ticked renders as a plain checked checkbox, not an
-indeterminate one (`cb.indeterminate = true` is a one-line follow-up);
-a checkbox for a node nested under an excluded folder is visually
-clickable but is a no-op (the two-list include/exclude model can't
-express deeper re-inclusion, documented on `godwitTreeToggle()`'s own
-comment) rather than being disabled. `godwit_du_bytes()` has no shell
-timeout (`ponytail:` comment in `lib.php` names the upgrade path) — a
-`du` against a huge cold share could in principle outlast the web
-request, leaving that one click's size uncached; the result is cached
-once it does succeed, so this is a one-off click cost, not a recurring
-one.
+data-safety and unlimited-sentinel claims above are proven against a
+real rcd with a local backend, exactly like every other Phase 3 e2e
+test, not against `kmonedrive` itself), no live browser click-through of
+the new tree dialog, Add-job dialog or budget-bar "unlimited" wording.
+
+**One fact needs the user's own confirmation, not this session's
+guess**: the "directory not found" log noise this release's retention-
+purge fix targets. This repo's *only* `operations/list` caller is the
+daily retention purge, over enabled jobs — today that's all four gdrive
+jobs, so the four log lines are almost certainly
+`gdrive:godwit/_versions/{Filing Cabinet,Kieren,Teegan,Photos}` (absent
+until each share's first versioned overwrite), not `kmonedrive:godwit`
+as originally described handing this phase off. Please check the exact
+`fs=` in `rcd.log` after installing — if it really does say
+`kmonedrive`, this fix's mkdir call won't silence it, since nothing in
+this repo lists a bare `<remote>:godwit` path, and the actual cause
+would need tracing on the host, not guessed at from here.
+
+Known, deliberately deferred UI gaps (not correctness bugs): a folder
+with some but not all children ticked renders as a plain checked
+checkbox, not an indeterminate one (`cb.indeterminate = true` is a
+one-line follow-up); a checkbox for a node nested under an excluded
+folder is visually clickable but is a no-op (the two-list
+include/exclude model can't express deeper re-inclusion, documented on
+`godwitTreeToggle()`'s own comment) rather than being disabled.
+`godwit_du_bytes()` has no shell timeout (`ponytail:` comment in
+`lib.php` names the upgrade path) — a `du` against a huge cold share
+could in principle outlast the web request, leaving that one click's
+size uncached; the result is cached once it does succeed, so this is a
+one-off click cost, not a recurring one.
 
 ## [0.4.4] - 2026-09-18
 

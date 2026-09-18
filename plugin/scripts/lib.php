@@ -1520,7 +1520,12 @@ function godwit_tree_node_size(SQLite3 $db, string $share, string $relPath, stri
 /** A single tree-selection node ({path, is_dir}) validated and normalised (no leading/trailing slash), or null if it's not shaped like a safe relative path — no traversal, no empty segments. */
 function godwit_validate_tree_node($node): ?string
 {
-    if (!is_array($node) || !isset($node['path']) || !is_string($node['path'])) {
+    // is_dir must be a real bool, not just missing/truthy-ish — a node
+    // that defaults to "dir" when it was actually a file would compile to
+    // "+ /path/**" (matches nothing under a plain file) instead of
+    // "+ /path", silently backing up nothing for that selection. The JS
+    // client always sends it explicitly; this is the POST trust boundary.
+    if (!is_array($node) || !isset($node['path']) || !is_string($node['path']) || !isset($node['is_dir']) || !is_bool($node['is_dir'])) {
         return null;
     }
     $path = trim($node['path'], '/');
@@ -1664,10 +1669,17 @@ function godwit_build_sync_params(array $job, array $fs, string $filterFile, int
         'Transfers' => (int) ($job['transfers'] ?? 4),
         'MaxDelete' => (int) ($job['max_delete'] ?? 1000),
         'CutoffMode' => 'CAUTIOUS',
-        'MaxTransfer' => $maxTransferBytes,
         'DryRun' => $dryRun,
         'NoUpdateDirModTime' => true,
     ];
+    // GODWIT_BUDGET_UNLIMITED (an unconfigured remote's cap, e.g. OneDrive
+    // by default) must never be sent to rcd as MaxTransfer — see the
+    // constant's own docblock for why. rclone's own default with no
+    // MaxTransfer set is already "no limit", so omitting the key is
+    // exactly the behaviour "unlimited" needs.
+    if ($maxTransferBytes !== GODWIT_BUDGET_UNLIMITED) {
+        $config['MaxTransfer'] = $maxTransferBytes;
+    }
     if ($backupDirFs !== null) {
         $config['BackupDir'] = $backupDirFs;
     }
@@ -1995,20 +2007,34 @@ function godwit_default_budget_cap_bytes(): int
 }
 
 /**
+ * Sentinel for "no daily cap configured" (PLAN.md §4.3: OneDrive's budget
+ * is off by default). Never send this value to rcd as a byte count —
+ * rclone applies `_config` through a JSON round-trip via a Go
+ * interface{}/float64, and PHP_INT_MAX (2^63-1) isn't exactly
+ * representable as a float64; what Go does with the resulting overflow
+ * back into an int64 SizeSuffix is not something to guess at for an
+ * upload path. Every caller that reaches rcd (godwit_build_sync_params())
+ * must check for this sentinel and omit the MaxTransfer key entirely
+ * instead — rclone's own default with no MaxTransfer set is already "no
+ * limit".
+ */
+const GODWIT_BUDGET_UNLIMITED = PHP_INT_MAX;
+
+/**
  * The budget cap that applies to $remote: whatever's explicitly configured
  * in settings.budget_caps, or — if unconfigured — the D12 700 GiB default
  * for "gdrive" specifically (the Google daily-quota risk that default
- * exists for), and effectively unlimited (PHP_INT_MAX) for any other
- * remote. PLAN.md §4.3: "OneDrive: budget off by default (none
- * documented), configurable if throttling ever warrants it" — before this
- * (Phase 3), every remote silently inherited gdrive's 700 GiB cap.
+ * exists for), and GODWIT_BUDGET_UNLIMITED for any other remote. PLAN.md
+ * §4.3: "OneDrive: budget off by default (none documented), configurable
+ * if throttling ever warrants it" — before this (Phase 3), every remote
+ * silently inherited gdrive's 700 GiB cap.
  */
 function godwit_budget_cap_bytes(string $remote, array $settings): int
 {
     if (isset($settings['budget_caps'][$remote])) {
         return (int) $settings['budget_caps'][$remote];
     }
-    return $remote === 'gdrive' ? godwit_default_budget_cap_bytes() : PHP_INT_MAX;
+    return $remote === 'gdrive' ? godwit_default_budget_cap_bytes() : GODWIT_BUDGET_UNLIMITED;
 }
 
 function godwit_open_budget_table(SQLite3 $db): void
@@ -2052,8 +2078,12 @@ function godwit_trim_ledger(SQLite3 $db, int $now, int $retainSeconds = 90000): 
     $stmt->execute();
 }
 
+/** Remaining budget for a remote's cap. The unlimited sentinel is returned unchanged — not cap-minus-used — so "unlimited" stays recognisable all the way down to godwit_build_sync_params(), which must omit MaxTransfer entirely for it rather than ever sending the sentinel to rcd. */
 function godwit_remaining_budget(int $capBytes, int $usedBytes): int
 {
+    if ($capBytes === GODWIT_BUDGET_UNLIMITED) {
+        return GODWIT_BUDGET_UNLIMITED;
+    }
     return max(0, $capBytes - $usedBytes);
 }
 
@@ -2332,12 +2362,10 @@ function godwit_default_retention_days(): int
  * Creates $fs (a full "<remote>:godwit/_versions/<share>" path) ahead of
  * the retention-purge listing, so a share that's never had a versioned
  * overwrite doesn't make rclone log its own "directory not found" against
- * that path on every retention tick (found live: a brand-new remote with
- * no versions yet generated this on every godwitd restart). operations/mkdir
- * is a no-op when the directory already exists. This targets the exact
- * path godwit_list_versions_dirs() is about to list — earlier code mkdir'd
- * <remote>:godwit instead, one level too shallow to actually silence the
- * "directory not found" the retention loop's own operations/list produces.
+ * that path on every retention tick. operations/mkdir is a no-op when the
+ * directory already exists, and creates every missing intermediate
+ * directory (including "godwit" itself for a brand-new remote), not just
+ * the final path component.
  */
 function godwit_ensure_versions_dir(array $listener, string $fs, ?callable $call = null): void
 {

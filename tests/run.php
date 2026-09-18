@@ -2165,7 +2165,13 @@ t('godwit_build_sync_params + rc sync/sync with a selective job: only the ticked
         $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
         $filterFile = $tmp . '/filter.txt';
         godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
-        $params = godwit_build_sync_params($job, $fs, $filterFile, 10_000_000, null, null, false, $shareRoot);
+        // GODWIT_BUDGET_UNLIMITED (OneDrive's default — no configured daily
+        // cap) rather than a plain byte count: proves both the data-safety
+        // claim below AND that the sentinel never reaches rcd as MaxTransfer
+        // (the value that isn't safely representable in rclone's own
+        // JSON->float64->int64 config round-trip) in one real rc call.
+        $params = godwit_build_sync_params($job, $fs, $filterFile, GODWIT_BUDGET_UNLIMITED, null, null, false, $shareRoot);
+        assert_true(!str_contains($params['_config'], 'MaxTransfer'), 'the unlimited sentinel must never be sent to rcd as MaxTransfer: ' . $params['_config']);
 
         $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
         assert_true(isset($resp['jobid']), 'expected a jobid back from sync/sync: ' . json_encode($resp));
@@ -2211,6 +2217,18 @@ t('godwit_validate_selective_job: rejects an excluded path with no included ance
 
 t('godwit_validate_selective_job: rejects path traversal in an included entry', function () {
     $job = ['name' => 'x', 'included' => [['path' => '../etc/passwd', 'is_dir' => false]]];
+    $err = godwit_validate_selective_job($job);
+    assert_true($err !== null && str_contains($err, 'invalid included path'), 'expected an error, got: ' . var_export($err, true));
+});
+
+t('godwit_validate_selective_job: rejects an included entry missing is_dir — a silently-defaulted type would compile a file selection to a dead filter rule', function () {
+    $job = ['name' => 'x', 'included' => [['path' => 'Documents/report.pdf']]];
+    $err = godwit_validate_selective_job($job);
+    assert_true($err !== null && str_contains($err, 'invalid included path'), 'expected an error, got: ' . var_export($err, true));
+});
+
+t('godwit_validate_selective_job: rejects an included entry whose is_dir is not a real bool', function () {
+    $job = ['name' => 'x', 'included' => [['path' => 'Documents', 'is_dir' => 'true']]];
     $err = godwit_validate_selective_job($job);
     assert_true($err !== null && str_contains($err, 'invalid included path'), 'expected an error, got: ' . var_export($err, true));
 });
@@ -2347,6 +2365,35 @@ t('godwit_budget_cap_bytes: an explicit setting always wins, for any remote', fu
     $settings = ['budget_caps' => ['gdrive' => 123, 'kmonedrive' => 456]];
     assert_eq(123, godwit_budget_cap_bytes('gdrive', $settings), 'explicit gdrive override wins');
     assert_eq(456, godwit_budget_cap_bytes('kmonedrive', $settings), 'explicit kmonedrive override wins');
+});
+
+t('GODWIT_BUDGET_UNLIMITED: is exactly PHP_INT_MAX, and is what an unconfigured non-gdrive remote returns', function () {
+    assert_eq(PHP_INT_MAX, GODWIT_BUDGET_UNLIMITED, 'sentinel value');
+    assert_eq(GODWIT_BUDGET_UNLIMITED, godwit_budget_cap_bytes('kmonedrive', []), 'godwit_budget_cap_bytes must return the sentinel itself, not just a PHP_INT_MAX-valued int');
+});
+
+t('godwit_remaining_budget: the unlimited sentinel is returned unchanged, never cap-minus-used', function () {
+    assert_eq(GODWIT_BUDGET_UNLIMITED, godwit_remaining_budget(GODWIT_BUDGET_UNLIMITED, 5_000_000_000), 'must stay the exact sentinel, not PHP_INT_MAX minus used bytes');
+});
+
+t('godwit_remaining_budget: an ordinary cap is unaffected by the sentinel special-case', function () {
+    assert_eq(50, godwit_remaining_budget(100, 50), 'plain subtraction still works');
+});
+
+t('godwit_build_sync_params: omits MaxTransfer entirely for the unlimited sentinel, never sends PHP_INT_MAX to rcd', function () {
+    $job = ['transfers' => 4, 'max_delete' => 1000];
+    $fs = ['srcFs' => '/mnt/user/Share', 'dstFs' => 'onedrive:godwit/Share'];
+    $params = godwit_build_sync_params($job, $fs, '/tmp/filter.txt', GODWIT_BUDGET_UNLIMITED, null, null);
+    $config = json_decode($params['_config'], true);
+    assert_true(!array_key_exists('MaxTransfer', $config), 'MaxTransfer must be entirely absent, not set to the sentinel: ' . $params['_config']);
+});
+
+t('godwit_build_sync_params: an ordinary byte count still sets MaxTransfer as before', function () {
+    $job = ['transfers' => 4, 'max_delete' => 1000];
+    $fs = ['srcFs' => '/mnt/user/Share', 'dstFs' => 'gdrive:godwit/Share'];
+    $params = godwit_build_sync_params($job, $fs, '/tmp/filter.txt', 5_000_000, null, null);
+    $config = json_decode($params['_config'], true);
+    assert_eq(5_000_000, $config['MaxTransfer'] ?? null, 'a real budget must still be sent');
 });
 
 // --- Budget ledger maths --------------------------------------------------
@@ -3760,6 +3807,21 @@ t('godwit_list_versions_dirs: end-to-end against a real rcd — lists real date 
         assert_eq([], $afterMkdir['dirs'], 'freshly created dir is empty');
         assert_true(!($afterMkdir['absent'] ?? false), 'no longer absent once created');
         assert_true(!isset($afterMkdir['error']), 'must not be an error: ' . json_encode($afterMkdir));
+
+        // The case that actually matters live (a just-added remote with NO
+        // "godwit" folder at all yet, not merely a missing leaf under an
+        // existing "godwit/_versions/"): a completely fresh root under
+        // $tmp, so mkdir must create every intermediate directory, not just
+        // the final path component.
+        $neverExisted = $tmp . '/never-existed-root';
+        mkdir($neverExisted, 0755, true);
+        assert_true(!is_dir($neverExisted . '/godwit'), 'sanity: no "godwit" dir must exist yet under this fresh root');
+        $neverExistedFs = 'localdst:' . $neverExisted . '/godwit/_versions/BrandNewShare';
+        godwit_ensure_versions_dir($listener, $neverExistedFs);
+        assert_true(is_dir($neverExisted . '/godwit/_versions/BrandNewShare'), 'operations/mkdir must create every missing intermediate directory, not just the leaf, against a remote with no "godwit" folder at all yet');
+        $neverExistedResult = godwit_list_versions_dirs($listener, $neverExistedFs);
+        assert_eq([], $neverExistedResult['dirs'], 'freshly created dir is empty');
+        assert_true(!isset($neverExistedResult['error']), 'must not be an error: ' . json_encode($neverExistedResult));
 
         // Idempotent: mkdir-ing an already-populated dir must not disturb it.
         godwit_ensure_versions_dir($listener, 'localdst:' . $root . '/godwit/_versions/Kieren');

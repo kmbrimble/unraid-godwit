@@ -20,12 +20,14 @@
   hand-pick individual folders/files from a share via a browsable
   tri-state tree (Add job → Browse…), instead of backing up the whole
   share — compiled to an rclone filter file the same way share jobs
-  compile their excludes. On-demand, cached folder/file size estimates
-  (no full-tree walk). A selected file over OneDrive's 250 GiB per-file
-  limit is flagged. Every remote's base "godwit" folder is now created
-  proactively after a healthy check, so a brand-new remote no longer logs
-  "directory not found" noise before its first backup. OneDrive's daily
-  upload budget is now unlimited by default (previously silently
+  compile their excludes, with real folder/file names safely escaped
+  against rclone's glob syntax. On-demand, cached folder/file size
+  estimates (no full-tree walk), shown against the target remote's free
+  space. A selected file over OneDrive's 250 GiB per-file limit is
+  flagged. The daily version-retention purge now creates its own target
+  directory before listing it, so a share/remote with no versions yet no
+  longer logs "directory not found" noise on every restart. OneDrive's
+  daily upload budget is now unlimited by default (previously silently
   inherited Google Drive's 700 GiB cap) — configurable the same way as
   Google's, per PLAN.md.
 ###0.4.4

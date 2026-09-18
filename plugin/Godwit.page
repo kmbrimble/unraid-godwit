@@ -945,6 +945,11 @@ function godwitJobsSave() {
     godwitRunAction('jobs_save', { jobs: JSON.stringify(jobs) }, btn, 'Saving…', function (data) {
         if (data.error) { godwitShowJobsMessage(godwitErrorHtml(data.error)); return; }
         godwitPendingNewJobs = [];
+        // A saved job's type/included/excluded are now the server's own
+        // truth — clear this tab's overrides so the next poll re-seeds
+        // from data.jobs instead of this tab's memory silently overriding
+        // the server (and every other tab/session) indefinitely.
+        godwitJobSelections = {};
         godwitShowJobsMessage('<p style="color:green">Jobs saved.</p>');
     }, godwitShowJobsMessage, godwitJobsRefresh);
 }

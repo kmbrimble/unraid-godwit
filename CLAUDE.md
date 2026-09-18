@@ -635,24 +635,25 @@ exercise of the v0.4.4 budget fix.
   `settings.budget_caps` configures one — PLAN.md §4.3 says OneDrive's
   budget should be off by default. The budget bar now shows "no daily cap
   configured" instead of a meaningless "744.5 MiB / 8.0 EiB (0.0%)".
-- **Retention-purge log noise fix, corrected mid-review (see below).** A
-  brand-new remote with jobs on it logged `operations/list: directory not
-  found` on every godwitd restart, from the daily retention purge listing
-  a `godwit/_versions/<share>` path that had never been created (harmless
+- **Retention-purge log noise fix, corrected mid-review (see below).**
+  The daily retention purge logged `operations/list: directory not
+  found` noise on every godwitd restart from listing a
+  `godwit/_versions/<share>` path that had never been created (harmless
   — already handled as "absent", not an error — but needless noise). The
   retention loop now `operations/mkdir`s that exact path immediately
-  before listing it.
-- **Review: two rounds of `code-diff-reviewer` (6 passes each, unattended
-  MID band, escalation score 8).** Round 1 was 6× `NO FINDINGS` — a known
-  failure mode of that reviewer per its own skill doc, not evidence of
-  clean code — so `advisor` read the diff directly and found 2 real
-  blocking issues, both fixed before merge: (1) the first version of the
-  log-noise fix mkdir'd `<remote>:godwit` from inside
-  `godwit_run_health_check()` — one directory level too shallow to touch
-  the path that actually produces the log line (the retention loop's own
-  `operations/list` on `_versions/<share>`, not the health check), and
-  reached from the page's "Test connection" action, silently turning a
-  documented never-mutates health check into a write; (2)
+  before listing it, once a day, only for enabled jobs.
+- **Review: 6 `code-diff-reviewer` passes (unattended MID band,
+  escalation score 8), then `advisor`, then a focused 3-pass round on the
+  fix commit, then `advisor` again.** All 6 first-round passes were `NO
+  FINDINGS` — a known failure mode of that reviewer per its own skill
+  doc, not evidence of clean code — so `advisor` read the diff directly
+  and found 2 real blocking issues, fixed in a second commit: (1) the
+  first version of the log-noise fix mkdir'd `<remote>:godwit` from
+  inside `godwit_run_health_check()` — one directory level too shallow to
+  touch the path that actually produces the log line (the retention
+  loop's own `operations/list` on `_versions/<share>`, not the health
+  check), and reached from the page's "Test connection" action, silently
+  turning a documented never-mutates health check into a write; (2)
   `godwit_tree_node_filter_line()` didn't escape rclone glob
   metacharacters, so a folder literally named `Photos [RAW]` would have
   compiled to a character-class glob and silently skipped the real
@@ -665,28 +666,57 @@ exercise of the v0.4.4 budget fix.
   red, all now green); no real `sync/sync` e2e for a selective job
   (added, described above); root `README.md` hadn't been updated
   alongside `plugin/README.md` (fixed); PLAN.md §4.4's free-space display
-  was initially missing (added). Round 2 (on the fix commit) was clean.
-- Verified offline: 287/287 (`php tests/run.php`, `build/` populated and
+  was initially missing (added). The 3-pass focused round on that fix
+  commit was 3× `NO FINDINGS`, and a second `advisor` call still found
+  two more real issues: `godwit.plg`'s own `<CHANGES>` entry (the text
+  the Plugins tab shows) still described the reverted health-check
+  mkdir, not the actual retention-purge fix (fixed); and OneDrive's
+  unlimited budget cap (`PHP_INT_MAX`) had never actually reached
+  `godwit_build_sync_params()` — sending it as `MaxTransfer` relies on
+  rclone's own JSON→float64→int64 round-trip handling a value that
+  is not exactly representable as a float64, not something to ship
+  without verifying. Fixed with a named `GODWIT_BUDGET_UNLIMITED`
+  sentinel: `godwit_remaining_budget()` returns it unchanged (never
+  cap-minus-used) and `godwit_build_sync_params()` omits the
+  `MaxTransfer` key entirely when it sees the sentinel — rclone's own
+  default with no `MaxTransfer` set is already "no limit" — proven
+  end-to-end against a real rcd via the same selective-job `sync/sync`
+  fixture already used for the data-safety proof, now run with the
+  sentinel instead of a plain byte count.
+- Verified offline: 294/294 (`php tests/run.php`, `build/` populated and
   confirmed present, 0 `skipped --` lines) plus 19/19 Node checks
   (`node tests/windows_form_test.mjs`, extended with the tri-state
   toggle logic's own tests via a new `GODWIT_TREE_BEGIN`/`END` marker
   pair, same pattern as the existing windows-form extraction).
 
+**One fact needs the user's own confirmation, not a guess made from this
+repo**: the "directory not found" noise this phase's retention-purge fix
+targets. This repo's only `operations/list` caller is the daily
+retention purge, over enabled jobs — today that's all four gdrive jobs,
+so the four log lines this phase started from are almost certainly
+`gdrive:godwit/_versions/{Filing Cabinet,Kieren,Teegan,Photos}` (each
+absent until that share's first versioned overwrite), not
+`kmonedrive:godwit`. Please check the real `fs=` in `rcd.log` after
+installing — if it truly is `kmonedrive`, this fix's mkdir call will not
+silence it, since nothing in this repo lists a bare `<remote>:godwit`
+path, and the actual source lives outside what this session could see.
+
 **Not verified this release**: nothing against the live host — no
 install, no daemon/rcd restart, no mutating rc call, per the user's
 explicit instruction (they are verifying v0.4.4's live budget fix
 tonight and didn't want a large new feature confounding it). No real
-OneDrive upload of a selective job (the sync/sync data-safety claim
-above is proven against a real rcd with a local backend, exactly like
-every other Phase 3 e2e test, not against `kmonedrive` itself), and no
-live browser click-through of the tree dialog, Add-job dialog or the new
-budget-bar wording. Two deliberately deferred UI gaps, not correctness
-bugs: a folder with some but not all children ticked renders as a plain
-checked checkbox, not an indeterminate one; a checkbox for a node nested
-under an excluded folder is visually clickable but is a documented no-op
-rather than being disabled. `godwit_du_bytes()` has no shell timeout
-(`ponytail:` comment names the upgrade path) — a `du` against a huge,
-cold share could in principle outlast the web request, leaving that
+OneDrive upload of a selective job (the sync/sync data-safety and
+unlimited-sentinel claims above are proven against a real rcd with a
+local backend, exactly like every other Phase 3 e2e test, not against
+`kmonedrive` itself), and no live browser click-through of the tree
+dialog, Add-job dialog or the new budget-bar wording. Two deliberately
+deferred UI gaps, not correctness bugs: a folder with some but not all
+children ticked renders as a plain checked checkbox, not an
+indeterminate one; a checkbox for a node nested under an excluded folder
+is visually clickable but is a documented no-op rather than being
+disabled. `godwit_du_bytes()` has no shell timeout (`ponytail:` comment
+names the upgrade path) — a `du` against a huge, cold share could in
+principle outlast the web request, leaving that
 click's size uncached; the result is cached once it does succeed, so
 this is a one-off cost, not a recurring one.
 
