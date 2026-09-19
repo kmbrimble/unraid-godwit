@@ -4541,6 +4541,148 @@ t('godwit_build_sync_params + rc sync/sync with a multi-share selective job: src
     }
 });
 
+// --- v0.6.1: a third masking shape — context-canceled march errors from a
+// near-zero-remaining-budget cutoff ------------------------------------
+
+t('godwit_is_context_canceled_cutoff_artifact: detects the march-failure text a tiny-MaxTransfer cutoff produces', function () {
+    assert_true(godwit_is_context_canceled_cutoff_artifact('march failed with 3 error(s): first error: context canceled'), 'the exact live-incident text must match');
+    assert_true(godwit_is_context_canceled_cutoff_artifact('context canceled'), 'the bare phrase must match');
+    assert_true(!godwit_is_context_canceled_cutoff_artifact('open /dst/badfile: is a directory'), 'an unrelated real error must not match');
+});
+
+t('godwit_classify_job_outcome: a context-canceled march failure with a MaxTransfer configured classifies as budget, even at 0 bytes transferred (2026-09-19 incident: 606KB remaining budget, cutoff fired before any file could fit)', function () {
+    $errorMsg = 'march failed with 7 error(s): first error: context canceled';
+    assert_eq('budget', godwit_classify_job_outcome($errorMsg, false, 0, 600), 'bytes (0) is nowhere near MaxTransfer (600) — the 2% proximity fallback alone cannot catch this, the text signal must');
+});
+
+t('godwit_classify_job_outcome: the same context-canceled text with no MaxTransfer configured (an unlimited remote) is NOT reclassified as budget', function () {
+    $errorMsg = 'march failed with 7 error(s): first error: context canceled';
+    assert_eq('error', godwit_classify_job_outcome($errorMsg, false, 0, null), 'no budget limit was configured for this run, so a context cancellation here has no known budget cause');
+});
+
+t('godwit_classify_job_outcome: a genuine unrelated error is not swallowed by the context-canceled check just because a MaxTransfer happened to be configured', function () {
+    assert_eq('error', godwit_classify_job_outcome('open /dst/badfile: is a directory', false, 500, 600), 'a real per-file error with no "context canceled" text must still surface as error, not budget');
+    assert_eq('auth', godwit_classify_job_outcome('googleapi: Error 401: invalid_grant', false, 500, 600), 'a real auth-expiry error must still classify as auth, not budget — its check has higher precedence than the context-canceled check');
+});
+
+t('godwit_classify_job_outcome: explicit --max-transfer cutoff text still wins over the context-canceled check when both could apply (no ordering regression)', function () {
+    $errorMsg = 'march failed with 1 error(s): first error: max transfer limit reached as set by --max-transfer - stopping transfers: context canceled';
+    assert_eq('budget', godwit_classify_job_outcome($errorMsg, false, 600, 600), 'either signal alone already says budget — this just confirms no regression when both are present');
+});
+
+t('e2e (real rcd): a near-zero remaining budget cutoff mid-directory-listing reproduces the exact live-incident shape and is now classified budget, not error', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-ctxcancel-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/Kieren';
+    mkdir($src, 0755, true);
+    // Several directories with several files each, so rclone's directory
+    // march is still mid-listing across more than one directory when the
+    // near-empty budget's cutoff fires — the exact shape that produced
+    // "error reading source directory: context canceled" live on
+    // 2026-09-19, not the single-directory shape v0.4.3's test used.
+    for ($d = 0; $d < 5; $d++) {
+        $dir = $src . "/dir$d";
+        mkdir($dir, 0755, true);
+        for ($i = 0; $i < 20; $i++) {
+            file_put_contents($dir . "/f$i.bin", random_bytes(50_000));
+        }
+    }
+    // Smaller than any single file — the live incident's ~606KB remaining
+    // against files far larger than that; 600 bytes here is the same
+    // relationship at test scale (a budget too small for even one file).
+    $maxTransfer = 600;
+
+    $dst = $tmp . '/dst';
+    mkdir($dst, 0755, true);
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $tmp . '/rcd.log'],
+        [0 => ['pipe', 'r'], 1 => ['file', $tmp . '/rcd.log', 'a'], 2 => ['file', $tmp . '/rcd.log', 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener))
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+
+    try {
+        $job = ['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'localdst', 'mode' => 'sync', 'transfers' => 4, 'max_delete' => 1000, 'excludes' => []];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        $params = godwit_build_sync_params($job, $fs, $filterFile, $maxTransfer, null, null, false, $shareRoot);
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));
+        $jobid = $resp['jobid'];
+        $status = null;
+        for ($i = 0; $i < 100; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $jobid], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish within 10s: ' . json_encode($status));
+        $errorMsg = trim((string) ($status['error'] ?? ''));
+        $stats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $jobid], 15);
+        $bytes = (int) ($stats['bytes'] ?? -1);
+        $errors = (int) ($stats['errors'] ?? -1);
+
+        // The masking must actually have happened — otherwise this test
+        // proves nothing about the fix.
+        assert_true(godwit_is_context_canceled_cutoff_artifact($errorMsg), 'expected a context-canceled march failure to reproduce the live incident: ' . var_export($errorMsg, true));
+        assert_true($bytes < $maxTransfer * 0.5, "expected bytes transferred far below MaxTransfer, reproducing the extreme-undershoot shape the 2% proximity check cannot catch: bytes=$bytes maxTransfer=$maxTransfer");
+        assert_true($errors >= 1, "expected at least the directory-listing artifact errors: $errors");
+
+        // Pre-fix behaviour: text alone (and the byte-proximity fallback,
+        // since bytes is nowhere near maxTransfer) both read this as a
+        // plain error — confirms the bug this release fixes.
+        assert_eq('error', godwit_classify_job_outcome($errorMsg, false), 'without the new text-based signal, this still misreads as error');
+
+        // Post-fix: what godwitd now actually does.
+        $outcome = godwit_classify_job_outcome($errorMsg, false, $bytes, $maxTransfer);
+        assert_eq('budget', $outcome, "bytes ($bytes) vs MaxTransfer ($maxTransfer), errorMsg: " . var_export($errorMsg, true));
+
+        // Knock-on effect (bug #3): once stored as a real 'budget' outcome,
+        // the v0.4.2 minimum-budget-threshold gate must now recognize this
+        // run as known-outstanding work and hold the job back until real
+        // headroom exists — proving the misclassification's thrashing
+        // side-effect is also fixed, not just the label.
+        $db = new SQLite3(':memory:');
+        godwit_open_job_runs_table($db);
+        godwit_open_budget_table($db);
+        godwit_open_throttle_table($db);
+        $runId = godwit_start_job_run($db, 'Kieren', 'gdrive', 1000);
+        godwit_finish_job_run($db, $runId, 1500, $bytes, 1, $errors, $outcome);
+        $cap = 700 * 1024 * 1024 * 1024;
+        // Same shape as the live incident: almost the whole cap already
+        // used, leaving far less than the 20% resume threshold free.
+        $tinyRemaining = 606 * 1024; // ~606 KiB, as observed live
+        $lastRun = godwit_last_job_run($db, 'Kieren');
+        assert_eq('budget', $lastRun['outcome'], 'the run must be stored as a budget stop, not error');
+        assert_true(godwit_job_budget_gated($lastRun, $cap, $tinyRemaining, GODWIT_MIN_BUDGET_FRACTION), 'a budget-stopped run with ~606KB remaining (far below the 140GiB/20% threshold) must be gated, not immediately re-selected');
+        assert_true(!godwit_job_budget_gated($lastRun, $cap, (int) round($cap * 0.25), GODWIT_MIN_BUDGET_FRACTION), 'once 25% of the cap has freed up (above the 20% threshold), the same run must no longer be gated');
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
+});
+
 // --- report ---------------------------------------------------------------
 
 printf("\n%d passed, %d failed\n", $passed, $failed);

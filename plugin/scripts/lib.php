@@ -2004,6 +2004,35 @@ function godwit_bytes_near_max_transfer(int $bytesTransferred, ?int $maxTransfer
 }
 
 /**
+ * A THIRD masking shape (v0.6.1, ground-truthed live on 2026-09-19 against
+ * the real bundled binary, remaining-budget ~606KB): when MaxTransfer is
+ * so small that no single file can fit, CAUTIOUS's cutoff cancels the
+ * sync's whole context immediately, and rclone's directory march reports
+ * whichever directories it was still listing at that instant as real
+ * errors — "march failed with N error(s): first error: context canceled",
+ * with each directory logging "error reading source directory: context
+ * canceled" — with $bytesTransferred landing at or near 0, nowhere near
+ * $maxTransferBytes (confirmed: 0 bytes against a 600-byte MaxTransfer,
+ * 7 reported errors). godwit_bytes_near_max_transfer()'s 2% proximity
+ * check assumes a cutoff always transfers close to its limit — true for a
+ * normal-sized budget, false here, since the near-empty budget itself is
+ * the reason NO file could fit before the cutoff fired. Detected by text
+ * instead: this exact cancellation phrase only appears when something
+ * cancelled rclone's sync context — it does not appear on a genuine
+ * per-file error (one bad file does not cancel the whole march) or a
+ * fatal MaxDuration cutoff (already caught by its own "as set by
+ * --max-duration" text, checked first). Gated on $maxTransferBytes !==
+ * null so it only fires for a run that actually had a budget limit
+ * configured — an unrelated context cancellation on an unlimited-budget
+ * remote (MaxTransfer never sent) falls through to the existing checks
+ * unchanged.
+ */
+function godwit_is_context_canceled_cutoff_artifact(string $errorMsg): bool
+{
+    return str_contains($errorMsg, 'context canceled');
+}
+
+/**
  * Classifies a finished rc job's outcome from its job/status error text (and
  * whether godwitd itself issued the mid-run job/stop that caused it — its
  * own job/stop produces a generic "context canceled", not a distinguishing
@@ -2057,6 +2086,9 @@ function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget, ?
         return 'throttled';
     }
     if ($stoppedForBudget || str_contains($errorMsg, 'as set by --max-transfer')) {
+        return 'budget';
+    }
+    if ($maxTransferBytes !== null && godwit_is_context_canceled_cutoff_artifact($errorMsg)) {
         return 'budget';
     }
     if (str_contains($errorMsg, 'as set by --max-duration')) {
