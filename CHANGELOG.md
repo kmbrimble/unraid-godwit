@@ -47,13 +47,17 @@ sort *before* `1.0.9`.
   stays `window` (a single-pass reviewer finding, fixed with its own test,
   red before the reorder). An unlimited remote (no `MaxTransfer`), a plain
   per-file error and auth expiry are unaffected.
-- Tests: 333/333 (`php tests/run.php`) plus 19/19 Node, `build/` populated,
-  0 `(skipped --` lines, stable across 3 repeats. 5 new tests + 1 real-rcd
+- Tests: 334/334 (`php tests/run.php`) plus 19/19 Node, `build/` populated,
+  0 `(skipped --` lines, 9 consecutive full-suite runs plus the red/green runs, all 334/0. 6 new tests + 1 real-rcd
   e2e test that reproduces the shape above, asserts the pre-fix classifier
   says `error`, the fixed one says `budget`, and that the stored `budget`
   outcome is then gated by `godwit_job_budget_gated()` at ~606 KiB remaining
   and released at 25% of the cap.
-- **Known limits, not fixed:** the phrase match is on `context canceled` in
+- **Known limits, not fixed:** the artifact errors still count toward `errors`, so
+  the status label and cap-stop notification read e.g. "7 transfer errors also
+  logged" (Transfers=4 baseline) for a clean stop; directory-listing
+  cancellations are not bounded by `Transfers`. The raw count is deliberately
+  not hidden. Also: the phrase match is on `context canceled` in
   the single error string `job/status` reports, so a genuine error that
   rclone ranks below a cancellation error could be hidden by it (same
   one-string limitation as 0.4.3). A near-zero-budget run whose directories

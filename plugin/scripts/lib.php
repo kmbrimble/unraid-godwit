@@ -2021,7 +2021,7 @@ function godwit_bytes_near_max_transfer(int $bytesTransferred, ?int $maxTransfer
  * cancelled rclone's sync context — it does not appear on a genuine
  * per-file error (one bad file does not cancel the whole march) or a
  * fatal MaxDuration cutoff (already caught by its own "as set by
- * --max-duration" text, checked first). Gated on $maxTransferBytes !==
+ * --max-duration" text, checked first; auth-expiry text also wins). Gated on $maxTransferBytes !==
  * null so it only fires for a run that actually had a budget limit
  * configured — an unrelated context cancellation on an unlimited-budget
  * remote (MaxTransfer never sent) falls through to the existing checks
@@ -2091,11 +2091,11 @@ function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget, ?
     if (str_contains($errorMsg, 'as set by --max-duration')) {
         return 'window';
     }
-    if ($maxTransferBytes !== null && godwit_is_context_canceled_cutoff_artifact($errorMsg)) {
-        return 'budget';
-    }
     if (godwit_classify_error($errorMsg) === 'auth-expired') {
         return 'auth';
+    }
+    if ($maxTransferBytes !== null && godwit_is_context_canceled_cutoff_artifact($errorMsg)) {
+        return 'budget';
     }
     if ($bytesTransferred !== null && godwit_bytes_near_max_transfer($bytesTransferred, $maxTransferBytes)) {
         return 'budget';

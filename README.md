@@ -6,7 +6,7 @@ Offsite backup for Unraid, built as a GUI over [rclone](https://rclone.org/).
 Named for the bar-tailed godwit, the bird that holds the record for the
 longest non-stop flight of any species and lands in Australia every year.
 
-**Status: Phase 4 shipped, plus v0.6.0.** The plugin installs, runs a
+**Status: Phase 4 shipped, plus v0.6.1.** The plugin installs, runs a
 supervised daemon (`rc.godwit` / `godwitd`) that manages a single bundled
 `rclone rcd`, and Settings → Godwit can add, test, re-authorise and delete
 Google Drive and OneDrive remotes. Godwit backs up whole shares to Google

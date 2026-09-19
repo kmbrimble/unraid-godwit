@@ -4575,6 +4575,10 @@ t('godwit_classify_job_outcome: a --max-duration cutoff whose text also contains
     assert_eq('window', godwit_classify_job_outcome($errorMsg, false, 0, 600), 'a window stop must not be relabelled as a daily-cap stop');
 });
 
+t('godwit_classify_job_outcome: auth-expiry text that also contains "context canceled" stays auth, not budget (specific signals outrank the cancellation fallback)', function () {
+    assert_eq('auth', godwit_classify_job_outcome('invalid_grant: token expired: context canceled', false, 0, 600), 'auth must win over the context-canceled fallback');
+});
+
 t('e2e (real rcd): a near-zero remaining budget cutoff mid-directory-listing reproduces the exact live-incident shape and is now classified budget, not error', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {
@@ -4681,6 +4685,16 @@ t('e2e (real rcd): a near-zero remaining budget cutoff mid-directory-listing rep
         assert_eq('budget', $lastRun['outcome'], 'the run must be stored as a budget stop, not error');
         assert_true(godwit_job_budget_gated($lastRun, $cap, $tinyRemaining, GODWIT_MIN_BUDGET_FRACTION), 'a budget-stopped run with ~606KB remaining (far below the 140GiB/20% threshold) must be gated, not immediately re-selected');
         assert_true(!godwit_job_budget_gated($lastRun, $cap, (int) round($cap * 0.25), GODWIT_MIN_BUDGET_FRACTION), 'once 25% of the cap has freed up (above the 20% threshold), the same run must no longer be gated');
+
+        // The scheduler tick itself: the gated job must not be selected, and
+        // once headroom returns it must be.
+        $jobs = [['name' => 'Kieren', 'remote' => 'gdrive', 'enabled' => true]];
+        $lastRuns = ['Kieren' => $lastRun];
+        $gated = godwit_job_budget_gated($lastRun, $cap, $tinyRemaining, GODWIT_MIN_BUDGET_FRACTION) ? ['Kieren'] : [];
+        assert_eq([], godwit_select_next_jobs($jobs, [], $lastRuns, 0, $gated), 'a gated near-zero-budget job must not be started on the next tick');
+        $gated = godwit_job_budget_gated($lastRun, $cap, (int) round($cap * 0.25), GODWIT_MIN_BUDGET_FRACTION) ? ['Kieren'] : [];
+        $picked = godwit_select_next_jobs($jobs, [], $lastRuns, 0, $gated);
+        assert_eq(1, count($picked), 'once 25% of the cap is free the job is picked again');
     } finally {
         proc_terminate($proc);
         proc_close($proc);
