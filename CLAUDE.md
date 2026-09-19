@@ -844,6 +844,18 @@ backend, exactly like every prior phase's e2e tests, not against
 Share dropdown, the tree's live-data flagging, or the type-toggle
 show/hide behaviour on the Add-job dialog.
 
+**v0.6.1 (built and offline-verified, 2026-09-19) fixes a third way a clean
+daily-cap stop was stored as `error`:** with ~606 KB of rolling budget left,
+rclone's cutoff cancels the sync mid-listing and job/status reports
+`march failed ... context canceled` at ~0 bytes, which neither the text checks
+nor 0.4.3's 2% byte-proximity check could catch. Reproduced against the
+bundled v1.75.1 through a real rcd before fixing. The suspected flat-cap vs
+per-run `MaxTransfer` mix-up was checked and is NOT the defect (godwitd already
+passes the run's own remaining budget). `godwit_classify_job_outcome()` now
+returns `budget` for `context canceled` when a `MaxTransfer` was configured,
+after the `--max-duration` text check (window stays window). 333/333, 0 skips,
+19/19 Node. See CHANGELOG 0.6.1 for the known limits. Not verified on the host.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

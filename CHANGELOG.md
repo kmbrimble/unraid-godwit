@@ -10,6 +10,59 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-19
+
+### Fixed
+
+- **A third masking of a clean daily-cap stop as `error`** (after 0.4.1's
+  directory-modtime errors and 0.4.3's precedence-masked cutoff text).
+  Live on 2026-09-18→19: the previous night had used ~669 GiB of the
+  700 GiB cap, so the next window opened with ~606 KB of rolling budget.
+  Kieren, Teegan and Photos each started, rclone's CAUTIOUS cutoff fired
+  before any file could fit and cancelled the whole sync context, and every
+  directory still being listed at that instant came back as
+  `error reading source directory: context canceled`. All three runs were
+  stored `error` (1120 / 282 / 13 bytes), so the 0.4.2 minimum-budget gate
+  never recognised them as budget stops and let them restart against a
+  near-empty budget.
+- **Root cause, reproduced locally against the bundled rclone v1.75.1
+  through a real rcd** (5 directories x 20 files x 50 KB, `MaxTransfer` =
+  600 bytes): `job/status` error `march failed with 3 error(s): first
+  error: context canceled`, `core/stats` bytes 0, errors 7, and rcd.log
+  shows the `max transfer limit reached` NOTICE followed by the per-directory
+  `context canceled` errors and rclone's own `not deleting files/directories
+  as there were IO errors` (correct, safe behaviour, unchanged).
+  `godwit_classify_job_outcome()` returned `error`.
+- **The suspected cause was checked and is not the defect:** godwitd
+  already passes each run's own `MaxTransfer` (the remaining budget at job
+  start, `$aj['max_transfer']`), not the flat daily cap, into the
+  byte-proximity check. The real gap is that `godwit_bytes_near_max_transfer()`
+  assumes a cutoff transfers close to its limit; with a budget too small for
+  any file it transfers ~0 bytes, nowhere near the limit, so no tolerance
+  could catch it.
+- New `godwit_is_context_canceled_cutoff_artifact()`; the classifier now
+  returns `budget` for a `context canceled` error when a `MaxTransfer` was
+  configured for the run. Checked after the throttle, `--max-transfer` and
+  `--max-duration` text, so a window stop that also says `context canceled`
+  stays `window` (a single-pass reviewer finding, fixed with its own test,
+  red before the reorder). An unlimited remote (no `MaxTransfer`), a plain
+  per-file error and auth expiry are unaffected.
+- Tests: 333/333 (`php tests/run.php`) plus 19/19 Node, `build/` populated,
+  0 `(skipped --` lines, stable across 3 repeats. 5 new tests + 1 real-rcd
+  e2e test that reproduces the shape above, asserts the pre-fix classifier
+  says `error`, the fixed one says `budget`, and that the stored `budget`
+  outcome is then gated by `godwit_job_budget_gated()` at ~606 KiB remaining
+  and released at 25% of the cap.
+- **Known limits, not fixed:** the phrase match is on `context canceled` in
+  the single error string `job/status` reports, so a genuine error that
+  rclone ranks below a cancellation error could be hidden by it (same
+  one-string limitation as 0.4.3). A near-zero-budget run whose directories
+  all list before the cutoff fires has no error text at all and is stored
+  `completed` with ~0 bytes; not seen live, not addressed. godwitd's glue is
+  untested by convention. **Not verified:** nothing against the live host or
+  Google Drive; the user installs. CI still never runs the rcd e2e tests
+  (no `build/`), unchanged.
+
 ## [0.6.0] - 2026-09-18
 
 ### Added
