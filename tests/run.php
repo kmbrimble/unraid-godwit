@@ -4570,6 +4570,11 @@ t('godwit_classify_job_outcome: explicit --max-transfer cutoff text still wins o
     assert_eq('budget', godwit_classify_job_outcome($errorMsg, false, 600, 600), 'either signal alone already says budget — this just confirms no regression when both are present');
 });
 
+t('godwit_classify_job_outcome: a --max-duration cutoff whose text also contains "context canceled" stays window, not budget, even with a MaxTransfer configured (max-duration text is checked first)', function () {
+    $errorMsg = 'max transfer duration reached as set by --max-duration - stopping transfers: context canceled';
+    assert_eq('window', godwit_classify_job_outcome($errorMsg, false, 0, 600), 'a window stop must not be relabelled as a daily-cap stop');
+});
+
 t('e2e (real rcd): a near-zero remaining budget cutoff mid-directory-listing reproduces the exact live-incident shape and is now classified budget, not error', function () use ($repoRoot) {
     $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
     if (!is_file($zip)) {

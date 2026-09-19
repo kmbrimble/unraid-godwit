@@ -2088,11 +2088,11 @@ function godwit_classify_job_outcome(string $errorMsg, bool $stoppedForBudget, ?
     if ($stoppedForBudget || str_contains($errorMsg, 'as set by --max-transfer')) {
         return 'budget';
     }
-    if ($maxTransferBytes !== null && godwit_is_context_canceled_cutoff_artifact($errorMsg)) {
-        return 'budget';
-    }
     if (str_contains($errorMsg, 'as set by --max-duration')) {
         return 'window';
+    }
+    if ($maxTransferBytes !== null && godwit_is_context_canceled_cutoff_artifact($errorMsg)) {
+        return 'budget';
     }
     if (godwit_classify_error($errorMsg) === 'auth-expired') {
         return 'auth';
