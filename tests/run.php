@@ -3137,9 +3137,9 @@ t('godwit_job_status_label: auth failure still says error, with the known specif
 const GODWIT_TEST_GOOGLE_QUOTA_ERROR = 'googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded';
 const GODWIT_TEST_GOOGLE_QUOTA_LOG = <<<'LOG'
 2026/09/22 02:06:46 ERROR : Google drive root 'godwit/Photos': Received upload limit error: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded
-2026/09/22 02:06:46 ERROR : Joint/New Zealand 2024/Camera Backup/JPG/A7C02479.JPG: Failed to copy: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded
+2026/09/22 02:06:46 ERROR : Album/Camera Backup/JPG/A7C02479.JPG: Failed to copy: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded
 2026/09/22 02:06:46 ERROR : Cancelling sync due to fatal error: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded
-2026/09/22 02:06:46 ERROR : Joint/New Zealand 2024/Camera Backup/JPG/A7C02527.JPG: Failed to copy: Post "https://www.googleapis.com/upload/drive/v3/files?...": context canceled
+2026/09/22 02:06:46 ERROR : Album/Camera Backup/JPG/A7C02527.JPG: Failed to copy: Post "https://www.googleapis.com/upload/drive/v3/files?...": context canceled
 LOG;
 
 t('godwit_classify_job_outcome: the real 2026-09-22 Google quota text classifies throttled (not error), in either form it can arrive', function () {
@@ -3166,6 +3166,12 @@ t('godwit_job_status_label: a Google quota stop is a calm pause that says it is 
     assert_true(str_contains($label, '205.6 GiB'), $label);
     assert_true(!str_contains($label, 'cap') && !str_contains($label, 'budget') && !str_contains($label, 'error'), 'must not read as our cap/budget or as an error: ' . $label);
     assert_true(!str_contains($label, 'also logged'), 'the 4 errors are the fatal cancel artifacts, not extra real errors: ' . $label);
+});
+
+t('godwit_job_status_label: a Google quota stop with genuinely many transfer errors still surfaces them', function () {
+    $ts = godwit_test_dt('2026-09-22 02:06:46')->getTimestamp();
+    $label = godwit_job_status_label(['outcome' => 'throttled', 'bytes' => 1000, 'errors' => 50, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-22 09:00:00'));
+    assert_true(str_contains($label, '50 transfer errors also logged'), $label);
 });
 
 t('godwit_next_window_start_any_ts: earliest upcoming start across windows, null with none', function () {

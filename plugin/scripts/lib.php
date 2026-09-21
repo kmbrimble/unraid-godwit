@@ -2161,7 +2161,13 @@ function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \
             return "completed ($bytes) at $when";
         case 'budget':
         case 'window':
-            $reason = $lastRun['outcome'] === 'window' ? 'upload window closed' : 'daily upload cap reached';
+        case 'throttled':
+            // 'throttled' is Google's own quota, not our budget — no
+            // "cap"/"budget" wording. Its stored errors are the fatal file
+            // plus its cancelled in-flight siblings (bounded by Transfers,
+            // same shape as a budget stop), so the same baseline applies and
+            // a genuinely elevated count still surfaces.
+            $reason = ['window' => 'upload window closed', 'throttled' => "Google's own daily upload limit reached"][$lastRun['outcome']] ?? 'daily upload cap reached';
             // $jobTransfers is an UPPER BOUND on a clean cutoff's own
             // bookkeeping errors (measured 1-4 at Transfers=8, see
             // godwit_cap_stop_notification()'s docblock), not an exact
@@ -2174,12 +2180,6 @@ function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \
             $errorCount = (int) ($lastRun['errors'] ?? 0);
             $suffix = $errorCount > $baseline ? sprintf(' — %d transfer error%s also logged, see /var/log/godwit.log', $errorCount, $errorCount === 1 ? '' : 's') : '';
             return "paused — $reason, resumes $resume ($bytes uploaded)$suffix";
-        case 'throttled':
-            // Google's own quota, on Google's clock — not our budget ledger,
-            // and not an error: no "cap"/"budget" wording, and no error-count
-            // suffix (the 4 errors of the 2026-09-22 incident were the fatal
-            // itself plus its cancelled in-flight uploads).
-            return "paused — Google's own daily upload limit reached, resumes $resume ($bytes uploaded)";
         case 'auth':
             return "error — authentication expired ($bytes) at $when";
         case 'interrupted':

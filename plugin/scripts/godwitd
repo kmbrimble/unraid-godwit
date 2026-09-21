@@ -526,8 +526,10 @@ while ($running) {
                 // Blocked until the next scheduled window, not a flat 24h —
                 // a flat 24h from a 02:06 stop would waste the first four
                 // hours of the next night's window. Google's reset clock is
-                // unknown; if the quota hasn't reset by then the job fails
-                // fast and is blocked again (calm, one quick retry).
+                // unknown: if it is a rolling 24h, the next night's first
+                // upload may 403 again and, blocked until the window AFTER,
+                // that costs a whole night. If tomorrow's window job fails
+                // immediately with the same 403, revert to `$now + 86400`.
                 $resumeTs = godwit_next_window_start_any_ts($settings['windows'], $nowDt) ?? $now + 86400;
                 godwit_mark_throttled($db, $aj['remote'], $resumeTs);
                 $n = godwit_throttled_notification($aj['remote'], $wasThrottled, godwit_next_window_start_label($settings['windows'], $nowDt));

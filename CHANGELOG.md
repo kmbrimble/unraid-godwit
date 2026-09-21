@@ -41,7 +41,7 @@ sort *before* `1.0.9`.
   errors and text lacking the `userRateLimitExceeded` reason stay `error`.
 - **Status/notification wording.** `throttled` renders `paused — Google's
   own daily upload limit reached, resumes 22:00 (X uploaded)` (real window
-  start; no "cap"/"budget" wording, no error-count suffix). The
+  start; no "cap"/"budget" wording; a genuinely elevated transfer-error count still shows as a suffix, same baseline as a budget stop). The
   notification is `normal` importance, names Google and says it is not
   Godwit's budget. Previously: `error — Google's daily upload limit reached`
   and an `alert`.
@@ -58,9 +58,11 @@ sort *before* `1.0.9`.
 - **Block lasts until the next scheduled window start, not a flat 24 h**
   (`godwit_next_window_start_any_ts()`): 24 h from a 02:06 stop would waste
   the first four hours of the next night's window. Google's reset clock is
-  unknown, so if the quota hasn't reset the next night's job fails fast and
-  is blocked again — calm, one quick retry.
-- Tests: 340/340 (334 + 6 net new, all six genuinely red first), 0
+  unknown: if it is a rolling 24h, the next night's first upload may 403
+  again and, blocked until the window after, that costs a whole night.
+  Discriminator: if tomorrow's window job fails immediately with the same
+  403, set `$resumeTs` back to `$now + 86400` in godwitd.
+- Tests: 341/341 (334 + 7 net new, all six genuinely red first), 0
   `skipped --`, stable across 3 runs; 19/19 Node. The classifier tests use
   the literal captured incident text. The queue test drives the real
   `godwit_select_next_jobs()` with a real throttle table. Not verified on

@@ -914,7 +914,7 @@ function godwitJobsRefresh() {
                     return '<p>' + esc(r.remote) + ': ' + fmtBytes(r.used_24h_bytes) + ' used (no daily cap configured)</p>';
                 }
                 var pct = r.cap_bytes > 0 ? Math.min(100, r.used_24h_bytes / r.cap_bytes * 100) : 0;
-                var throttled = r.throttled_until ? ' — throttled until ' + new Date(r.throttled_until * 1000).toLocaleString() : '';
+                var throttled = r.throttled_until ? ' — Google upload limit, waiting until ' + new Date(r.throttled_until * 1000).toLocaleString() : '';
                 return '<p>' + esc(r.remote) + ': ' + fmtBytes(r.used_24h_bytes) + ' / ' + fmtBytes(r.cap_bytes) +
                     ' (' + pct.toFixed(1) + '%)' + esc(throttled) +
                     '<br><div style="background:#ddd;width:300px;height:10px;"><div style="background:' +
