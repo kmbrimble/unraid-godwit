@@ -406,12 +406,11 @@ while ($running) {
                     unset($budgetGateLogged[$job['name']]);
                 }
             }
-            $candidates = godwit_select_next_jobs($jobs, $activeRemotes, $lastRuns, $sessionStartTs, $gatedJobNames);
+            // A Google-quota block (godwit_mark_throttled()) is account-wide:
+            // treat those remotes as busy so no job on them starts.
+            $candidates = godwit_select_next_jobs($jobs, array_merge($activeRemotes, godwit_throttled_remotes($db, $jobs, $now)), $lastRuns, $sessionStartTs, $gatedJobNames);
             foreach ($candidates as $job) {
                 $remote = $job['remote'];
-                if (godwit_throttled_until($db, $remote, $now) !== null) {
-                    continue;
-                }
                 $cap = $remoteBudget[$remote]['cap'];
                 $remaining = $remoteBudget[$remote]['remaining'];
                 if ($remaining <= 0) {
@@ -524,8 +523,14 @@ while ($running) {
             $outcome = godwit_classify_job_outcome($errorMsg, $stoppedForBudget, $bytes, $aj['max_transfer'] ?? null);
             if ($outcome === 'throttled') {
                 $wasThrottled = godwit_throttled_until($db, $aj['remote'], $now) !== null;
-                godwit_mark_throttled($db, $aj['remote'], $now + 86400);
-                $n = godwit_throttled_notification($aj['remote'], $wasThrottled);
+                // Blocked until the next scheduled window, not a flat 24h —
+                // a flat 24h from a 02:06 stop would waste the first four
+                // hours of the next night's window. Google's reset clock is
+                // unknown; if the quota hasn't reset by then the job fails
+                // fast and is blocked again (calm, one quick retry).
+                $resumeTs = godwit_next_window_start_any_ts($settings['windows'], $nowDt) ?? $now + 86400;
+                godwit_mark_throttled($db, $aj['remote'], $resumeTs);
+                $n = godwit_throttled_notification($aj['remote'], $wasThrottled, godwit_next_window_start_label($settings['windows'], $nowDt));
                 if ($n !== null) {
                     godwit_notify($n['subject'], $n['description'], $n['importance']);
                 }
@@ -571,7 +576,7 @@ while ($running) {
             foreach ($jobs as $job) {
                 $lastRunsForDrainCheck[$job['name']] = godwit_last_job_run($db, $job['name']);
             }
-            $stillEligible = godwit_select_next_jobs($jobs, [], $lastRunsForDrainCheck, $sessionStartTs);
+            $stillEligible = godwit_select_next_jobs($jobs, godwit_throttled_remotes($db, $jobs, $now), $lastRunsForDrainCheck, $sessionStartTs);
             if (count($stillEligible) === 0) {
                 @unlink($runNowMarker);
                 godwit_log($logFile, '"Run now" queue drained — reverting to the normal window schedule');

@@ -10,6 +10,66 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-22
+
+### Fixed
+
+- **Google's own daily upload limit was stored as `error`.** Live overnight
+  2026-09-21→22 (v0.6.1): Photos (gdrive) uploaded 220,714,648,882 bytes /
+  7,997 files over ~4 h, then rcd logged `Received upload limit error:
+  googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded`
+  and `Cancelling sync due to fatal error`. job_runs stored `outcome='error'`
+  (errors=4: the fatal itself plus 3 cancelled in-flight uploads). rclone
+  behaved correctly (`--drive-stop-on-upload-limit` turns that exact Google
+  403 into a FatalError); Godwit misreported it.
+- **Root cause: an existing outcome already modelled this, but its detector
+  never matched real text.** `throttled` (remote blocked via
+  `remote_throttle`, notification, terminal for the session) was matched by
+  `godwit_is_upload_limit_error()` on the substrings `upload limit` /
+  `uploadLimitExceeded`. Those are only in rcd's *log line*; the job/status
+  error is the bare `googleapi: Error 403: User rate limit exceeded.,
+  userRateLimitExceeded`. It now also matches that pair (both halves
+  required). No second outcome was added — a parallel one would have
+  duplicated the throttle table, terminal-outcome and notification wiring.
+- **Precedence** (unchanged position, now actually reachable): `throttled`
+  stays first, above budget, window, auth and the context-canceled/byte
+  fallbacks. The Google fatal is highest in rclone's `currentError()`
+  precedence, so when it co-occurs with our own stop (`$stoppedForBudget`),
+  a `--max-transfer` text or near-cap bytes, the real cause is Google's and
+  the remote must be blocked — reading it as `budget` would let the next
+  job on the same remote fail seconds later. Unrelated 403s/googleapi
+  errors and text lacking the `userRateLimitExceeded` reason stay `error`.
+- **Status/notification wording.** `throttled` renders `paused — Google's
+  own daily upload limit reached, resumes 22:00 (X uploaded)` (real window
+  start; no "cap"/"budget" wording, no error-count suffix). The
+  notification is `normal` importance, names Google and says it is not
+  Godwit's budget. Previously: `error — Google's daily upload limit reached`
+  and an `alert`.
+- **Minimum-budget gate is not applied** — it keys off `outcome ===
+  'budget'` only and `throttled` never was (now pinned by a queue test
+  with 1 byte of our budget left).
+- **Rest of the remote's queue is held back** — Google's quota is
+  account-wide. This already existed as an unreachable inline
+  `godwit_throttled_until()` check *after* selection; it is now applied
+  *before*, via new `godwit_throttled_remotes()` fed to
+  `godwit_select_next_jobs()` as busy remotes (also to the "Run now"
+  drained check, which previously could never drain while a remote was
+  blocked). Other remotes are unaffected.
+- **Block lasts until the next scheduled window start, not a flat 24 h**
+  (`godwit_next_window_start_any_ts()`): 24 h from a 02:06 stop would waste
+  the first four hours of the next night's window. Google's reset clock is
+  unknown, so if the quota hasn't reset the next night's job fails fast and
+  is blocked again — calm, one quick retry.
+- Tests: 340/340 (334 + 6 net new, all six genuinely red first), 0
+  `skipped --`, stable across 3 runs; 19/19 Node. The classifier tests use
+  the literal captured incident text. The queue test drives the real
+  `godwit_select_next_jobs()` with a real throttle table. Not verified on
+  the host (no live Google 403); godwitd's inline glue (which passes the
+  throttled remotes and the resume timestamp) is untested by construction,
+  like the rest of godwitd's loop.
+- An old test asserting `throttled` labelled `error…` encoded the wording
+  this release deliberately changes, and was replaced by the new label test.
+
 ## [0.6.1] - 2026-09-19
 
 ### Fixed

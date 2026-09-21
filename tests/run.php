@@ -3122,12 +3122,118 @@ t('godwit_job_status_label: a genuine failure still plainly says error', functio
     assert_true(str_starts_with($label, 'error ('), $label);
 });
 
-t('godwit_job_status_label: throttled and auth failures still say error, with the known specific reason', function () {
+t('godwit_job_status_label: auth failure still says error, with the known specific reason', function () {
     $ts = godwit_test_dt('2026-09-18 05:41:51')->getTimestamp();
-    $throttled = godwit_job_status_label(['outcome' => 'throttled', 'bytes' => 0, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
     $auth = godwit_job_status_label(['outcome' => 'auth', 'bytes' => 0, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-18 12:00:00'));
-    assert_true(str_starts_with($throttled, 'error'), $throttled);
     assert_true(str_starts_with($auth, 'error'), $auth);
+});
+
+// The literal job/status error text and rcd.log lines captured live on
+// 2026-09-22 02:06:46 (Photos, gdrive, v0.6.1) — 220.7 GB uploaded, then
+// Google's own per-account daily upload quota fired. rclone returns it as
+// a FatalError (highest currentError() precedence), so job/status's error
+// is exactly this googleapi text; "Received upload limit error" is only
+// rcd's own log line, never part of the job error.
+const GODWIT_TEST_GOOGLE_QUOTA_ERROR = 'googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded';
+const GODWIT_TEST_GOOGLE_QUOTA_LOG = <<<'LOG'
+2026/09/22 02:06:46 ERROR : Google drive root 'godwit/Photos': Received upload limit error: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded
+2026/09/22 02:06:46 ERROR : Joint/New Zealand 2024/Camera Backup/JPG/A7C02479.JPG: Failed to copy: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded
+2026/09/22 02:06:46 ERROR : Cancelling sync due to fatal error: googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded
+2026/09/22 02:06:46 ERROR : Joint/New Zealand 2024/Camera Backup/JPG/A7C02527.JPG: Failed to copy: Post "https://www.googleapis.com/upload/drive/v3/files?...": context canceled
+LOG;
+
+t('godwit_classify_job_outcome: the real 2026-09-22 Google quota text classifies throttled (not error), in either form it can arrive', function () {
+    assert_eq('throttled', godwit_classify_job_outcome(GODWIT_TEST_GOOGLE_QUOTA_ERROR, false, 220714648882, 300000000000), 'job/status error text');
+    assert_eq('throttled', godwit_classify_job_outcome(GODWIT_TEST_GOOGLE_QUOTA_LOG, false), 'full captured log block');
+});
+
+t('godwit_classify_job_outcome: Google quota text wins over our own budget signals, but not over nothing-wrong or unrelated errors', function () {
+    assert_eq('throttled', godwit_classify_job_outcome(GODWIT_TEST_GOOGLE_QUOTA_ERROR, true), 'godwitd-issued budget stop co-occurring with Google fatal: Google limit is real and must block the remote');
+    assert_eq('throttled', godwit_classify_job_outcome(GODWIT_TEST_GOOGLE_QUOTA_ERROR . ' max transfer limit reached as set by --max-transfer', false), 'cutoff text alongside');
+    assert_eq('throttled', godwit_classify_job_outcome(GODWIT_TEST_GOOGLE_QUOTA_ERROR, false, 99_000_000, 100_000_000), 'byte proximity must not relabel it budget');
+    assert_eq('completed', godwit_classify_job_outcome('', false), 'no error is still completed');
+    assert_eq('error', godwit_classify_job_outcome('googleapi: Error 403: The user does not have sufficient permissions for this file, forbidden', false), 'other 403 is a real error');
+    assert_eq('error', godwit_classify_job_outcome('googleapi: Error 500: Internal Error, backendError', false), 'unrelated googleapi error is a real error');
+    assert_eq('error', godwit_classify_job_outcome('Failed to copy: User rate limit exceeded by a local proxy', false), 'message fragment without the Google reason code is not enough');
+});
+
+t('godwit_job_status_label: a Google quota stop is a calm pause that says it is Google\'s limit, not Godwit\'s budget', function () {
+    $ts = godwit_test_dt('2026-09-22 02:06:46')->getTimestamp();
+    $label = godwit_job_status_label(['outcome' => 'throttled', 'bytes' => 220714648882, 'errors' => 4, 'ended_ts' => $ts, 'started_ts' => $ts], false, godwit_default_windows(), godwit_test_dt('2026-09-22 09:00:00'));
+    assert_true(str_starts_with($label, 'paused'), $label);
+    assert_true(str_contains($label, "Google's own daily upload limit"), $label);
+    assert_true(str_contains($label, 'resumes 22:00'), $label);
+    assert_true(str_contains($label, '205.6 GiB'), $label);
+    assert_true(!str_contains($label, 'cap') && !str_contains($label, 'budget') && !str_contains($label, 'error'), 'must not read as our cap/budget or as an error: ' . $label);
+    assert_true(!str_contains($label, 'also logged'), 'the 4 errors are the fatal cancel artifacts, not extra real errors: ' . $label);
+});
+
+t('godwit_next_window_start_any_ts: earliest upcoming start across windows, null with none', function () {
+    $tz = godwit_test_dt('2026-09-22 09:00:00');
+    assert_eq(godwit_test_dt('2026-09-22 22:00:00')->getTimestamp(), godwit_next_window_start_any_ts(godwit_default_windows(), $tz), 'default 22:00');
+    $two = [['days' => [0,1,2,3,4,5,6], 'start' => '22:00', 'end' => '06:00', 'limit_mbit' => 250.0], ['days' => [0,1,2,3,4,5,6], 'start' => '13:00', 'end' => '14:00', 'limit_mbit' => 250.0]];
+    assert_eq(godwit_test_dt('2026-09-22 13:00:00')->getTimestamp(), godwit_next_window_start_any_ts($two, $tz), 'earliest wins');
+    assert_eq(null, godwit_next_window_start_any_ts([], $tz), 'no windows');
+});
+
+t('godwit_throttled_notification: a Google quota stop is calm (normal importance), names Google and the resume time', function () {
+    $n = godwit_throttled_notification('gdrive', false, '22:00');
+    assert_eq('normal', $n['importance'], 'not an alert');
+    assert_true(str_contains($n['description'], '22:00'), $n['description']);
+    assert_true(str_contains($n['subject'] . $n['description'], 'Google'), 'names Google');
+    assert_true(!str_contains(strtolower($n['subject'] . $n['description']), 'budget reached'), 'must not read as our budget-reached alert');
+});
+
+// The real queue function, not just the predicate: Google's quota is
+// account-wide, so once a job on gdrive hits it, every other gdrive job
+// would hit the identical fatal error seconds later.
+t('queue: a Google quota stop holds back the REST of that remote\'s queue for the night, other remotes unaffected, and resumes at the next window', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_throttle_table($db);
+    $jobs = godwit_default_jobs(); // Filing Cabinet, Kieren, Teegan, Photos — all gdrive
+    $jobs[] = ['name' => 'OD', 'enabled' => true, 'remote' => 'kmonedrive', 'mode' => 'sync', 'type' => 'share', 'share' => 'Docs'];
+    $nowDt = godwit_test_dt('2026-09-22 02:06:46');
+    $now = $nowDt->getTimestamp();
+    $sessionStart = godwit_test_dt('2026-09-21 22:00:00')->getTimestamp();
+    // Filing Cabinet/Kieren/Teegan completed earlier in the session; Photos just hit Google's limit.
+    $lastRuns = [];
+    foreach (['Filing Cabinet', 'Kieren', 'Teegan'] as $n) {
+        $lastRuns[$n] = ['ended_ts' => $now - 3600, 'outcome' => 'completed'];
+    }
+    $lastRuns['Photos'] = ['ended_ts' => $now, 'outcome' => 'throttled'];
+    // Worst case for the "rest of the queue" claim: Kieren had NOT run yet when Photos hit the limit.
+    $lastRuns['Kieren'] = null;
+
+    assert_eq([], godwit_throttled_remotes($db, $jobs, $now), 'nothing throttled yet');
+    $before = array_column(godwit_select_next_jobs($jobs, [], $lastRuns, $sessionStart), 'name');
+    assert_true(in_array('Kieren', $before, true), 'sanity: without the block Kieren would be started');
+
+    // What godwitd does on outcome === 'throttled':
+    godwit_mark_throttled($db, 'gdrive', godwit_next_window_start_any_ts(godwit_default_windows(), $nowDt) ?? $now + 86400);
+    $throttled = godwit_throttled_remotes($db, $jobs, $now);
+    assert_eq(['gdrive'], $throttled, 'only gdrive is throttled');
+    $picked = array_column(godwit_select_next_jobs($jobs, $throttled, $lastRuns, $sessionStart), 'name');
+    assert_eq(['OD'], $picked, 'no gdrive job starts; the OneDrive job still does');
+
+    // Tonight's window (22:00): the block has expired and, in the new session, every gdrive job is eligible again — including Photos, whose last outcome was throttled, and un-gated by the 20% budget rule.
+    $tonight = godwit_test_dt('2026-09-22 22:00:00')->getTimestamp();
+    assert_eq([], godwit_throttled_remotes($db, $jobs, $tonight), 'block expired at window start');
+    $gated = [];
+    $cap = godwit_default_budget_cap_bytes();
+    foreach ($jobs as $j) {
+        if (godwit_job_budget_gated($lastRuns[$j['name']] ?? null, $cap, 1, GODWIT_MIN_BUDGET_FRACTION)) {
+            $gated[] = $j['name'];
+        }
+    }
+    assert_eq([], $gated, 'the throttled job is not held by the 20% budget gate even with 1 byte of our budget left');
+    $resumed = array_column(godwit_select_next_jobs($jobs, [], $lastRuns, $tonight, $gated), 'name');
+    assert_eq(['Filing Cabinet', 'OD'], $resumed, 'gdrive queue resumes at next window from the top (one job per remote per tick)');
+    // ...and Photos itself, last outcome throttled, is selectable once the ones ahead of it have run this session.
+    $later = $lastRuns;
+    foreach (['Filing Cabinet', 'Kieren', 'Teegan'] as $n) {
+        $later[$n] = ['ended_ts' => $tonight + 60, 'outcome' => 'completed'];
+    }
+    assert_eq(['Photos', 'OD'], array_column(godwit_select_next_jobs($jobs, [], $later, $tonight), 'name'), 'a throttled job is re-selectable in a later session');
 });
 
 t('godwit_purge_call_params: builds fs/remote params only after the safety assertion passes', function () {

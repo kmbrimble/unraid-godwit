@@ -2175,7 +2175,11 @@ function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \
             $suffix = $errorCount > $baseline ? sprintf(' — %d transfer error%s also logged, see /var/log/godwit.log', $errorCount, $errorCount === 1 ? '' : 's') : '';
             return "paused — $reason, resumes $resume ($bytes uploaded)$suffix";
         case 'throttled':
-            return "error — Google's daily upload limit reached ($bytes) at $when";
+            // Google's own quota, on Google's clock — not our budget ledger,
+            // and not an error: no "cap"/"budget" wording, and no error-count
+            // suffix (the 4 errors of the 2026-09-22 incident were the fatal
+            // itself plus its cancelled in-flight uploads).
+            return "paused — Google's own daily upload limit reached, resumes $resume ($bytes uploaded)";
         case 'auth':
             return "error — authentication expired ($bytes) at $when";
         case 'interrupted':
@@ -2339,10 +2343,34 @@ function godwit_throttled_until(SQLite3 $db, string $remote, int $now): ?int
     return (int) $row['until_ts'];
 }
 
-/** Whether an rc job error looks like Google's daily-upload-limit rejection (surfaces via --drive-stop-on-upload-limit as a fatal transfer error, distinct from the auth/quota errors godwit_classify_error() already handles). */
+/**
+ * Whether an rc job error is Google's own daily-upload-limit rejection.
+ * With --drive-stop-on-upload-limit (always set, see the RCLONE_DRIVE_*
+ * env above) rclone's drive backend turns Google's exact "User rate limit
+ * exceeded." / userRateLimitExceeded 403 on an upload into a FatalError —
+ * highest currentError() precedence, so this text IS job/status's error even
+ * when other per-file errors or a cutoff ride along. Captured live
+ * 2026-09-22 (Photos, after 220.7 GB): `googleapi: Error 403: User rate
+ * limit exceeded., userRateLimitExceeded`. rcd's own log line "Received
+ * upload limit error" is NOT part of the job error, so the older
+ * "upload limit"/uploadLimitExceeded substrings alone never matched it.
+ * Both halves of the real pair are required — the bare phrase alone could
+ * come from anything that merely echoes it.
+ */
 function godwit_is_upload_limit_error(string $message): bool
 {
-    return stripos($message, 'upload limit') !== false || stripos($message, 'uploadLimitExceeded') !== false;
+    return stripos($message, 'upload limit') !== false
+        || stripos($message, 'uploadLimitExceeded') !== false
+        || (str_contains($message, 'User rate limit exceeded.') && str_contains($message, 'userRateLimitExceeded'));
+}
+
+/** Remotes with an unexpired Google-quota block (godwit_mark_throttled()). Fed to godwit_select_next_jobs() as if they were busy, so the whole remote's queue waits — Google's quota is account-wide, not per job. */
+function godwit_throttled_remotes(SQLite3 $db, array $jobs, int $now): array
+{
+    return array_values(array_filter(
+        array_unique(array_column($jobs, 'remote')),
+        fn ($remote) => godwit_throttled_until($db, $remote, $now) !== null
+    ));
 }
 
 // --- Windows and speed ---------------------------------------------------
@@ -2477,18 +2505,25 @@ function godwit_next_window_start_ts(array $window, \DateTimeImmutable $now): in
     return $now->setTime($sh, $sm, 0)->getTimestamp();
 }
 
-/** "H:i" label of the earliest upcoming start across every configured window — what a budget/window-paused job's status text tells the user to expect, instead of a hardcoded "22:00". Null if there are no windows at all. Formats in $now's own timezone (via DateTimeImmutable, not the date() function's process-wide default) — plain date($fmt, $ts) would silently render in UTC regardless of what timezone $now was built in. */
-function godwit_next_window_start_label(array $windows, \DateTimeImmutable $now): ?string
+/** Timestamp of the earliest upcoming start across every configured window, or null if there are none. */
+function godwit_next_window_start_any_ts(array $windows, \DateTimeImmutable $now): ?int
 {
-    if (count($windows) === 0) {
-        return null;
-    }
     $best = null;
     foreach ($windows as $w) {
         $ts = godwit_next_window_start_ts($w, $now);
         if ($best === null || $ts < $best) {
             $best = $ts;
         }
+    }
+    return $best;
+}
+
+/** "H:i" label of the earliest upcoming start across every configured window — what a budget/window-paused job's status text tells the user to expect, instead of a hardcoded "22:00". Null if there are no windows at all. Formats in $now's own timezone (via DateTimeImmutable, not the date() function's process-wide default) — plain date($fmt, $ts) would silently render in UTC regardless of what timezone $now was built in. */
+function godwit_next_window_start_label(array $windows, \DateTimeImmutable $now): ?string
+{
+    $best = godwit_next_window_start_any_ts($windows, $now);
+    if ($best === null) {
+        return null;
     }
     return (new \DateTimeImmutable('@' . $best))->setTimezone($now->getTimezone())->format('H:i');
 }
@@ -3089,16 +3124,17 @@ function godwit_budget_reached_notification(SQLite3 $db, string $remote, string 
     ];
 }
 
-/** Notifies once on entering the throttled state, not on every tick it remains throttled — mirrors the auth-expired transition pattern in godwit_health_notifications(). */
-function godwit_throttled_notification(string $remote, bool $wasAlreadyThrottled): ?array
+/** Notifies once on entering the throttled state, not on every tick it remains throttled — mirrors the auth-expired transition pattern in godwit_health_notifications(). Calm ('normal'), not an alert: Google's own daily quota is expected, self-resolving, and nothing here is broken. */
+function godwit_throttled_notification(string $remote, bool $wasAlreadyThrottled, ?string $resumeLabel = null): ?array
 {
     if ($wasAlreadyThrottled) {
         return null;
     }
+    $resume = $resumeLabel ?? 'the next window';
     return [
-        'subject' => "Godwit: $remote throttled by Google for 24h",
-        'description' => "$remote hit Google's daily upload limit — no further uploads to $remote until the throttle clears.",
-        'importance' => 'alert',
+        'subject' => "Godwit: $remote hit Google's daily upload limit",
+        'description' => "Google's own per-account daily upload limit stopped uploads to $remote (not Godwit's budget) — all $remote jobs wait and resume $resume.",
+        'importance' => 'normal',
     ];
 }
 

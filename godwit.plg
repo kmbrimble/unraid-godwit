@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.6.1">
+<!ENTITY version   "0.6.2">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,16 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.6.2
+- Fixed Google's own daily upload limit showing as a red "error". Overnight
+  2026-09-21 the Photos job uploaded 220.7 GB cleanly, then Google stopped it
+  with "User rate limit exceeded" and Godwit stored it as a generic error.
+  That stop is Google's per-account quota (on Google's clock, separate from
+  Godwit's own 700 GiB budget) and is now recognised, shown as "paused —
+  Google's own daily upload limit reached, resumes 22:00", and notified as a
+  normal (not alert) message. The whole remote waits until the next window
+  starts instead of the rest of its queue failing the same way seconds later.
+  Real, unrelated errors still read as errors.
 ###0.6.1
 - Fixed a job that hit its daily upload cap while almost no budget was
   left showing as "error" instead of a calm "paused". When the remaining
