@@ -115,10 +115,12 @@ if (file_exists($pidFile)) {
 </div>
 <style>
 /* CSS-drawn expand triangle: a bare unicode glyph in a <button> rendered blank on
-   some browsers/fonts (v0.6.3). */
-.godwit-tree-expand { width: 18px; height: 18px; padding: 0; margin: 0 2px 0 0; border: 0; background: transparent; vertical-align: middle; cursor: pointer; }
-.godwit-tree-expand::before { content: ""; display: inline-block; border-style: solid; border-width: 5px 0 5px 8px; border-color: transparent transparent transparent currentColor; }
-.godwit-tree-expand.open::before { border-width: 8px 5px 0 5px; border-color: currentColor transparent transparent transparent; }
+   some browsers/fonts (v0.6.3). Scoped under #tree-dialog because the stock webGui
+   button rule (default-base.css: min-width 86px, padding 8px, margin, gradient
+   background, uppercase bold text) would otherwise outrank a bare class selector. */
+#tree-dialog button.godwit-tree-expand { min-width: 0; width: 18px; height: 18px; padding: 0; margin: 0 2px 0 0; border: 0; background: transparent; color: inherit; font-size: 0; letter-spacing: 0; vertical-align: middle; cursor: pointer; }
+#tree-dialog button.godwit-tree-expand::before { content: ""; display: inline-block; border-style: solid; border-width: 5px 0 5px 8px; border-color: transparent transparent transparent currentColor; }
+#tree-dialog button.godwit-tree-expand.open::before { border-width: 8px 5px 0 5px; border-color: currentColor transparent transparent transparent; }
 </style>
 </details>
 

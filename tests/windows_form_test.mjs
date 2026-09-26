@@ -172,9 +172,8 @@ t('godwitTreeIsDirty: an added include, removed include or new exclude is dirty'
     assert.equal(sandbox.godwitTreeIsDirty({ included: saved.included, excluded: [{ path: 'A/x', is_dir: true }] }, saved), true);
 });
 
-const treeDialogHtml = page.slice(page.indexOf('<div id="tree-dialog"'), page.indexOf('</div>', page.indexOf('id="tree-root"')));
 t('tree dialog: commit/cancel live in the dialog button pane, not the scrolling content', () => {
-    assert.ok(!treeDialogHtml.includes('tree-done'), 'Done must not be inside the scrolling #tree-dialog content');
+    assert.ok(!page.includes('tree-done'), 'the old bottom-of-scroll #tree-done button must be gone');
     const init = page.slice(page.indexOf("$('#tree-dialog').dialog({"));
     const opts = init.slice(0, init.indexOf('});') );
     assert.ok(/buttons\s*:/.test(opts) && /Done/.test(opts) && /Cancel/.test(opts), 'dialog buttons Done + Cancel');
@@ -183,7 +182,7 @@ t('tree dialog: commit/cancel live in the dialog button pane, not the scrolling 
 
 t('tree dialog: expand affordance is CSS-drawn, no bare unicode triangle glyphs', () => {
     assert.ok(!/[▸▾]/.test(page), 'no ▸/▾ glyphs left in Godwit.page');
-    assert.ok(page.includes('.godwit-tree-expand::before'), 'CSS triangle rule present');
+    assert.ok(page.includes('#tree-dialog button.godwit-tree-expand::before'), 'CSS triangle rule present');
 });
 
 console.log(`\n${passed}/${passed} windows-form + tree-selection checks passed`);

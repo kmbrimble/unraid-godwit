@@ -28,8 +28,12 @@ sort *before* `1.0.9`.
 - **Blank expand boxes.** The `▸`/`▾` were bare unicode characters in a
   `<button>`; Kieren's browser rendered them as empty bordered boxes (glyph
   coverage in the button's font). Replaced with a CSS border-trick triangle
-  (`.godwit-tree-expand::before`, `.open` for expanded), buttons restyled
-  borderless, `aria-label="Expand"`. Not reproduced locally (headless); the
+  (`#tree-dialog button.godwit-tree-expand::before`, `.open` for expanded),
+  `aria-label="Expand"`. Host theme checked read-only over ssh
+  (`default-base.css`): stock `button` rules force `min-width:86px`, `padding:8px`,
+  a margin, bold uppercase text and a gradient background at specificity
+  (0,1,1), so a bare-class override would have lost — the rule is scoped under
+  `#tree-dialog` (1,1,1) and resets min-width/padding/margin/background/color. Not reproduced locally (headless); the
   fix removes the font dependency entirely rather than diagnosing the font.
 - Tests: 4 new node checks in `tests/windows_form_test.mjs` (dirty logic;
   Done/Cancel/beforeClose wiring and Done absent from scrolling content; no
