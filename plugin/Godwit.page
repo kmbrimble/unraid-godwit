@@ -112,8 +112,14 @@ if (file_exists($pidFile)) {
 <div id="tree-dialog" style="display:none">
     <p>Total selected: <span id="tree-total-size">—</span><span id="tree-free-space"></span></p>
     <div id="tree-root">Loading…</div>
-    <button id="tree-done" type="button">Done</button>
 </div>
+<style>
+/* CSS-drawn expand triangle: a bare unicode glyph in a <button> rendered blank on
+   some browsers/fonts (v0.6.3). */
+.godwit-tree-expand { width: 18px; height: 18px; padding: 0; margin: 0 2px 0 0; border: 0; background: transparent; vertical-align: middle; cursor: pointer; }
+.godwit-tree-expand::before { content: ""; display: inline-block; border-style: solid; border-width: 5px 0 5px 8px; border-color: transparent transparent transparent currentColor; }
+.godwit-tree-expand.open::before { border-width: 8px 5px 0 5px; border-color: currentColor transparent transparent transparent; }
+</style>
 </details>
 
 <details id="godwit-section-windows">
@@ -650,6 +656,13 @@ function godwitTreeToggle(node, included, excluded) {
     }
     return { included: newIncluded, excluded: newExcluded };
 }
+
+// True when the dialog's working selection differs from what was saved —
+// order-insensitive, since toggling can reorder the arrays.
+function godwitTreeIsDirty(current, saved) {
+    var key = function (list) { return list.map(function (n) { return n.path; }).sort().join('\n'); };
+    return key(current.included) !== key(saved.included) || key(current.excluded) !== key(saved.excluded);
+}
 // GODWIT_TREE_END
 
 var godwitJobSelections = {}; // job name -> {type, included, excluded}, the source of truth for every row's tree selection
@@ -673,7 +686,7 @@ function godwitTreeRenderChildren(container, parentPath, entries) {
     container.innerHTML = entries.map(function (e) {
         var path = parentPath ? parentPath + '/' + e.name : e.name;
         var checked = godwitTreeNodeChecked(path, godwitTreeIncluded, godwitTreeExcluded);
-        var expandBtn = e.is_dir ? '<button type="button" class="godwit-tree-expand" data-path="' + esc(path) + '">▸</button> ' : '';
+        var expandBtn = e.is_dir ? '<button type="button" class="godwit-tree-expand" data-path="' + esc(path) + '" aria-label="Expand"></button> ' : '';
         return '<div class="godwit-tree-node" data-path="' + esc(path) + '" style="margin-left:16px">' +
             expandBtn +
             '<label><input type="checkbox" class="godwit-tree-check" data-path="' + esc(path) + '" data-isdir="' + (e.is_dir ? '1' : '0') + '"' + (checked ? ' checked' : '') + '> ' + esc(godwitTreeNodeLabel(e)) + '</label> ' +
@@ -751,13 +764,13 @@ document.getElementById('tree-root').addEventListener('click', function (ev) {
         var children = node.querySelector('.godwit-tree-children');
         if (children.style.display === 'none') {
             children.style.display = 'block';
-            ev.target.textContent = '▾';
+            ev.target.classList.add('open');
             if (!children.dataset.loaded) {
                 godwitTreeLoad(node.dataset.path, children).done(function () { children.dataset.loaded = '1'; });
             }
         } else {
             children.style.display = 'none';
-            ev.target.textContent = '▸';
+            ev.target.classList.remove('open');
         }
         return;
     }
@@ -786,7 +799,9 @@ function godwitTreeOpen(remote, targetName) {
     $('#tree-dialog').dialog('open');
 }
 
-document.getElementById('tree-done').addEventListener('click', function () {
+var godwitTreeForceClose = false;
+
+function godwitTreeDone() {
     var sel = { included: godwitTreeIncluded, excluded: godwitTreeExcluded };
     if (godwitTreeTargetName === null) {
         godwitTreeScratch = sel;
@@ -796,8 +811,9 @@ document.getElementById('tree-done').addEventListener('click', function () {
         godwitJobSelections[godwitTreeTargetName] = { type: 'selective', included: sel.included, excluded: sel.excluded };
         godwitJobsRefresh();
     }
+    godwitTreeForceClose = true;
     $('#tree-dialog').dialog('close');
-});
+}
 
 // Splits a full tree-selection path ("Kieren/Documents/Foo") into its share
 // (top segment) and the rest — the tree spans every share (v0.6.0), but
@@ -1076,7 +1092,21 @@ $('#drive-add-dialog').dialog({ autoOpen: false, modal: true, width: 620, title:
 $('#onedrive-add-dialog').dialog({ autoOpen: false, modal: true, width: 620, title: 'Add OneDrive remote' });
 $('#onedrive-picker').dialog({ autoOpen: false, modal: true, width: 500, title: 'Choose a OneDrive drive' });
 $('#job-add-dialog').dialog({ autoOpen: false, modal: true, width: 500, title: 'Add job' });
-$('#tree-dialog').dialog({ autoOpen: false, modal: true, width: 500, height: 500, title: 'Browse' });
+// Done/Cancel live in the dialog's own button pane, which stays pinned below the
+// scrolling content. beforeClose also guards the titlebar ✕ and Esc, so a dirty
+// selection is never discarded silently.
+$('#tree-dialog').dialog({
+    autoOpen: false, modal: true, width: 500, height: 500, title: 'Browse',
+    buttons: [
+        { text: 'Done', click: godwitTreeDone },
+        { text: 'Cancel', click: function () { $(this).dialog('close'); } }
+    ],
+    beforeClose: function () {
+        if (godwitTreeForceClose) { godwitTreeForceClose = false; return true; }
+        var dirty = godwitTreeIsDirty({ included: godwitTreeIncluded, excluded: godwitTreeExcluded }, godwitTreeSelectionFor(godwitTreeTargetName));
+        return !dirty || confirm('Discard your unsaved selection changes?');
+    }
+});
 
 document.getElementById('drive-add-open').addEventListener('click', function () { $('#drive-add-dialog').dialog('open'); });
 document.getElementById('onedrive-add-open').addEventListener('click', function () { $('#onedrive-add-dialog').dialog('open'); });

@@ -858,6 +858,8 @@ after the `--max-duration` text check (window stays window). 334/334, 0 skips,
 
 **v0.6.2 (built and offline-verified 2026-09-22, 341/341 with 0 skips, 3 runs) stops Google's own daily upload limit reading as `error`.** Live: Photos hit `googleapi: Error 403: User rate limit exceeded., userRateLimitExceeded` after 220.7 GB and was stored `error`. The existing `throttled` outcome (remote block, notification) already modelled this but `godwit_is_upload_limit_error()` never matched that text (only rcd's log line says "upload limit"); it does now. `throttled` stays first in `godwit_classify_job_outcome()` (Google's fatal outranks our own budget/cutoff signals). Label is a calm "paused — Google's own daily upload limit reached, resumes HH:MM"; notification is `normal`. The whole remote waits until the next window start (`godwit_throttled_remotes()` fed into `godwit_select_next_jobs()`), not a flat 24 h. Not gated by the 20% budget rule. Not verified on the host. See CHANGELOG 0.6.2.
 
+**v0.6.3 (built and offline-verified 2026-09-26, 341/341 PHP with 0 skips over 3 runs, 23/23 Node) fixes the tree picker discarding edits.** The "Close" Kieren used was jQuery UI's titlebar close; Done was at the bottom of the scroll area. Done/Cancel are now the dialog's pinned `buttons` pane, `beforeClose` confirms if `godwitTreeIsDirty()`; expand arrows are CSS-drawn triangles instead of unicode glyphs. No live browser click-through was done (headless) — confirm in a real browser. See CHANGELOG 0.6.3.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command

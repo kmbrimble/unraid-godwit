@@ -10,6 +10,32 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-26
+
+### Fixed
+
+- **Tree picker silently discarded edits (Kieren lost a ~20-root OneDrive
+  selection twice).** Ground truth in `plugin/Godwit.page`: `#tree-dialog`
+  had no Close button of its own — the top control was jQuery UI's stock
+  titlebar close, which just closes the dialog; the only commit control was
+  `#tree-done`, at the bottom of the 500px-high scrolling content. Done and a
+  new Cancel are now the dialog's own `buttons` pane (pinned below the scroll
+  area, never scrolled away), and a `beforeClose` guard confirms before
+  discarding when `godwitTreeIsDirty()` (new, pure, order-insensitive, in the
+  node-tested `GODWIT_TREE` block) says the working selection differs from the
+  saved one. That covers the titlebar close, Esc and Cancel alike; Done sets
+  a one-shot force-close flag so it never prompts.
+- **Blank expand boxes.** The `▸`/`▾` were bare unicode characters in a
+  `<button>`; Kieren's browser rendered them as empty bordered boxes (glyph
+  coverage in the button's font). Replaced with a CSS border-trick triangle
+  (`.godwit-tree-expand::before`, `.open` for expanded), buttons restyled
+  borderless, `aria-label="Expand"`. Not reproduced locally (headless); the
+  fix removes the font dependency entirely rather than diagnosing the font.
+- Tests: 4 new node checks in `tests/windows_form_test.mjs` (dirty logic;
+  Done/Cancel/beforeClose wiring and Done absent from scrolling content; no
+  unicode triangle left, CSS rule present) — red before the change. UI
+  behaviour itself (real click-through) is unverified without a browser.
+
 ## [0.6.2] - 2026-09-22
 
 ### Fixed

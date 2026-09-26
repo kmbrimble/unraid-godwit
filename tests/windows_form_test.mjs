@@ -157,4 +157,33 @@ t('a sibling folder is unaffected by an unrelated include/exclude pair', () => {
     assert.equal(sandbox.godwitTreeNodeChecked('Pictures/holiday.jpg', included, excluded), false);
 });
 
+// v0.6.3: the tree dialog's Done was at the bottom of the scroll area and the
+// only visible control (the titlebar close) silently discarded edits.
+t('godwitTreeIsDirty: identical selection is clean, order-insensitive', () => {
+    const a = { included: [{ path: 'A', is_dir: true }, { path: 'B', is_dir: true }], excluded: [] };
+    const b = { included: [{ path: 'B', is_dir: true }, { path: 'A', is_dir: true }], excluded: [] };
+    assert.equal(sandbox.godwitTreeIsDirty(a, b), false);
+});
+
+t('godwitTreeIsDirty: an added include, removed include or new exclude is dirty', () => {
+    const saved = { included: [{ path: 'A', is_dir: true }], excluded: [] };
+    assert.equal(sandbox.godwitTreeIsDirty({ included: [{ path: 'A', is_dir: true }, { path: 'B', is_dir: true }], excluded: [] }, saved), true);
+    assert.equal(sandbox.godwitTreeIsDirty({ included: [], excluded: [] }, saved), true);
+    assert.equal(sandbox.godwitTreeIsDirty({ included: saved.included, excluded: [{ path: 'A/x', is_dir: true }] }, saved), true);
+});
+
+const treeDialogHtml = page.slice(page.indexOf('<div id="tree-dialog"'), page.indexOf('</div>', page.indexOf('id="tree-root"')));
+t('tree dialog: commit/cancel live in the dialog button pane, not the scrolling content', () => {
+    assert.ok(!treeDialogHtml.includes('tree-done'), 'Done must not be inside the scrolling #tree-dialog content');
+    const init = page.slice(page.indexOf("$('#tree-dialog').dialog({"));
+    const opts = init.slice(0, init.indexOf('});') );
+    assert.ok(/buttons\s*:/.test(opts) && /Done/.test(opts) && /Cancel/.test(opts), 'dialog buttons Done + Cancel');
+    assert.ok(/beforeClose\s*:/.test(opts), 'beforeClose dirty guard');
+});
+
+t('tree dialog: expand affordance is CSS-drawn, no bare unicode triangle glyphs', () => {
+    assert.ok(!/[▸▾]/.test(page), 'no ▸/▾ glyphs left in Godwit.page');
+    assert.ok(page.includes('.godwit-tree-expand::before'), 'CSS triangle rule present');
+});
+
 console.log(`\n${passed}/${passed} windows-form + tree-selection checks passed`);

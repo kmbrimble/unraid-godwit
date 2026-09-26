@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.6.2">
+<!ENTITY version   "0.6.3">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,13 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.6.3
+- Fixed the folder-picker (Browse) losing edits. Done was at the very bottom
+  of the scrolling list while the only visible control, the titlebar close,
+  threw the whole selection away with no warning. Done and Cancel now sit in a
+  button bar pinned below the list, and closing any other way (titlebar close,
+  Esc) asks first if you have unsaved changes. The expand arrows are now drawn
+  with CSS, so they no longer show as blank boxes on browsers lacking the glyph.
 ###0.6.2
 - Fixed Google's own daily upload limit showing as a red "error". Overnight
   2026-09-21 the Photos job uploaded 220.7 GB cleanly, then Google stopped it
