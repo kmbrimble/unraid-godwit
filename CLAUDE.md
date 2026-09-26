@@ -860,6 +860,8 @@ after the `--max-duration` text check (window stays window). 334/334, 0 skips,
 
 **v0.6.3 (built and offline-verified 2026-09-26, 341/341 PHP with 0 skips over 3 runs, 23/23 Node) fixes the tree picker discarding edits.** The "Close" Kieren used was jQuery UI's titlebar close; Done was at the bottom of the scroll area. Done/Cancel are now the dialog's pinned `buttons` pane, `beforeClose` confirms if `godwitTreeIsDirty()`; expand arrows are CSS-drawn triangles instead of unicode glyphs. No live browser click-through was done (headless) — confirm in a real browser. See CHANGELOG 0.6.3.
 
+**KNOWN ISSUE (found 2026-09-26, unresolved, tracked here not in CHANGELOG): flaky real-rcd e2e test.** `e2e (real rcd): a near-zero remaining budget cutoff mid-directory-listing reproduces the exact live-incident shape and is now classified budget, not error` (the v0.6.1 test) intermittently fails with `expected a context-canceled march failure to reproduce the live incident: 'max transfer limit reached as set by --max-transfer'` — i.e. rclone's error text is the graceful cutoff message rather than `context canceled`, so the scenario's timing race didn't land. Observed while building v0.6.3 (which touches no PHP): 2 failures in 9 runs on the v0.6.3 worktree (7/9 clean), 0 in 6 on untouched origin/main (6/6 clean). Small samples; attributed to a pre-existing timing race, not proven. Next step: reproduce in a loop, and either make the scenario deterministic or accept both texts if both are genuinely valid rclone outcomes for that shape.
+
 See PLAN.md §5 for the remaining phases.
 
 ## Test command
