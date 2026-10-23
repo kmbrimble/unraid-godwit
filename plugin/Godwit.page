@@ -886,6 +886,16 @@ document.getElementById('godwit-jobs-table').addEventListener('click', function 
     }
 });
 
+// The recorded reason for the last run's ending (job_runs.error_text,
+// server-side scrubbed and capped at 4 KB). Escaped, shown in a <pre> inside a
+// collapsed <details> so a long rclone dump does not blow out the table row.
+function godwitRunErrorDetailHtml(j) {
+    if (j.running || !j.last_run || !j.last_run.error_text) { return ''; }
+    return '<details class="godwit-run-error"><summary>error detail</summary>' +
+        '<pre style="white-space:pre-wrap;word-break:break-word;max-height:16em;overflow:auto;margin:4px 0 0">' +
+        esc(j.last_run.error_text) + '</pre></details>';
+}
+
 function godwitJobRowHtml(j) {
     var sel = godwitJobSelections[j.name] || { type: j.type || 'share', included: j.included || [], excluded: j.excluded || [] };
     var pending = !('status_text' in j);
@@ -908,7 +918,7 @@ function godwitJobRowHtml(j) {
         '<option value="copy"' + (j.mode === 'copy' ? ' selected' : '') + '>copy</option></select></td>' +
         '<td><input type="number" class="godwit-job-transfers" value="' + (j.transfers || 4) + '" size="3"></td>' +
         '<td>' + selectionCell + '</td>' +
-        '<td>' + esc(state) + '</td>' +
+        '<td>' + esc(state) + godwitRunErrorDetailHtml(j) + '</td>' +
         '<td>' + esc(String(queue)) + '</td>' +
         '</tr>';
 }

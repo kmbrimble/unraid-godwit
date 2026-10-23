@@ -510,6 +510,7 @@ while ($running) {
                 continue;
             }
             $errorMsg = trim((string) ($status['error'] ?? ''));
+            $statsLastError = trim((string) ($stats['lastError'] ?? ''));
             $files = (int) ($stats['transfers'] ?? 0);
             $errors = (int) ($stats['errors'] ?? 0);
             // godwit_classify_job_outcome() reads rclone's own fixed cutoff
@@ -537,7 +538,7 @@ while ($running) {
                     godwit_notify($n['subject'], $n['description'], $n['importance']);
                 }
             } elseif ($outcome === 'error') {
-                $n = godwit_job_error_notification($name, $errorMsg);
+                $n = godwit_job_error_notification($name, godwit_scrub_error_text($errorMsg, 1024));
                 godwit_notify($n['subject'], $n['description'], $n['importance']);
             } elseif ($outcome === 'budget' || $outcome === 'window') {
                 // Two clean-cutoff error baselines, ground-truthed locally
@@ -553,14 +554,23 @@ while ($running) {
                 $n = godwit_cap_stop_notification($name, $outcome, $bytes, $errors, $baselineErrors, $resumeLabel);
                 godwit_notify($n['subject'], $n['description'], $n['importance']);
             }
-            godwit_finish_job_run($db, $aj['run_id'], $now, $bytes, $files, $errors, $outcome);
+            // Record WHY the run ended (issue #2: only a count was kept, so a
+            // run that failed every night could not be diagnosed after rcd.log
+            // was lost). Completed runs have nothing to explain.
+            $errorText = null;
+            if ($outcome !== 'completed') {
+                $logLines = godwit_rcd_log_error_lines($rcdLogFile, (int) $aj['started_ts'], $now, new \DateTimeZone(date_default_timezone_get()));
+                $errorText = godwit_compose_run_error_text($errorMsg, $statsLastError, $logLines);
+            }
+            godwit_finish_job_run($db, $aj['run_id'], $now, $bytes, $files, $errors, $outcome, $errorText);
             if ($outcome === 'completed') {
                 $n = godwit_first_seed_notification($db, $name);
                 if ($n !== null) {
                     godwit_notify($n['subject'], $n['description'], $n['importance']);
                 }
             }
-            godwit_log($logFile, "job finished: $name -> $outcome ($bytes bytes, $files files, $errors errors)");
+            $headline = godwit_error_text_headline($errorText);
+            godwit_log($logFile, "job finished: $name -> $outcome ($bytes bytes, $files files, $errors errors)" . ($headline !== '' ? " — $headline" : ''));
             unset($activeJobs[$name]);
         }
 

@@ -345,6 +345,179 @@ function godwit_redact(string $text): string
     return $text;
 }
 
+// --- Per-run error text (job_runs.error_text) -------------------------------
+
+/** Hard cap on what job_runs.error_text may hold, in bytes. */
+const GODWIT_ERROR_TEXT_MAX_BYTES = 4096;
+
+/**
+ * Makes rclone error/output text safe to persist and to show on the status
+ * page: redacts secret-shaped values, strips control characters (newlines
+ * and tabs are kept so multi-line output stays readable), forces valid
+ * UTF-8 (a stray byte would make json_encode() of the whole jobs_status
+ * response return false), and keeps only the TAIL of the text — the last
+ * lines of rclone's output are the ones that name the fatal error — at most
+ * $maxBytes bytes including the truncation marker.
+ *
+ * Redaction happens BEFORE truncation so a secret cut in half by the
+ * truncation can never survive as an unrecognisable fragment, and the input
+ * is first clamped to a few times the output cap so a runaway log tail
+ * cannot make the regex passes expensive.
+ *
+ * godwit_redact() covers the rc-body and rclone.conf shapes; the extra
+ * patterns here cover what appears in rclone's own error text: bearer
+ * tokens, Google OAuth access (ya29.) and refresh (1//) tokens, JWTs,
+ * OAuth client ids, URL query secrets, and rcd's --user/--pass.
+ */
+function godwit_scrub_error_text(string $text, int $maxBytes = GODWIT_ERROR_TEXT_MAX_BYTES): string
+{
+    if ($text === '' || $maxBytes <= 0) {
+        return '';
+    }
+    $text = str_replace(["\r\n", "\r"], "\n", $text);
+    $clamp = $maxBytes * 8;
+    if (strlen($text) > $clamp) {
+        $text = substr($text, -$clamp);
+    }
+    $text = godwit_redact($text);
+    $patterns = [
+        '/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/=-]+/i' => '$1 <redacted>',
+        '/\b(Authorization|Proxy-Authorization)\s*[:=]\s*[^\r\n]*/i' => '$1: <redacted>',
+        '/\bya29\.[A-Za-z0-9._-]+/' => '<redacted>',
+        '/(?<![A-Za-z0-9\/])1\/\/[A-Za-z0-9._-]{20,}/' => '<redacted>',
+        '/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/' => '<redacted>',
+        '/[0-9]{6,}-[a-z0-9]{10,}\.apps\.googleusercontent\.com/i' => '<redacted>',
+        '/(--(?:rc-)?(?:user|pass|password))(?:=|\s+)\S+/i' => '$1 <redacted>',
+        '/\b(RCLONE_RC_(?:USER|PASS)|password|passwd|pass|secret|(?:access|secret|api)[_-]?key|key|code|sig|signature|x-goog-signature|x-amz-signature)=[^\s&"\']+/i' => '$1=<redacted>',
+        '/"(password|passwd|secret|api_key|authorization)"\s*:\s*"(?:\\\\.|[^"\\\\])*"/i' => '"$1":"<redacted>"',
+    ];
+    foreach ($patterns as $re => $replacement) {
+        $text = preg_replace($re, $replacement, $text) ?? '';
+    }
+    $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]+/', ' ', $text) ?? '';
+    $text = trim($text);
+    if (strlen($text) > $maxBytes) {
+        $marker = '[... truncated, showing the last part ...]' . "\n";
+        $keep = max(0, $maxBytes - strlen($marker));
+        $text = substr($text, -$keep);
+        // Do not start mid-way through a multi-byte character.
+        $text = preg_replace('/^[\x80-\xBF]+/', '', $text) ?? '';
+        $text = $marker . $text;
+    }
+    if (preg_match('//u', $text) !== 1) {
+        $text = preg_replace('/[\x80-\xFF]/', '?', $text) ?? '';
+    }
+    return $text;
+}
+
+/**
+ * The ERROR/CRITICAL lines rcd wrote to its log between $startTs and
+ * $endTs (inclusive, padded by $padSeconds either side because rclone's
+ * log timestamps are whole seconds and godwitd polls on a tick), oldest
+ * first, at most the last $maxLines of them. Only the last $tailBytes of the
+ * log file are read, so a long-lived rcd.log never costs more than that.
+ *
+ * rcd is one shared process, so while two remotes run at once their lines
+ * interleave — the caller labels this section accordingly rather than
+ * claiming the lines belong to one job. rclone stamps lines in the rcd
+ * process's local time; $tz must be that zone (godwitd's own default zone,
+ * which on the live host matches the system clock — see
+ * godwit_resolve_timezone()).
+ *
+ * @return string[]
+ */
+function godwit_rcd_log_error_lines(string $logPath, int $startTs, int $endTs, \DateTimeZone $tz, int $maxLines = 40, int $tailBytes = 1048576, int $padSeconds = 5): array
+{
+    if (!is_file($logPath)) {
+        return [];
+    }
+    $fh = @fopen($logPath, 'rb');
+    if ($fh === false) {
+        return [];
+    }
+    $size = (int) @filesize($logPath);
+    if ($size > $tailBytes) {
+        fseek($fh, $size - $tailBytes);
+        fgets($fh); // drop the (probably partial) first line
+    }
+    $lines = [];
+    while (($line = fgets($fh)) !== false) {
+        if (!preg_match('#^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}) (ERROR|CRITICAL)\s*:#', $line, $m)) {
+            continue;
+        }
+        $dt = \DateTimeImmutable::createFromFormat('Y/m/d H:i:s', $m[1], $tz);
+        if ($dt === false) {
+            continue;
+        }
+        $ts = $dt->getTimestamp();
+        if ($ts < $startTs - $padSeconds || $ts > $endTs + $padSeconds) {
+            continue;
+        }
+        $lines[] = rtrim($line, "\r\n");
+        if (count($lines) > $maxLines * 4) {
+            array_shift($lines); // bounded memory on a pathological log
+        }
+    }
+    fclose($fh);
+    return array_slice($lines, -$maxLines);
+}
+
+/**
+ * Builds the text stored in job_runs.error_text: rclone's own job/status
+ * error (the reason the run ended), then core/stats' last error if it adds
+ * something, then rcd's ERROR/CRITICAL log lines from the run's time window.
+ * Returned scrubbed and truncated to GODWIT_ERROR_TEXT_MAX_BYTES; null when
+ * there is nothing to record.
+ *
+ * @param string[] $logLines
+ */
+function godwit_compose_run_error_text(string $jobError, string $statsLastError, array $logLines): ?string
+{
+    $parts = [];
+    $jobError = trim($jobError);
+    $statsLastError = trim($statsLastError);
+    if ($jobError !== '') {
+        $parts[] = "job error: $jobError";
+    }
+    if ($statsLastError !== '' && $statsLastError !== $jobError && !str_contains($jobError, $statsLastError)) {
+        $parts[] = "last error: $statsLastError";
+    }
+    if ($logLines !== []) {
+        $parts[] = "rcd.log errors during this run (rcd is shared, so a concurrent job on another remote can appear here):\n" . implode("\n", $logLines);
+    }
+    if ($parts === []) {
+        return null;
+    }
+    $text = godwit_scrub_error_text(implode("\n", $parts));
+    return $text === '' ? null : $text;
+}
+
+/** One short line of a stored error text for a status label or log line: the first line of the "job error:" part if there is one, else the first non-empty line, clipped to $maxChars. */
+function godwit_error_text_headline(?string $errorText, int $maxChars = 160): string
+{
+    if ($errorText === null || trim($errorText) === '') {
+        return '';
+    }
+    $first = '';
+    foreach (explode("\n", $errorText) as $line) {
+        $line = trim($line);
+        if ($line === '') {
+            continue;
+        }
+        $first = $line;
+        break;
+    }
+    $first = preg_replace('/^job error:\s*/', '', $first) ?? $first;
+    if (strlen($first) > $maxChars) {
+        $first = substr($first, 0, $maxChars - 3);
+        while ($first !== '' && preg_match('//u', $first) !== 1) {
+            $first = substr($first, 0, -1); // do not end mid-way through a multi-byte character
+        }
+        $first .= '...';
+    }
+    return $first;
+}
+
 /**
  * Mirrors rclone's own `config create` name-validation rule (see the
  * evidence block above) plus a clash check against remotes that already
@@ -2185,7 +2358,10 @@ function godwit_job_status_label(?array $lastRun, bool $gated, array $windows, \
         case 'interrupted':
             return "interrupted (godwitd restarted mid-run, $bytes) at $when";
         default:
-            return "error ($bytes) at $when — see /var/log/godwit.log";
+            // The recorded reason (job_runs.error_text, v0.6.4) as a short
+            // headline; the full text is on the status page under the row.
+            $headline = godwit_error_text_headline($lastRun['error_text'] ?? null);
+            return $headline !== '' ? "error ($bytes) at $when — $headline" : "error ($bytes) at $when — no error text was recorded for this run";
     }
 }
 
@@ -2673,9 +2849,15 @@ function godwit_open_job_runs_table(SQLite3 $db): void
         errors INTEGER NOT NULL DEFAULT 0,
         outcome TEXT,
         eta_seconds INTEGER,
-        speed_bps INTEGER
+        speed_bps INTEGER,
+        error_text TEXT
     )');
     $db->exec('CREATE INDEX IF NOT EXISTS idx_job_runs_job_started ON job_runs(job_name, started_ts)');
+    // Migrates a table created before error_text existed (0.6.3 and
+    // earlier). exec() returns false (not an exception, exceptions mode is
+    // never enabled here) once the column already exists — safe to run on
+    // every open, same pattern as remotes_health.fail_count.
+    @$db->exec('ALTER TABLE job_runs ADD COLUMN error_text TEXT');
 }
 
 /** Updates a still-running run row's live progress (bytes/files/errors/eta/speed) — called every daemon tick while a job is active, so the status page reflects the run in progress rather than only its final result. */
@@ -2780,6 +2962,7 @@ function godwit_build_jobs_status(SQLite3 $db, array $jobs, array $settings, int
                 'files' => (int) $last['files'],
                 'errors' => (int) $last['errors'],
                 'outcome' => $last['outcome'],
+                'error_text' => $last['error_text'] ?? null,
             ] : null,
             'queue_position' => $pos,
             'status_text' => godwit_job_status_label($last, $gated, $settings['windows'] ?? [], $nowDt, (int) ($job['transfers'] ?? 4)),
@@ -2982,9 +3165,17 @@ function godwit_start_job_run(SQLite3 $db, string $jobName, string $remote, int 
     return $db->lastInsertRowID();
 }
 
-function godwit_finish_job_run(SQLite3 $db, int $runId, int $ts, int $bytes, int $files, int $errors, string $outcome): void
+/**
+ * Closes a run row. $errorText is whatever explains a non-clean ending
+ * (see godwit_compose_run_error_text()); it is passed through
+ * godwit_scrub_error_text() HERE, so no caller can persist an unredacted or
+ * oversized value. null/empty stores NULL.
+ */
+function godwit_finish_job_run(SQLite3 $db, int $runId, int $ts, int $bytes, int $files, int $errors, string $outcome, ?string $errorText = null): void
 {
-    $stmt = $db->prepare('UPDATE job_runs SET ended_ts = :ts, bytes = :bytes, files = :files, errors = :errors, outcome = :outcome WHERE id = :id');
+    $stmt = $db->prepare('UPDATE job_runs SET ended_ts = :ts, bytes = :bytes, files = :files, errors = :errors, outcome = :outcome, error_text = :error_text WHERE id = :id');
+    $scrubbed = $errorText === null ? '' : godwit_scrub_error_text($errorText);
+    $stmt->bindValue(':error_text', $scrubbed === '' ? null : $scrubbed, $scrubbed === '' ? SQLITE3_NULL : SQLITE3_TEXT);
     $stmt->bindValue(':ts', $ts, SQLITE3_INTEGER);
     $stmt->bindValue(':bytes', $bytes, SQLITE3_INTEGER);
     $stmt->bindValue(':files', $files, SQLITE3_INTEGER);
@@ -3019,7 +3210,7 @@ function godwit_interrupt_open_runs(SQLite3 $db, int $ts): array
         $rows[] = $row;
     }
     foreach ($rows as $row) {
-        godwit_finish_job_run($db, (int) $row['id'], $ts, 0, 0, 0, 'interrupted');
+        godwit_finish_job_run($db, (int) $row['id'], $ts, 0, 0, 0, 'interrupted', 'godwitd restarted while this run was in progress; rcd keeps job state in memory only, so the run was cut short and will be requeued.');
     }
     return $rows;
 }

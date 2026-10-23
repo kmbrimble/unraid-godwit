@@ -4814,6 +4814,345 @@ t('e2e (real rcd): a near-zero remaining budget cutoff mid-directory-listing rep
     }
 });
 
+// --- Per-run error text (job_runs.error_text, issue #2) -----------------------
+
+/** Fake credentials assembled at runtime so no secret-shaped literal sits in the repo. */
+function godwit_test_fake_secrets(): array
+{
+    return [
+        'access' => 'ya29.' . str_repeat('A1b2C3d4', 6),
+        'refresh' => '1//' . str_repeat('0gXyZ9', 8),
+        'bearer' => 'Bearer ' . str_repeat('tok', 12),
+        'jwt' => 'eyJ' . str_repeat('h', 12) . '.' . str_repeat('p', 12) . '.' . str_repeat('s', 12),
+        'client' => '123456789012-' . str_repeat('abc', 6) . '.apps.googleusercontent.com',
+        'pass' => 'hunter' . '2' . 'hunter',
+    ];
+}
+
+t('godwit_scrub_error_text: redacts OAuth tokens, bearer headers, JWTs, client ids, rc credentials and URL secrets', function () {
+    $s = godwit_test_fake_secrets();
+    $in = implode("\n", [
+        "Failed to create file system: couldn't get token: {$s['access']} rejected",
+        "refresh failed for {$s['refresh']}",
+        "Authorization: {$s['bearer']}",
+        "got {$s['bearer']} back",
+        "jwt {$s['jwt']} end",
+        "client {$s['client']} unknown",
+        "Using --user someone --pass {$s['pass']} as authenticated user",
+        "GET https://example.invalid/x?code={$s['pass']}&key={$s['pass']}&ok=1",
+        '{"token":"{\"access_token\":\"' . $s['access'] . '\"}","client_secret":"' . $s['pass'] . '"}',
+        "RCLONE_RC_PASS={$s['pass']}",
+        "access_token = {$s['access']}",
+    ]);
+    $out = godwit_scrub_error_text($in);
+    foreach ($s as $name => $secret) {
+        $needle = $name === 'bearer' ? substr($secret, 7) : $secret;
+        assert_true(strpos($out, $needle) === false, "the $name value must not survive scrubbing: $out");
+    }
+    assert_true(strpos($out, '<redacted>') !== false, 'redaction markers expected');
+    assert_true(strpos($out, 'ok=1') !== false, 'harmless URL parameters must be kept');
+    assert_true(strpos($out, 'rejected') !== false, 'surrounding message text must be kept');
+});
+
+t('godwit_scrub_error_text: ordinary rclone errors pass through untouched', function () {
+    $in = "march failed with 8 error(s): first error: failed to delete 1000 files\nERROR : Backup/AirVault/00008150-0015656C1A3A401C/objects/ab/cdef: Couldn't move: googleapi: Error 404: File not found.";
+    assert_eq($in, godwit_scrub_error_text($in), 'text without secrets must be unchanged');
+});
+
+t('godwit_scrub_error_text: keeps only the tail, within the cap including the marker, valid UTF-8', function () {
+    $lines = [];
+    for ($i = 1; $i <= 600; $i++) {
+        $lines[] = sprintf('line %04d — café ünïcode ✓ payload payload payload', $i);
+    }
+    $in = implode("\n", $lines);
+    assert_true(strlen($in) > 3 * GODWIT_ERROR_TEXT_MAX_BYTES, 'fixture must exceed the cap');
+    $out = godwit_scrub_error_text($in);
+    assert_true(strlen($out) <= GODWIT_ERROR_TEXT_MAX_BYTES, 'must fit the cap, got ' . strlen($out));
+    assert_true(strpos($out, 'line 0600') !== false, 'the LAST line must be kept');
+    assert_true(strpos($out, 'line 0001') === false, 'the first line must have been dropped');
+    assert_true(strpos($out, 'truncated') !== false, 'a truncation marker is expected');
+    assert_eq(1, preg_match('//u', $out), 'must be valid UTF-8 even when the cut lands inside a multi-byte character');
+    assert_true(json_encode($out) !== false, 'must survive json_encode');
+    // Every possible cut offset against a multi-byte-heavy string stays valid.
+    for ($cap = 60; $cap < 75; $cap++) {
+        $o = godwit_scrub_error_text(str_repeat('✓é', 80), $cap);
+        assert_eq(1, preg_match('//u', $o), "cap $cap produced invalid UTF-8");
+        assert_true(strlen($o) <= $cap, "cap $cap exceeded: " . strlen($o));
+    }
+});
+
+t('godwit_scrub_error_text: a secret near the truncation boundary is redacted, not left as a fragment', function () {
+    $s = godwit_test_fake_secrets();
+    for ($pad = 3900; $pad < 4200; $pad += 7) {
+        $in = str_repeat('x', $pad) . ' ' . $s['access'] . ' tail-end';
+        $out = godwit_scrub_error_text($in);
+        assert_true(strpos($out, 'ya29') === false, "pad $pad: token prefix leaked");
+        assert_true(strpos($out, 'A1b2C3d4') === false, "pad $pad: token body leaked");
+        assert_true(strlen($out) <= GODWIT_ERROR_TEXT_MAX_BYTES, "pad $pad: over cap");
+    }
+});
+
+t('godwit_scrub_error_text: invalid UTF-8 and control characters are neutralised; empty stays empty', function () {
+    $out = godwit_scrub_error_text("bad \xC3\x28 byte\x00 and \x1b[31m escape\r\nnext");
+    assert_eq(1, preg_match('//u', $out), 'must be valid UTF-8');
+    assert_true(strpos($out, "\x00") === false && strpos($out, "\x1b") === false, 'control characters must be removed');
+    assert_true(strpos($out, "\nnext") !== false, 'newlines are kept, CRLF normalised');
+    assert_eq('', godwit_scrub_error_text(''), 'empty in, empty out');
+    assert_eq('', godwit_scrub_error_text("  \n "), 'whitespace only collapses to empty');
+});
+
+t('godwit_open_job_runs_table: migrates a pre-0.6.4 table (adds error_text, keeps rows, idempotent)', function () {
+    $db = new SQLite3(':memory:');
+    $db->exec('CREATE TABLE job_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_name TEXT NOT NULL,
+        remote TEXT NOT NULL,
+        started_ts INTEGER NOT NULL,
+        ended_ts INTEGER,
+        bytes INTEGER NOT NULL DEFAULT 0,
+        files INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        outcome TEXT,
+        eta_seconds INTEGER,
+        speed_bps INTEGER
+    )');
+    $db->exec("INSERT INTO job_runs (job_name, remote, started_ts, ended_ts, errors, outcome) VALUES ('Kieren', 'gdrive', 1000, 1900, 8, 'error')");
+    godwit_open_job_runs_table($db);
+    godwit_open_job_runs_table($db); // second open must be harmless
+    $cols = [];
+    $res = $db->query('PRAGMA table_info(job_runs)');
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        $cols[] = $r['name'];
+    }
+    assert_true(in_array('error_text', $cols, true), 'error_text column must exist after migration');
+    $row = godwit_last_job_run($db, 'Kieren');
+    assert_eq(8, (int) $row['errors'], 'existing row preserved');
+    assert_eq(null, $row['error_text'], 'old rows have no recorded text');
+    $id = godwit_start_job_run($db, 'Kieren', 'gdrive', 3000);
+    godwit_finish_job_run($db, $id, 3500, 0, 0, 8, 'error', 'failed to delete 1000 files');
+    assert_eq('failed to delete 1000 files', godwit_last_job_run($db, 'Kieren')['error_text'], 'new rows record text on the migrated table');
+});
+
+t('godwit_finish_job_run: stores scrubbed, capped error text; secrets never reach the database file', function () {
+    $s = godwit_test_fake_secrets();
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    $id = godwit_start_job_run($db, 'Kieren', 'gdrive', 1000);
+    $raw = "boom {$s['access']} " . str_repeat("filler line\n", 1000) . "final {$s['refresh']}";
+    godwit_finish_job_run($db, $id, 2000, 0, 0, 8, 'error', $raw);
+    $stored = (string) godwit_last_job_run($db, 'Kieren')['error_text'];
+    assert_true(strlen($stored) <= GODWIT_ERROR_TEXT_MAX_BYTES, 'cap enforced by the writer itself, not only by callers');
+    assert_true(strpos($stored, 'final') !== false, 'tail kept');
+    $all = '';
+    $res = $db->query('SELECT * FROM job_runs');
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        $all .= json_encode($r);
+    }
+    assert_true(strpos($all, '0gXyZ9') === false && strpos($all, 'A1b2C3d4') === false, 'no secret material in any column');
+});
+
+t('godwit_finish_job_run: no text (or only whitespace) stores NULL; completed runs keep NULL', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    $a = godwit_start_job_run($db, 'A', 'gdrive', 1000);
+    godwit_finish_job_run($db, $a, 2000, 10, 1, 0, 'completed');
+    assert_eq(null, godwit_last_job_run($db, 'A')['error_text'], 'omitted text is NULL');
+    $b = godwit_start_job_run($db, 'B', 'gdrive', 1000);
+    godwit_finish_job_run($db, $b, 2000, 0, 0, 1, 'error', "  \n");
+    assert_eq(null, godwit_last_job_run($db, 'B')['error_text'], 'whitespace-only text is NULL, not an empty string');
+});
+
+t('godwit_interrupt_open_runs: records why the run was interrupted', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_start_job_run($db, 'Photos', 'gdrive', 1000);
+    godwit_interrupt_open_runs($db, 2000);
+    $text = (string) godwit_last_job_run($db, 'Photos')['error_text'];
+    assert_true(strpos($text, 'godwitd restarted') !== false, "interrupted run should explain itself: $text");
+});
+
+t('godwit_rcd_log_error_lines: only ERROR/CRITICAL lines inside the run window, oldest first, bounded', function () {
+    $tz = new \DateTimeZone('Australia/Brisbane');
+    $f = tempnam(sys_get_temp_dir(), 'gwlog');
+    file_put_contents($f, implode("\n", [
+        '2026/10/22 21:00:00 ERROR : before-window: should not appear',
+        '2026/10/22 22:00:10 INFO  : a.txt: Copied (new)',
+        '2026/10/22 22:05:00 ERROR : Backup/x: Couldn\'t move: boom',
+        '2026/10/22 22:05:01 NOTICE: noise that is not an error',
+        '2026/10/22 22:10:00 ERROR : Cancelling sync due to fatal error: failed to delete 1000 files',
+        '2026/10/22 22:10:00 CRITICAL: something fatal',
+        'continuation line without a timestamp',
+        '2026/10/23 06:00:00 ERROR : after-window: should not appear',
+        '',
+    ]));
+    $start = (new \DateTimeImmutable('2026-10-22 22:00:00', $tz))->getTimestamp();
+    $end = (new \DateTimeImmutable('2026-10-22 22:15:00', $tz))->getTimestamp();
+    $lines = godwit_rcd_log_error_lines($f, $start, $end, $tz);
+    assert_eq(3, count($lines), 'three in-window ERROR/CRITICAL lines: ' . json_encode($lines));
+    assert_true(strpos($lines[0], "Couldn't move") !== false, 'oldest first');
+    assert_true(strpos($lines[2], 'CRITICAL') !== false, 'newest last');
+    assert_eq(1, count(godwit_rcd_log_error_lines($f, $start, $end, $tz, 1)), 'maxLines honoured');
+    assert_true(strpos(godwit_rcd_log_error_lines($f, $start, $end, $tz, 1)[0], 'CRITICAL') !== false, 'bounded result keeps the newest');
+    assert_eq([], godwit_rcd_log_error_lines('/nonexistent/rcd.log', $start, $end, $tz), 'missing log is an empty result, not an error');
+    unlink($f);
+});
+
+t('godwit_rcd_log_error_lines: only the last tailBytes of a huge log are read', function () {
+    $tz = new \DateTimeZone('UTC');
+    $f = tempnam(sys_get_temp_dir(), 'gwlog');
+    $fh = fopen($f, 'wb');
+    fwrite($fh, "2026/10/22 22:05:00 ERROR : ancient line beyond the tail window\n");
+    for ($i = 0; $i < 4000; $i++) {
+        fwrite($fh, "2026/10/22 21:00:00 INFO  : padding padding padding padding padding padding padding\n");
+    }
+    fwrite($fh, "2026/10/22 22:06:00 ERROR : recent line\n");
+    fclose($fh);
+    $start = (new \DateTimeImmutable('2026-10-22 22:00:00', $tz))->getTimestamp();
+    $lines = godwit_rcd_log_error_lines($f, $start, $start + 3600, $tz, 40, 64 * 1024);
+    assert_eq(1, count($lines), 'only the recent line is within the tail: ' . json_encode($lines));
+    assert_true(strpos($lines[0], 'recent line') !== false, 'recent line kept');
+    unlink($f);
+});
+
+t('godwit_compose_run_error_text: job error, distinct last error and log lines, scrubbed; null when empty', function () {
+    $s = godwit_test_fake_secrets();
+    assert_eq(null, godwit_compose_run_error_text('', '', []), 'nothing to record');
+    $text = godwit_compose_run_error_text('failed to delete 1000 files', 'failed to delete 1000 files', ['2026/10/22 22:10:00 ERROR : Cancelling sync due to fatal error: failed to delete 1000 files']);
+    assert_true(strpos($text, 'job error: failed to delete 1000 files') !== false, 'job error first');
+    assert_true(strpos($text, 'last error:') === false, 'an identical last error must not be repeated');
+    assert_true(strpos($text, 'rcd.log errors') !== false, 'log section labelled');
+    $text2 = godwit_compose_run_error_text('march failed', "other problem {$s['access']}", ["ERROR : leaked {$s['bearer']}"]);
+    assert_true(strpos($text2, 'last error: other problem') !== false, 'a distinct last error is kept');
+    assert_true(strpos($text2, 'A1b2C3d4') === false && strpos($text2, str_repeat('tok', 12)) === false, 'secrets in any section are scrubbed');
+    assert_true(strlen($text2) <= GODWIT_ERROR_TEXT_MAX_BYTES, 'cap');
+});
+
+t('godwit_error_text_headline: first meaningful line without the label, clipped, valid UTF-8', function () {
+    assert_eq('', godwit_error_text_headline(null), 'null');
+    assert_eq('failed to delete 1000 files', godwit_error_text_headline("job error: failed to delete 1000 files\nmore"), 'label stripped');
+    $h = godwit_error_text_headline(str_repeat('é', 200), 50);
+    assert_true(strlen($h) <= 50 + 3, 'clipped');
+    assert_eq(1, preg_match('//u', $h), 'clip must not split a character');
+});
+
+t('godwit_job_status_label: an error run shows the recorded reason; one without text says so', function () {
+    $now = godwit_test_dt('2026-10-23 12:00:00');
+    $windows = godwit_default_settings()['windows'];
+    $withText = ['bytes' => 0, 'started_ts' => 1000, 'ended_ts' => 1900, 'outcome' => 'error', 'errors' => 8, 'error_text' => "job error: failed to delete 1000 files\nrcd.log errors during this run: ..."];
+    $label = godwit_job_status_label($withText, false, $windows, $now);
+    assert_true(strpos($label, 'failed to delete 1000 files') !== false, "label should carry the reason: $label");
+    assert_true(strpos($label, 'rcd.log') === false, 'only the headline goes in the label');
+    $legacy = ['bytes' => 0, 'started_ts' => 1000, 'ended_ts' => 1900, 'outcome' => 'error', 'errors' => 8];
+    $label2 = godwit_job_status_label($legacy, false, $windows, $now);
+    assert_true(strpos($label2, 'no error text was recorded') !== false, "legacy row: $label2");
+});
+
+t('godwit_build_jobs_status: last_run carries error_text so the page can show it', function () {
+    $db = new SQLite3(':memory:');
+    godwit_open_job_runs_table($db);
+    godwit_open_budget_table($db);
+    godwit_open_throttle_table($db);
+    $id = godwit_start_job_run($db, 'Filing Cabinet', 'gdrive', 1000);
+    godwit_finish_job_run($db, $id, 1500, 0, 0, 8, 'error', 'job error: failed to delete 1000 files');
+    $status = godwit_build_jobs_status($db, godwit_default_jobs(), godwit_default_settings(), 2000);
+    $fc = null;
+    foreach ($status['jobs'] as $j) {
+        if ($j['name'] === 'Filing Cabinet') {
+            $fc = $j;
+        }
+    }
+    assert_true($fc !== null, 'job present');
+    assert_eq('job error: failed to delete 1000 files', $fc['last_run']['error_text'], 'error_text surfaced');
+    assert_true(strpos($fc['status_text'], 'failed to delete 1000 files') !== false, 'and in the status text: ' . $fc['status_text']);
+    assert_true(json_encode($status) !== false, 'whole status must stay JSON-encodable');
+});
+
+t('e2e (real rcd): the Kieren incident (--max-delete tripped by a mass local deletion) is recorded with its real reason', function () use ($repoRoot) {
+    $zip = $repoRoot . '/build/rclone-v1.75.1-linux-amd64.zip';
+    if (!is_file($zip)) {
+        echo "  (skipped -- build/rclone-v1.75.1-linux-amd64.zip not found; run scripts/build-plugin.sh first to exercise this test)\n";
+        return;
+    }
+    $tmp = sys_get_temp_dir() . '/godwit-e2e-maxdelete-' . bin2hex(random_bytes(4));
+    mkdir($tmp, 0755, true);
+    exec('unzip -q ' . escapeshellarg($zip) . ' -d ' . escapeshellarg($tmp));
+    $rclone = $tmp . '/rclone-v1.75.1-linux-amd64/rclone';
+    $shareRoot = $tmp . '/mnt-user';
+    $src = $shareRoot . '/Kieren';
+    mkdir($src, 0755, true);
+    file_put_contents($src . '/keep.txt', 'keep');
+    // The destination holds many files the source no longer has — what the
+    // live Kieren share looked like after AirVault garbage-collected ~48k
+    // objects locally, against Godwit's default --max-delete of 1000.
+    $dst = $tmp . '/dst';
+    mkdir($dst . '/old', 0755, true);
+    file_put_contents($dst . '/keep.txt', 'keep');
+    for ($i = 0; $i < 30; $i++) {
+        file_put_contents($dst . "/old/gone$i.txt", "gone $i");
+    }
+    $confPath = $tmp . '/rclone.conf';
+    file_put_contents($confPath, "[localdst]\ntype = local\n");
+    $sockPath = $tmp . '/rcd.sock';
+    $rcdLog = $tmp . '/rcd.log';
+    $listener = ['type' => 'unix', 'path' => $sockPath, 'user' => 'testuser', 'pass' => 'testpass'];
+    $startTs = time();
+    // TZ pinned so the log's local timestamps are parsed in the same zone.
+    $proc = proc_open(
+        [$rclone, 'rcd', '--rc-addr=unix://' . $sockPath, '--config=' . $confPath, '--log-file=' . $rcdLog, '--log-level=INFO'],
+        [0 => ['pipe', 'r'], 1 => ['file', $rcdLog, 'a'], 2 => ['file', $rcdLog, 'a']],
+        $pipes,
+        null,
+        array_merge(getenv(), godwit_rcd_env($listener), ['TZ' => 'UTC'])
+    );
+    fclose($pipes[0]);
+    for ($i = 0; $i < 30 && !file_exists($sockPath); $i++) {
+        usleep(100000);
+    }
+    try {
+        $job = ['name' => 'Kieren', 'share' => 'Kieren', 'remote' => 'localdst', 'mode' => 'sync', 'transfers' => 4, 'max_delete' => 5, 'excludes' => []];
+        $fs = ['srcFs' => $src, 'dstFs' => 'localdst:' . $dst];
+        $filterFile = $tmp . '/filter.txt';
+        godwit_write_filter_file($filterFile, godwit_compile_filter_rules($job));
+        $params = godwit_build_sync_params($job, $fs, $filterFile, 1 << 40, 'localdst:' . $tmp . '/bk', null, false, $shareRoot);
+        $resp = godwit_rc_call_params($listener, godwit_sync_rc_path($job['mode']), $params, 15);
+        assert_true(isset($resp['jobid']), 'expected a jobid: ' . json_encode($resp));
+        $jobid = $resp['jobid'];
+        $status = null;
+        for ($i = 0; $i < 100; $i++) {
+            $status = godwit_rc_call_params($listener, 'job/status', ['jobid' => $jobid], 15);
+            if (!empty($status['finished'])) {
+                break;
+            }
+            usleep(100000);
+        }
+        assert_true($status !== null && !empty($status['finished']), 'job should finish: ' . json_encode($status));
+        $errorMsg = trim((string) ($status['error'] ?? ''));
+        $stats = godwit_rc_call_params($listener, 'core/stats', ['group' => 'job/' . $jobid], 15);
+        $errors = (int) ($stats['errors'] ?? -1);
+        assert_true($errors >= 1, "the run must have counted errors, as the live one did (8): $errors");
+        assert_true(strpos($errorMsg, 'failed to delete') !== false, 'rclone names the max-delete trip in job/status: ' . var_export($errorMsg, true));
+        assert_eq('error', godwit_classify_job_outcome($errorMsg, false, 0, null), 'it is an error outcome');
+
+        usleep(300000); // let rcd flush its log
+        $now = time();
+        $logLines = godwit_rcd_log_error_lines($rcdLog, $startTs, $now, new \DateTimeZone('UTC'));
+        $text = godwit_compose_run_error_text($errorMsg, trim((string) ($stats['lastError'] ?? '')), $logLines);
+        assert_true($text !== null && strpos($text, 'failed to delete') !== false, 'composed text carries the reason: ' . var_export($text, true));
+
+        $db = new SQLite3(':memory:');
+        godwit_open_job_runs_table($db);
+        $runId = godwit_start_job_run($db, 'Kieren', 'localdst', $startTs);
+        godwit_finish_job_run($db, $runId, $now, 0, 0, $errors, 'error', $text);
+        $stored = godwit_last_job_run($db, 'Kieren');
+        assert_true(strpos((string) $stored['error_text'], 'failed to delete') !== false, 'stored with the run');
+        assert_true(strpos(godwit_job_status_label($stored, false, [], godwit_test_dt('2026-10-23 12:00:00')), 'failed to delete') !== false, 'and visible in the status label');
+    } finally {
+        proc_terminate($proc);
+        proc_close($proc);
+        exec('rm -rf ' . escapeshellarg($tmp));
+    }
+});
+
 // --- report ---------------------------------------------------------------
 
 printf("\n%d passed, %d failed\n", $passed, $failed);

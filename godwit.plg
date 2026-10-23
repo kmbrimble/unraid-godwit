@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "godwit">
 <!ENTITY author    "kmbrimble">
-<!ENTITY version   "0.6.3">
+<!ENTITY version   "0.6.4">
 <!ENTITY launch    "Settings/Godwit">
 <!ENTITY pluginURL "https://raw.githubusercontent.com/kmbrimble/unraid-godwit/main/godwit.plg">
 <!ENTITY gitURL    "https://github.com/kmbrimble/unraid-godwit/releases/download/v&version;">
@@ -15,6 +15,14 @@
 <PLUGIN name="&name;" author="&author;" version="&version;" launch="&launch;" pluginURL="&pluginURL;" support="https://github.com/kmbrimble/unraid-godwit" min="7.0" icon="upload">
 
 <CHANGES>
+###0.6.4
+- Every run that does not finish cleanly now records WHY. Until now only an
+  error count was kept (the Kieren job showed "8 errors, 0 bytes" every night
+  with nothing to say what the 8 were, and the rclone log lives in RAM and
+  is lost on reboot). The reason (rclone's own error plus the error lines
+  from its log during the run, with any credentials removed and capped at
+  4 KB) is stored with the run, shown as a short reason in the job's status
+  and in full under an "error detail" toggle, and added to godwit.log.
 ###0.6.3
 - Fixed the folder-picker (Browse) losing edits. Done was at the very bottom
   of the scrolling list while the only visible control, the titlebar close,

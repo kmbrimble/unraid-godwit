@@ -185,4 +185,33 @@ t('tree dialog: expand affordance is CSS-drawn, no bare unicode triangle glyphs'
     assert.ok(page.includes('#tree-dialog button.godwit-tree-expand::before'), 'CSS triangle rule present');
 });
 
+// --- Run error detail (job_runs.error_text, issue #2) ---------------------
+// godwitRunErrorDetailHtml sits outside the marker blocks (it needs the page's
+// own esc()), so pull the two functions out by name and run them in a vm.
+const escSrc = page.slice(page.indexOf('function esc(s) {'), page.indexOf('function fmtBytes'));
+const detailSrc = page.slice(page.indexOf('function godwitRunErrorDetailHtml'), page.indexOf('function godwitJobRowHtml'));
+const detailBox = {};
+vm.createContext(detailBox);
+vm.runInContext(escSrc + detailSrc, detailBox);
+
+t('godwitRunErrorDetailHtml: shows an escaped, collapsed detail block for a finished run with text', () => {
+    const html = detailBox.godwitRunErrorDetailHtml({ running: false, last_run: { error_text: 'job error: failed to delete 1000 files\n<img src=x onerror=alert(1)>' } });
+    assert.ok(html.startsWith('<details'), 'collapsed <details>');
+    assert.ok(html.includes('failed to delete 1000 files'), 'reason shown');
+    assert.ok(!html.includes('<img'), 'markup in rclone output must be escaped');
+    assert.ok(html.includes('&lt;img'), 'escaped form present');
+});
+
+t('godwitRunErrorDetailHtml: nothing for running jobs, runs without text, or jobs never run', () => {
+    assert.equal(detailBox.godwitRunErrorDetailHtml({ running: true, last_run: { error_text: 'x' } }), '');
+    assert.equal(detailBox.godwitRunErrorDetailHtml({ running: false, last_run: { error_text: null } }), '');
+    assert.equal(detailBox.godwitRunErrorDetailHtml({ running: false, last_run: null }), '');
+    assert.equal(detailBox.godwitRunErrorDetailHtml({ running: false }), '');
+});
+
+t('job row: the status cell includes the run error detail', () => {
+    const row = page.slice(page.indexOf('function godwitJobRowHtml'));
+    assert.ok(/esc\(state\)\s*\+\s*godwitRunErrorDetailHtml\(j\)/.test(row), 'state cell appends the detail');
+});
+
 console.log(`\n${passed}/${passed} windows-form + tree-selection checks passed`);

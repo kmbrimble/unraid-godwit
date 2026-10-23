@@ -10,6 +10,46 @@ sort *before* `1.0.9`.
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-23
+
+### Added
+
+- **Per-run error text (issue #2).** `job_runs` stored only an error *count*,
+  so the Kieren job's eight errors every night since 2026-09-27 could not be
+  diagnosed: `/var/run/godwit/rcd.log` is on tmpfs (lost at the 2026-10-23
+  reboot) and `godwit.log` held only health checks. New nullable
+  `job_runs.error_text` column (`ALTER TABLE ... ADD COLUMN` on open, same
+  pattern as `remotes_health.fail_count`; old rows stay NULL). For every run
+  that ends other than `completed`, godwitd stores rclone's `job/status`
+  error, `core/stats` `lastError` when it differs, and the ERROR/CRITICAL
+  lines rcd logged during the run's time window
+  (`godwit_rcd_log_error_lines()`, reads only the last 1 MiB of the log; rcd is
+  shared, so a concurrent job on another remote can appear — the section says
+  so). A restart-interrupted run records that fact.
+- `godwit_scrub_error_text()` runs inside `godwit_finish_job_run()` so no
+  caller can store an unredacted value: `godwit_redact()` plus bearer tokens,
+  Google `ya29.`/`1//` tokens, JWTs, OAuth client ids, `--user/--pass`,
+  URL secrets; control characters removed; valid UTF-8 forced (a stray byte
+  would make `json_encode()` of the whole status return false); redaction
+  runs before truncation to the LAST 4096 bytes so a secret cut by the
+  boundary cannot survive as a fragment.
+- Surfaced in `jobs_status` (`last_run.error_text`), in the error status
+  label (a one-line reason instead of "see /var/log/godwit.log"; legacy rows
+  say no text was recorded), under the job row on Settings → Godwit as a
+  collapsed "error detail" block (escaped), in the `job finished` line of
+  `godwit.log`, and in the failed-run notification (scrubbed, 1 KB).
+- Tests: 16 new PHP (357 total, 0 skips) including a real-rcd end-to-end
+  reproduction of the incident (`--max-delete` tripped by a mass deletion),
+  and 3 new Node checks (26 total).
+
+### Diagnosis recorded with this release (not a code change)
+
+Kieren's nightly `error` (8 errors, 0 bytes) is rclone's `--max-delete`
+guard (Godwit default 1000) tripping: the destination holds ~22k files the
+source no longer has (AirVault object-store garbage collection on 2026-09-25,
+plus rotated `Backup/unRAID/ab_*` dirs). Each night rclone moves exactly 1000
+of them into `godwit/_versions/Kieren/<date>/` and aborts with a fatal error.
+
 ## [0.6.3] - 2026-09-26
 
 ### Fixed
