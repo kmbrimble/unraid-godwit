@@ -1,5 +1,8 @@
 # Godwit
 
+> **Archived 2026-10-26 — no longer maintained.** Godwit was retired on the author's own server: offsite backup of the unRAID shares moved to [Backrest](https://github.com/garethgeorge/backrest) (restic to Azure). The code is left here for reference; no further releases or fixes are planned.
+
+
 *"Flies your data a long way away."*
 
 Offsite backup for Unraid, built as a GUI over [rclone](https://rclone.org/).
